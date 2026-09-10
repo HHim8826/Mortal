@@ -4,6 +4,11 @@
 # v4 cannot inherit the v3 weights: obs_shape goes from (934, 34) to (1012, 34),
 # so the encoder's input layer is a different shape. The v3 checkpoint is still
 # useful as the opponent to measure against - see [baseline].
+#
+# Measured on a 12-core / RTX 3060 box: 1,350 instances/s end to end, of which
+# the loader alone can do 4,100 and the GPU alone about 2,500. Encoding a v4
+# observation runs a single-player EV solve, so cores - not the GPU - set the
+# pace. One pass over the 1.6M-game corpus is ~1.03B instances, or ~212 h here.
 
 [control]
 version = 4
@@ -20,8 +25,9 @@ enable_cudnn_benchmark = false
 enable_amp = true
 enable_compile = false
 
-# 512 keeps the peak near 2.5 GB with v4's 1012 channels. A 16 GB card can take
-# 1024, which measured ~34% more instances/s.
+# v4 encoding is expensive enough that the GPU is not the constraint: batch
+# 1024 measured 1,295 instances/s against 1,291 at 512, so the larger batch buys
+# nothing here and only costs VRAM. Raise it only on a box with more cores.
 batch_size = 512
 opt_step_every = 1
 
@@ -56,9 +62,10 @@ file_batch_size = 10
 # Rows inside a shard are chronological, so carrying a slice of each batch
 # forward mixes across them.
 reserve_ratio = 0.2
-# `load_logs` already fans out over all cores inside one worker, so a second
-# one only contends for them and doubles the buffer.
-num_workers = 1
+# `load_logs` already fans out over every core inside one worker, so a second
+# one adds overlap rather than throughput: 1,350 instances/s against 1,291.
+# Each worker holds a ~850 MB buffer, so this is the ceiling on a 7 GB box.
+num_workers = 2
 # The published corpus has nicknames stripped, so this filter can never match.
 # Leaving a file here would silently select zero games.
 player_names_files = []
