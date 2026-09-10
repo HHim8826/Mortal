@@ -134,6 +134,21 @@ impl GameplayLoader {
         self.load_gz_log_files(gzip_filenames)
     }
 
+    /// Load many raw logs at once, fanning out over them the way
+    /// `load_gz_log_files` fans out over files.
+    ///
+    /// `load_log` only parallelises over the players within one game, which
+    /// leaves most cores idle when the logs come from a columnar store rather
+    /// than from one file each. Encoding a v4 observation is expensive enough
+    /// for that to decide whether the GPU stays fed.
+    #[pyo3(name = "load_logs")]
+    fn load_logs_py(&self, raw_logs: Vec<String>) -> Result<Vec<Vec<Gameplay>>> {
+        raw_logs
+            .into_par_iter()
+            .map(|raw_log| self.load_log(&raw_log))
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }

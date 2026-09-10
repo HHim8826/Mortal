@@ -1,0 +1,187 @@
+# Offline training of a v4 model from scratch, fed from the parquet corpus at
+# hhim8826/tenhou-houou-mjai. Select it with `MORTAL_CFG=config.v4.toml`.
+#
+# v4 cannot inherit the v3 weights: obs_shape goes from (934, 34) to (1012, 34),
+# so the encoder's input layer is a different shape. The v3 checkpoint is still
+# useful as the opponent to measure against - see [baseline].
+
+[control]
+version = 4
+online = false
+
+state_file = 'logs/v4/mortal.pth'
+best_state_file = 'logs/v4/best.pth'
+tensorboard_dir = 'logs/v4'
+
+device = 'cuda:0'
+enable_cudnn_benchmark = false
+# Measured on a 6 GB 3060: batch 1024 in fp32 peaks at 7.8 GB and falls back to
+# host memory, which is ~50x slower per step. AMP is not optional here.
+enable_amp = true
+enable_compile = false
+
+# 512 keeps the peak near 2.5 GB with v4's 1012 channels. A 16 GB card can take
+# 1024, which measured ~34% more instances/s.
+batch_size = 512
+opt_step_every = 1
+
+save_every = 400
+test_every = 20000
+submit_every = 400
+
+# using env `TRAIN_PLAY_PROFILE`
+[train_play.default]
+games = 800
+log_dir = 'challenger/train_play'
+boltzmann_epsilon = 0.005
+boltzmann_temp = 0.05
+top_p = 1.0
+repeats = 1
+
+[test_play]
+# 3000 upstream; 2000 is about 25 minutes on this GPU and still separates
+# models that differ by more than noise.
+games = 2000
+log_dir = 'challenger/test_play'
+
+[dataset]
+# One entry per parquet row group. `globs` stays for the gz path that online
+# training still uses.
+parquet_globs = ['/root/mortal-data/*.parquet']
+globs = []
+file_index = 'logs/v4/file_index.pth'
+# 10 games per read, ~660 instances each at ~137 KB, so about 900 MB of buffer
+# per worker. Raise it wherever there is more RAM.
+file_batch_size = 10
+# Rows inside a shard are chronological, so carrying a slice of each batch
+# forward mixes across them.
+reserve_ratio = 0.2
+# `load_logs` already fans out over all cores inside one worker, so a second
+# one only contends for them and doubles the buffer.
+num_workers = 1
+# The published corpus has nicknames stripped, so this filter can never match.
+# Leaving a file here would silently select zero games.
+player_names_files = []
+num_epochs = 1
+enable_augmentation = false
+augmented_first = false
+
+[env]
+gamma = 1
+# Tenhou houou uma [90, 45, 0, -135] over 30, which is also the distribution
+# the strength tables report. Upstream's v4 example uses [6, 4, 2, 0], which is
+# far flatter and trains a much less 4th-averse bot.
+pts = [3.0, 1.5, 0.0, -4.5]
+
+[resnet]
+conv_channels = 192
+num_blocks = 40
+
+[cql]
+min_q_weight = 5
+
+[aux]
+next_rank_weight = 0.2
+
+[freeze_bn]
+# `true` in online training
+mortal = false
+
+[optim]
+eps = 1e-8
+betas = [0.9, 0.999]
+weight_decay = 0.1
+max_grad_norm = 0
+
+[optim.scheduler]
+peak = 1e-4
+final = 1e-5
+warm_up_steps = 500
+# v3 ran 107,200 steps at batch 1024; the same instance count at batch 512 is
+# about 215k, so this is roughly one v3-sized pass as the cosine horizon.
+max_steps = 200000
+
+# The opponent, not the starting point. Both players carry their own version,
+# so a v3 champion measuring a v4 challenger is a fixed reference point.
+[baseline.train]
+device = 'cuda:0'
+enable_compile = false
+state_file = 'logs/baseline.pth'
+
+[baseline.test]
+device = 'cuda:0'
+enable_compile = false
+state_file = 'logs/baseline.pth'
+
+[online]
+history_window = 50
+enable_compile = false
+
+[online.remote]
+host = '127.0.0.1'
+port = 5000
+
+[online.server]
+buffer_dir = 'online/buffer'
+drain_dir = 'online/drain'
+sample_reuse_rate = 0
+sample_reuse_threshold = 0
+capacity = 1600
+force_sequential = false
+
+[test]
+stochastic_latent = false
+
+[1v3]
+seed_key = -1
+games_per_iter = 2000
+iters = 500
+log_dir = 'challenger/1v3'
+
+[1v3.challenger]
+device = 'cuda:0'
+name = 'mortal'
+state_file = 'logs/v4/best.pth'
+stochastic_latent = false
+enable_compile = false
+enable_amp = true
+enable_rule_based_agari_guard = true
+
+[1v3.champion]
+device = 'cuda:0'
+name = 'baseline'
+state_file = 'logs/baseline.pth'
+stochastic_latent = false
+enable_compile = false
+enable_amp = true
+enable_rule_based_agari_guard = true
+
+[1v3.akochan]
+enabled = false
+dir = '/path/to/akochan'
+tactics = '/path/to/tactics.json'
+
+[grp]
+state_file = 'grp_v2/grp.pth'
+
+[grp.network]
+hidden_size = 64
+num_layers = 2
+
+[grp.control]
+device = 'cuda:0'
+enable_cudnn_benchmark = false
+tensorboard_dir = 'grp_v2/log'
+
+batch_size = 1024
+save_every = 2000
+val_steps = 400
+
+[grp.dataset]
+train_globs = []
+val_globs = []
+file_index = 'grp_v2/log/grp_file/grp_file_index.pth'
+file_batch_size = 100
+
+[grp.optim]
+lr = 1e-5

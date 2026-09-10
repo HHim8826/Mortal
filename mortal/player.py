@@ -51,6 +51,9 @@ class TestPlayer:
             version = self.chal_version,
             device = device,
             enable_amp = True,
+            # The champion has this on, and so does the released bot. Leaving
+            # it off here measured a player nobody ever runs. Upstream #114.
+            enable_rule_based_agari_guard = True,
             name = 'mortal',
         )
 
@@ -129,6 +132,7 @@ class TrainPlayer:
             top_p = self.top_p,
             device = device,
             enable_amp = True,
+            enable_rule_based_agari_guard = True,
             name = 'trainee',
         )
 

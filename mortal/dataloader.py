@@ -16,6 +16,7 @@ class FileDatasetsIter(IterableDataset):
         oracle = False,
         file_batch_size = 20, # hint: around 660 instances per file
         reserve_ratio = 0,
+        parquet = False,
         player_names = None,
         excludes = None,
         num_epochs = 1,
@@ -29,6 +30,8 @@ class FileDatasetsIter(IterableDataset):
         self.oracle = oracle
         self.file_batch_size = file_batch_size
         self.reserve_ratio = reserve_ratio
+        self.parquet = parquet
+        self.readers = {}
         self.player_names = player_names
         self.excludes = excludes
         self.num_epochs = num_epochs
@@ -61,9 +64,9 @@ class FileDatasetsIter(IterableDataset):
         )
         self.buffer = []
 
-        for start_idx in range(0, len(self.file_list), self.file_batch_size):
+        for batch in self.iter_batches():
             old_buffer_size = len(self.buffer)
-            self.populate_buffer(self.file_list[start_idx:start_idx + self.file_batch_size])
+            self.populate_buffer(batch)
             buffer_size = len(self.buffer)
 
             reserved_size = int((buffer_size - old_buffer_size) * self.reserve_ratio)
@@ -77,8 +80,40 @@ class FileDatasetsIter(IterableDataset):
         yield from self.buffer
         self.buffer.clear()
 
-    def populate_buffer(self, file_list):
-        data = self.loader.load_gz_log_files(file_list)
+    def iter_batches(self):
+        """Games to hand the loader, `file_batch_size` at a time.
+
+        A gz entry is one path; a parquet entry is one (shard, row group) pair
+        holding thousands of games, so it is sliced down to the same batch size
+        rather than being read whole.
+        """
+        if not self.parquet:
+            for start in range(0, len(self.file_list), self.file_batch_size):
+                yield self.file_list[start:start + self.file_batch_size]
+            return
+
+        import pyarrow.parquet as pq
+        for shard, row_group in self.file_list:
+            reader = self.readers.get(shard)
+            if reader is None:
+                # A handful of shards, so holding every footer open is cheaper
+                # than reopening one per group in a shuffled list.
+                reader = self.readers[shard] = pq.ParquetFile(shard)
+            for chunk in reader.iter_batches(
+                batch_size = self.file_batch_size,
+                row_groups = [row_group],
+                columns = ['events'],
+            ):
+                yield chunk.column('events').to_pylist()
+
+    def populate_buffer(self, batch):
+        if self.parquet:
+            # One call for the whole batch: encoding a v4 observation costs
+            # enough that fanning out over games in Rust rather than looping
+            # here is the difference between 1.8k and 4k instances/s.
+            data = self.loader.load_logs(batch)
+        else:
+            data = self.loader.load_gz_log_files(batch)
         for file in data:
             for game in file:
                 # per move
@@ -96,6 +131,10 @@ class FileDatasetsIter(IterableDataset):
                 player_id = game.take_player_id()
 
                 game_size = len(obs)
+                if game_size == 0:
+                    # This player never acted, so there is nothing to learn
+                    # from and no `at_kyoku` to index. Upstream issue #103.
+                    continue
 
                 grp_feature = grp.take_feature()
                 rank_by_player = grp.take_rank_by_player()

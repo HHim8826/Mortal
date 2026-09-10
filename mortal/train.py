@@ -158,9 +158,22 @@ def train():
             logging.info(f'loaded {len(player_names):,} players')
 
             file_index = config['dataset']['file_index']
+            parquet_globs = config['dataset'].get('parquet_globs') or []
             if path.exists(file_index):
                 index = torch.load(file_index, weights_only=True)
                 file_list = index['file_list']
+            elif parquet_globs:
+                logging.info('building parquet row group index...')
+                shards = []
+                for pat in parquet_globs:
+                    shards.extend(glob(pat, recursive=True))
+                import pyarrow.parquet as pq
+                file_list = []
+                for shard in tqdm(sorted(shards), unit='shard'):
+                    num_row_groups = pq.ParquetFile(shard).num_row_groups
+                    file_list.extend((shard, rg) for rg in range(num_row_groups))
+                logging.info(f'{len(shards):,} shards, {len(file_list):,} row groups')
+                torch.save({'file_list': file_list}, file_index)
             else:
                 logging.info('building file index...')
                 file_list = []
@@ -183,12 +196,16 @@ def train():
 
         if num_workers > 1:
             random.shuffle(file_list)
+        # A gz entry is a path and a parquet entry is a (shard, row group)
+        # pair, which is also what a reloaded index holds.
+        use_parquet = bool(file_list) and not isinstance(file_list[0], str)
         file_data = FileDatasetsIter(
             version = version,
             file_list = file_list,
             pts = pts,
             file_batch_size = file_batch_size,
             reserve_ratio = reserve_ratio,
+            parquet = use_parquet,
             player_names = player_names,
             num_epochs = num_epochs,
             enable_augmentation = enable_augmentation,
