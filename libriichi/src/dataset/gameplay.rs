@@ -129,24 +129,35 @@ impl GameplayLoader {
         self.load_events(&events)
     }
 
+    /// Releases the GIL while decoding, which takes seconds for v4. Held, it
+    /// would stop the DataLoader worker's other threads: the one flushing its
+    /// finished batches and the one handing their shared memory to the main
+    /// process, which then waits on this worker with others' batches ready.
     #[pyo3(name = "load_gz_log_files")]
-    fn load_gz_log_files_py(&self, gzip_filenames: Vec<String>) -> Result<Vec<Vec<Gameplay>>> {
-        self.load_gz_log_files(gzip_filenames)
+    fn load_gz_log_files_py(
+        &self,
+        py: Python<'_>,
+        gzip_filenames: Vec<String>,
+    ) -> Result<Vec<Vec<Gameplay>>> {
+        py.allow_threads(|| self.load_gz_log_files(gzip_filenames))
     }
 
     /// Load many raw logs at once, fanning out over them the way
-    /// `load_gz_log_files` fans out over files.
+    /// `load_gz_log_files` fans out over files, and releasing the GIL as it
+    /// does.
     ///
     /// `load_log` only parallelises over the players within one game, which
     /// leaves most cores idle when the logs come from a columnar store rather
     /// than from one file each. Encoding a v4 observation is expensive enough
     /// for that to decide whether the GPU stays fed.
     #[pyo3(name = "load_logs")]
-    fn load_logs_py(&self, raw_logs: Vec<String>) -> Result<Vec<Vec<Gameplay>>> {
-        raw_logs
-            .into_par_iter()
-            .map(|raw_log| self.load_log(&raw_log))
-            .collect()
+    fn load_logs_py(&self, py: Python<'_>, raw_logs: Vec<String>) -> Result<Vec<Vec<Gameplay>>> {
+        py.allow_threads(|| {
+            raw_logs
+                .into_par_iter()
+                .map(|raw_log| self.load_log(&raw_log))
+                .collect()
+        })
     }
 
     fn __repr__(&self) -> String {

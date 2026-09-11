@@ -1,4 +1,6 @@
+import queue
 import random
+import threading
 import torch
 import numpy as np
 from torch.utils.data import IterableDataset
@@ -64,9 +66,9 @@ class FileDatasetsIter(IterableDataset):
         )
         self.buffer = []
 
-        for batch in self.iter_batches():
+        for entries in self.decoded_ahead(self.iter_batches()):
             old_buffer_size = len(self.buffer)
-            self.populate_buffer(batch)
+            self.buffer.extend(entries)
             buffer_size = len(self.buffer)
 
             reserved_size = int((buffer_size - old_buffer_size) * self.reserve_ratio)
@@ -106,7 +108,38 @@ class FileDatasetsIter(IterableDataset):
             ):
                 yield chunk.column('events').to_pylist()
 
-    def populate_buffer(self, batch):
+    def decoded_ahead(self, batches):
+        """`load_entries` of each batch, with the next one decoding meanwhile.
+
+        Decoding a v4 batch takes seconds. Done in line, it runs only once a
+        worker has been handed a task and found its buffer empty, and tasks
+        arrive only as the trainer consumes batches, so the workers drift into
+        taking turns to decode instead of decoding side by side. A thread one
+        batch ahead keeps every worker decoding; Rust releases the GIL while it
+        does. At most one decoded batch waits, which bounds the memory.
+        """
+        ready = queue.Queue()
+        ahead = threading.Semaphore(1)
+        done = object()
+
+        def decode():
+            try:
+                for batch in batches:
+                    ahead.acquire()
+                    ready.put(self.load_entries(batch))
+                ready.put(done)
+            except BaseException as exc:
+                ready.put(exc)
+
+        threading.Thread(target=decode, daemon=True).start()
+        while (entries := ready.get()) is not done:
+            if isinstance(entries, BaseException):
+                raise entries
+            ahead.release()
+            yield entries
+
+    def load_entries(self, batch):
+        entries = []
         if self.parquet:
             # One call for the whole batch: encoding a v4 observation costs
             # enough that fanning out over games in Rust rather than looping
@@ -162,7 +195,8 @@ class FileDatasetsIter(IterableDataset):
                     ]
                     if self.oracle:
                         entry.insert(1, invisible_obs[i])
-                    self.buffer.append(entry)
+                    entries.append(entry)
+        return entries
 
     def __iter__(self):
         if self.iterator is None:
