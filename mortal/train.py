@@ -21,6 +21,7 @@ def train():
     from torch.utils.tensorboard import SummaryWriter
     from common import submit_param, parameter_count, drain, filtered_trimmed_lines, tqdm
     from player import TestPlayer
+    from distributed import Dist, NullWriter
     from dataloader import FileDatasetsIter, worker_init_fn
     from lr_scheduler import LinearWarmUpCosineAnnealingLR
     from model import Brain, DQN, AuxNet
@@ -41,7 +42,12 @@ def train():
     assert save_every % opt_step_every == 0
     assert test_every % save_every == 0
 
-    device = torch.device(config['control']['device'])
+    # One process per GPU under torchrun; otherwise the single-GPU path.
+    ddp = Dist()
+    device = ddp.setup(torch.device(config['control']['device']))
+    if ddp.enabled and online:
+        raise RuntimeError('DDP is for offline training: online mode drains one '
+                           'shared replay buffer and has no notion of shards')
     torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
     enable_amp = config['control']['enable_amp']
     enable_compile = config['control']['enable_compile']
@@ -94,7 +100,11 @@ def train():
     optimizer = optim.AdamW(param_groups, lr=1, weight_decay=0, betas=betas, eps=eps)
     scheduler = LinearWarmUpCosineAnnealingLR(optimizer, **config['optim']['scheduler'])
     scaler = GradScaler(device.type, enabled=enable_amp)
-    test_player = TestPlayer()
+    test_player = TestPlayer(
+        device = device if ddp.enabled else None,
+        rank = ddp.rank,
+        world_size = ddp.world_size,
+    )
     best_perf = {
         'avg_rank': 4.,
         'avg_pt': -135.,
@@ -117,6 +127,25 @@ def train():
         best_perf = state['best_perf']
         steps = state['steps']
 
+    class TrainNet(nn.Module):
+        """The three trained modules as one, so DDP syncs them with one reducer.
+
+        Checkpoints still save each module on its own, so nothing that loads
+        them needs to know this exists.
+        """
+        def __init__(self):
+            super().__init__()
+            self.mortal = mortal
+            self.dqn = dqn
+            self.aux_net = aux_net
+
+        def forward(self, obs, masks):
+            phi = self.mortal(obs)
+            return self.dqn(phi, masks), self.aux_net(phi)
+
+    # Wrapped after loading, so every rank starts from the same weights.
+    net = ddp.wrap(TrainNet(), device)
+
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
     ce = nn.CrossEntropyLoss()
@@ -130,7 +159,7 @@ def train():
         submit_param(mortal, dqn, is_idle=True)
         logging.info('param has been submitted')
 
-    writer = SummaryWriter(config['control']['tensorboard_dir'])
+    writer = SummaryWriter(config['control']['tensorboard_dir']) if ddp.is_main else NullWriter()
     stats = {
         'dqn_loss': 0,
         'cql_loss': 0,
@@ -159,10 +188,10 @@ def train():
 
             file_index = config['dataset']['file_index']
             parquet_globs = config['dataset'].get('parquet_globs') or []
-            if path.exists(file_index):
-                index = torch.load(file_index, weights_only=True)
-                file_list = index['file_list']
-            elif parquet_globs:
+            # Rank 0 builds a missing index while the others wait, so two
+            # processes never race to write one file; then all read it back.
+            build = ddp.is_main and not path.exists(file_index)
+            if build and parquet_globs:
                 logging.info('building parquet row group index...')
                 shards = []
                 for pat in parquet_globs:
@@ -174,7 +203,7 @@ def train():
                     file_list.extend((shard, rg) for rg in range(num_row_groups))
                 logging.info(f'{len(shards):,} shards, {len(file_list):,} row groups')
                 torch.save({'file_list': file_list}, file_index)
-            else:
+            elif build:
                 logging.info('building file index...')
                 file_list = []
                 for pat in config['dataset']['globs']:
@@ -189,7 +218,13 @@ def train():
                     file_list = filtered
                 file_list.sort(reverse=True)
                 torch.save({'file_list': file_list}, file_index)
-        logging.info(f'file list size: {len(file_list):,}')
+            ddp.barrier()
+            file_list = torch.load(file_index, weights_only=True)['file_list']
+        # A disjoint slice per rank. `steps` is the same on every rank here, so
+        # they agree on the split without having to ask each other.
+        file_list = ddp.shard(file_list, seed=steps)
+        logging.info(f'file list size: {len(file_list):,}'
+                     + (f' (rank 0 of {ddp.world_size})' if ddp.enabled else ''))
 
         before_next_test_play = (test_every - steps % test_every) % test_every
         logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
@@ -220,14 +255,8 @@ def train():
             worker_init_fn = worker_init_fn,
         ))
 
-        remaining_obs = []
-        remaining_actions = []
-        remaining_masks = []
-        remaining_steps_to_done = []
-        remaining_kyoku_rewards = []
-        remaining_player_ranks = []
-        remaining_bs = 0
-        pb = tqdm(total=save_every, desc='TRAIN', initial=steps % save_every)
+        pb = tqdm(total=save_every, desc='TRAIN', initial=steps % save_every,
+                  disable=not ddp.is_main)
 
         def train_batch(obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks):
             nonlocal steps
@@ -245,24 +274,24 @@ def train():
             q_target_mc = gamma ** steps_to_done * kyoku_rewards
             q_target_mc = q_target_mc.to(torch.float32)
 
-            with torch.autocast(device.type, enabled=enable_amp):
-                phi = mortal(obs)
-                q_out = dqn(phi, masks)
-                q = q_out[range(batch_size), actions]
-                dqn_loss = 0.5 * mse(q, q_target_mc)
-                cql_loss = 0
-                if not online:
-                    cql_loss = q_out.logsumexp(-1).mean() - q.mean()
+            # Only the step that updates the weights needs the all-reduce.
+            with ddp.no_sync(net, (idx + 1) % opt_step_every == 0):
+                with torch.autocast(device.type, enabled=enable_amp):
+                    q_out, (next_rank_logits,) = net(obs, masks)
+                    q = q_out[range(batch_size), actions]
+                    dqn_loss = 0.5 * mse(q, q_target_mc)
+                    cql_loss = 0
+                    if not online:
+                        cql_loss = q_out.logsumexp(-1).mean() - q.mean()
 
-                next_rank_logits, = aux_net(phi)
-                next_rank_loss = ce(next_rank_logits, player_ranks)
+                    next_rank_loss = ce(next_rank_logits, player_ranks)
 
-                loss = sum((
-                    dqn_loss,
-                    cql_loss * min_q_weight,
-                    next_rank_loss * next_rank_weight,
-                ))
-            scaler.scale(loss / opt_step_every).backward()
+                    loss = sum((
+                        dqn_loss,
+                        cql_loss * min_q_weight,
+                        next_rank_loss * next_rank_weight,
+                    ))
+                scaler.scale(loss / opt_step_every).backward()
 
             with torch.inference_mode():
                 stats['dqn_loss'] += dqn_loss
@@ -291,6 +320,12 @@ def train():
 
             if steps % save_every == 0:
                 pb.close()
+
+                # Every rank has to take part in these before rank 0 goes on
+                # alone to write things down.
+                for k in stats:
+                    stats[k] = ddp.mean(stats[k], device)
+                ddp.check_in_sync(all_models, device)
 
                 # downsample to reduce tensorboard event size
                 all_q_1d = all_q.cpu().numpy().flatten()[::128]
@@ -324,14 +359,24 @@ def train():
                     'best_perf': best_perf,
                     'config': config,
                 }
-                torch.save(state, state_file)
+                if ddp.is_main:
+                    torch.save(state, state_file)
 
                 if online and steps % submit_every != 0:
                     submit_param(mortal, dqn, is_idle=False)
                     logging.info('param has been submitted')
 
                 if steps % test_every == 0:
-                    stat = test_player.test_play(test_games // 4, mortal, dqn, device)
+                    # Each rank plays its own slice of the same seeds on its own
+                    # GPU. Rank 0 clears the last round's games first, and all
+                    # read the finished set back once the slowest rank is done.
+                    ddp.barrier()
+                    if ddp.is_main:
+                        test_player.clear()
+                    ddp.barrier()
+                    test_player.play(test_games // 4, mortal, dqn, device)
+                    ddp.barrier()
+                    stat = test_player.collect()
                     mortal.train()
                     dqn.train()
 
@@ -386,7 +431,7 @@ def train():
                     writer.add_scalar('test_play/fuuro_point', stat.avg_fuuro_point, steps)
                     writer.flush()
 
-                    if better:
+                    if better and ddp.is_main:
                         torch.save(state, state_file)
                         logging.info(
                             'a new record has been made, '
@@ -401,42 +446,28 @@ def train():
                         # is the reason why `main` spawns a sub process to train
                         # in online mode instead of going for training directly.
                         sys.exit(0)
-                pb = tqdm(total=save_every, desc='TRAIN')
+                pb = tqdm(total=save_every, desc='TRAIN', disable=not ddp.is_main)
 
-        for obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks in data_loader:
-            bs = obs.shape[0]
-            if bs != batch_size:
-                remaining_obs.append(obs)
-                remaining_actions.append(actions)
-                remaining_masks.append(masks)
-                remaining_steps_to_done.append(steps_to_done)
-                remaining_kyoku_rewards.append(kyoku_rewards)
-                remaining_player_ranks.append(player_ranks)
+        def full_batches():
+            """Every full batch of the epoch, with the ragged ends re-cut last."""
+            remaining = []
+            remaining_bs = 0
+            for batch in data_loader:
+                bs = batch[0].shape[0]
+                if bs == batch_size:
+                    yield batch
+                    continue
+                remaining.append(batch)
                 remaining_bs += bs
-                continue
-            train_batch(obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks)
+            if remaining_bs >= batch_size:
+                columns = [torch.cat(col, dim=0) for col in zip(*remaining)]
+                for start in range(0, remaining_bs - batch_size + 1, batch_size):
+                    yield [col[start:start + batch_size] for col in columns]
 
-        remaining_batches = remaining_bs // batch_size
-        if remaining_batches > 0:
-            obs = torch.cat(remaining_obs, dim=0)
-            actions = torch.cat(remaining_actions, dim=0)
-            masks = torch.cat(remaining_masks, dim=0)
-            steps_to_done = torch.cat(remaining_steps_to_done, dim=0)
-            kyoku_rewards = torch.cat(remaining_kyoku_rewards, dim=0)
-            player_ranks = torch.cat(remaining_player_ranks, dim=0)
-            start = 0
-            end = batch_size
-            while end <= remaining_bs:
-                train_batch(
-                    obs[start:end],
-                    actions[start:end],
-                    masks[start:end],
-                    steps_to_done[start:end],
-                    kyoku_rewards[start:end],
-                    player_ranks[start:end],
-                )
-                start = end
-                end += batch_size
+        # One place for both the full batches and the re-cut ends, so DDP can
+        # stop every rank together when the first of them runs dry.
+        for batch in ddp.in_lockstep(full_batches()):
+            train_batch(*batch)
         pb.close()
 
         if online:
@@ -451,6 +482,7 @@ def train():
         if not online:
             # only run one epoch for offline for easier control
             break
+    ddp.close()
 
 def main():
     import os

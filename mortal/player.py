@@ -12,9 +12,11 @@ from libriichi.arena import OneVsThree
 from config import config
 
 class TestPlayer:
-    def __init__(self):
+    def __init__(self, device=None, rank=0, world_size=1):
         baseline_cfg = config['baseline']['test']
-        device = torch.device(baseline_cfg['device'])
+        # Under DDP each rank plays its share of test games on its own GPU, so
+        # the champion lives there too rather than on the configured device.
+        device = device or torch.device(baseline_cfg['device'])
 
         state = torch.load(baseline_cfg['state_file'], weights_only=True, map_location=torch.device('cpu'))
         cfg = state['config']
@@ -41,8 +43,30 @@ class TestPlayer:
         )
         self.chal_version = config['control']['version']
         self.log_dir = path.abspath(config['test_play']['log_dir'])
+        self.rank = rank
+        self.world_size = world_size
 
     def test_play(self, seed_count, mortal, dqn, device):
+        self.clear()
+        self.play(seed_count, mortal, dqn, device)
+        return self.collect()
+
+    def clear(self):
+        if path.isdir(self.log_dir):
+            shutil.rmtree(self.log_dir)
+
+    def seeds(self, seed_count):
+        """This rank's contiguous slice of [10000, 10000 + seed_count).
+
+        The slices tile the range exactly, so every world size plays the same
+        games and the numbers stay comparable across runs.
+        """
+        per_rank = seed_count // self.world_size
+        first = self.rank * per_rank
+        last = seed_count if self.rank == self.world_size - 1 else first + per_rank
+        return 10000 + first, last - first
+
+    def play(self, seed_count, mortal, dqn, device):
         torch.backends.cudnn.benchmark = False
         engine_chal = MortalEngine(
             mortal,
@@ -57,23 +81,27 @@ class TestPlayer:
             name = 'mortal',
         )
 
-        if path.isdir(self.log_dir):
-            shutil.rmtree(self.log_dir)
-
-        env = OneVsThree(
-            disable_progress_bar = False,
-            log_dir = self.log_dir,
-        )
-        env.py_vs_py(
-            challenger = engine_chal,
-            champion = self.baseline_engine,
-            seed_start = (10000, 0x2000),
-            seed_count = seed_count,
-        )
-
-        stat = Stat.from_dir(self.log_dir, 'mortal')
+        first, count = self.seeds(seed_count)
+        # One directory per rank under log_dir, which `collect` reads whole.
+        log_dir = self.log_dir
+        if self.world_size > 1:
+            log_dir = path.join(self.log_dir, f'rank{self.rank}')
+        if count > 0:
+            env = OneVsThree(
+                disable_progress_bar = self.rank != 0,
+                log_dir = log_dir,
+            )
+            env.py_vs_py(
+                challenger = engine_chal,
+                champion = self.baseline_engine,
+                seed_start = (first, 0x2000),
+                seed_count = count,
+            )
         torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
-        return stat
+
+    def collect(self):
+        # Globs **/*.json.gz, so it picks up every rank's directory at once.
+        return Stat.from_dir(self.log_dir, 'mortal')
 
 class TrainPlayer:
     def __init__(self):
