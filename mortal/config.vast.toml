@@ -23,7 +23,9 @@ best_state_file = 'logs/v4/best.pth'
 tensorboard_dir = 'logs/v4'
 
 device = 'cuda:0'
-enable_cudnn_benchmark = false
+# Every training batch has the same shape, so the autotuned convolutions
+# pay off; test play turns it off around its own variable batches.
+enable_cudnn_benchmark = true
 # Measured on a 6 GB 3060: batch 1024 in fp32 peaks at 7.8 GB and falls back to
 # host memory, which is ~50x slower per step. AMP is not optional here.
 enable_amp = true
