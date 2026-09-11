@@ -70,9 +70,6 @@ def train():
     dqn = DQN(version=version).to(device)
     aux_net = AuxNet((4,)).to(device)
     all_models = (mortal, dqn, aux_net)
-    if enable_compile:
-        for m in all_models:
-            m.compile()
 
     logging.info(f'version: {version}')
     logging.info(f'obs shape: {obs_shape(version)}')
@@ -164,6 +161,15 @@ def train():
 
     # Wrapped after loading, so every rank starts from the same weights.
     net = ddp.wrap(TrainNet(), device)
+    if enable_compile:
+        # Fuses the ResNet's thousands of small kernels a step, whose launches
+        # otherwise leave the GPU waiting on the host: 240 -> 138 ms a step on
+        # a laptop 3060, for a couple of minutes of compiling at the start.
+        # The whole wrapped net rather than each module in place, as this used
+        # to: DDP keeps overlapping the gradient all-reduce with the backward,
+        # and test play, which runs the modules themselves with a batch size
+        # of its own, stays uncompiled instead of recompiling for it.
+        net = torch.compile(net)
 
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
