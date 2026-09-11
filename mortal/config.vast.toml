@@ -57,9 +57,12 @@ top_p = 1.0
 repeats = 1
 
 [test_play]
-# 3000 upstream. 2000 is split 1000 per GPU; the average rank over 2000 games
-# has a standard error of about 0.025, enough to tell real gains from noise.
-games = 2000
+# 3000 upstream. Split 2000 per GPU. The average rank over 2000 games has a
+# standard error of ~0.025, and 40k vs 80k (2.524 vs 2.556) could not be told
+# apart from noise; 4000 brings it to ~0.018 for ~6 minutes per evaluation.
+# The seeds extend the same range, so the first 2000 games deal the walls of
+# the earlier evaluations.
+games = 4000
 log_dir = 'challenger/test_play'
 
 [dataset]
