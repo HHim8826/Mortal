@@ -336,6 +336,16 @@ def train():
                 for k in stats:
                     stats[k] = ddp.mean(stats[k], device)
                 ddp.check_in_sync(all_models, device)
+                # Where the time went. A loader that falls behind shows as data
+                # waits; a slow rank as the others waiting on it.
+                pace = ddp.pace()
+                wall = pace[0][0]
+                writer.add_scalar('perf/steps_per_sec', save_every / wall, steps)
+                writer.add_scalar('perf/data_wait', max(data for _, data, _ in pace) / wall, steps)
+                logging.info(
+                    f'{save_every} steps in {wall:.0f} s; waiting for data / other ranks: '
+                    + ', '.join(f'rank {r} {data / wall:.0%} / {ranks / wall:.0%}'
+                                for r, (_, data, ranks) in enumerate(pace)))
 
                 # downsample to reduce tensorboard event size
                 all_q_1d = all_q.cpu().numpy().flatten()[::128]

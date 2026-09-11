@@ -14,6 +14,7 @@ one GPU, the code path it always was.
 import logging
 import os
 import random
+import time
 from contextlib import nullcontext
 from datetime import timedelta
 
@@ -65,6 +66,8 @@ class Dist:
         self.local_rank = int(os.environ.get('LOCAL_RANK', '0'))
         self.enabled = self.world_size > 1
         self.control = None
+        self.window_start = time.perf_counter()
+        self.waited = {'data': 0., 'ranks': 0.}
 
     @property
     def is_main(self):
@@ -145,18 +148,45 @@ class Dist:
         Ranks hold different amounts of data. The first to run out would leave
         the rest waiting forever on a gradient all-reduce it never joins, so
         before each step they vote, and one empty rank stops them all.
+
+        Also times the waits, for `pace`: for the next batch, and for the
+        other ranks to have theirs.
         """
-        if not self.enabled:
-            yield from batches
-            return
         it = iter(batches)
+        self.window_start = time.perf_counter()
+        self.waited = {'data': 0., 'ranks': 0.}
         while True:
+            t0 = time.perf_counter()
             batch = next(it, None)
-            flag = torch.tensor([0 if batch is None else 1])
-            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.control)
-            if not flag.item():
+            t1 = time.perf_counter()
+            if self.enabled:
+                flag = torch.tensor([0 if batch is None else 1])
+                dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.control)
+                stop = not flag.item()
+            else:
+                stop = batch is None
+            self.waited['data'] += t1 - t0
+            self.waited['ranks'] += time.perf_counter() - t1
+            if stop:
                 return
             yield batch
+
+    def pace(self):
+        """[wall, data, ranks] seconds since the last call, one list per rank.
+
+        What is not waiting on data or on the other ranks is the training step
+        itself. Every rank has to call this.
+        """
+        now = time.perf_counter()
+        mine = [now - self.window_start, self.waited['data'], self.waited['ranks']]
+        self.window_start = now
+        self.waited = {'data': 0., 'ranks': 0.}
+        if not self.enabled:
+            return [mine]
+        t = torch.tensor(mine, dtype=torch.float64)
+        gathered = [torch.empty_like(t) for _ in range(self.world_size)]
+        dist.all_gather(gathered, t, group=self.control)
+        return [g.tolist() for g in gathered]
 
     def barrier(self):
         if self.enabled:
