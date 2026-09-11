@@ -31,13 +31,16 @@ def available_cpus():
 
     On a rented slice of a shared host, os.cpu_count() reports the whole
     machine - all 256 threads of a box you were given 64 of - and pools sized
-    from it thrash. The cgroup quota is the real limit when there is one.
+    from it thrash. The cgroup quota is the real limit when there is one, and
+    the CPUs the process may run on when they are fewer still (56 against a
+    quota of 61 on another box).
     """
+    affinity = len(os.sched_getaffinity(0))
     try:
         with open('/sys/fs/cgroup/cpu.max') as f:
             quota, period = f.read().split()
         if quota != 'max':
-            return max(1, int(quota) // int(period))
+            return max(1, min(affinity, int(quota) // int(period)))
     except (OSError, ValueError):
         pass
     try:
@@ -46,10 +49,10 @@ def available_cpus():
         with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us') as f:
             period = int(f.read())
         if quota > 0:
-            return max(1, quota // period)
+            return max(1, min(affinity, quota // period))
     except (OSError, ValueError):
         pass
-    return len(os.sched_getaffinity(0))
+    return affinity
 
 
 class NullWriter:
@@ -66,6 +69,8 @@ class Dist:
         self.local_rank = int(os.environ.get('LOCAL_RANK', '0'))
         self.enabled = self.world_size > 1
         self.control = None
+        # Before CUDA or NCCL has had a chance to narrow it; see keep_cpus.
+        self.cpus = os.sched_getaffinity(0) if hasattr(os, 'sched_getaffinity') else None
         self.window_start = time.perf_counter()
         self.waited = {'data': 0., 'ranks': 0.}
 
@@ -96,6 +101,7 @@ class Dist:
         # Barriers and the end-of-data vote go over gloo on the CPU, so they
         # never queue behind GPU work the way an NCCL call on the stream would.
         self.control = dist.new_group(backend='gloo', timeout=TIMEOUT)
+        self.keep_cpus()
 
         cpus = available_cpus()
         per_rank = max(1, cpus // self.world_size)
@@ -122,7 +128,26 @@ class Dist:
         # BatchNorm stays per rank: each sees a full per-rank batch, and
         # SyncBatchNorm would add an all-reduce for every one of the ~80 BN
         # layers on every step. Running stats are broadcast from rank 0.
-        return DistributedDataParallel(module, device_ids=[device.index])
+        net = DistributedDataParallel(module, device_ids=[device.index])
+        # Its first broadcast is where NCCL sets up, if setup did not.
+        self.keep_cpus()
+        return net
+
+    def keep_cpus(self):
+        """Put this thread back on every CPU the process started with.
+
+        NCCL's setup can leave the calling thread on just the CPUs next to
+        its GPU, and every thread and loader worker started from it
+        afterwards inherits that. On a rented slice those can be a handful of the CPUs
+        the process may use: one box gave rank 1 eight of its 56, and its
+        three loaders' decoding crowded onto them while rank 0 waited in the
+        all-reduce. NCCL's own threads keep their placement.
+        """
+        if self.cpus and os.sched_getaffinity(0) != self.cpus:
+            logging.warning(
+                f'rank {self.rank}: something narrowed this thread to '
+                f'{len(os.sched_getaffinity(0))} of {len(self.cpus)} CPUs; restoring')
+            os.sched_setaffinity(0, self.cpus)
 
     def no_sync(self, net, sync):
         """Skip the gradient all-reduce on accumulation steps that do not step."""
