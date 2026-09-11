@@ -1,3 +1,5 @@
+import hashlib
+import logging
 import queue
 import random
 import threading
@@ -147,7 +149,7 @@ class FileDatasetsIter(IterableDataset):
             data = self.loader.load_logs(batch)
         else:
             data = self.loader.load_gz_log_files(batch)
-        for file in data:
+        for source, file in zip(batch, data):
             for game in file:
                 # per move
                 obs = game.take_obs()
@@ -185,6 +187,18 @@ class FileDatasetsIter(IterableDataset):
                         steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
 
                 for i in range(game_size):
+                    action = actions[i]
+                    if not (0 <= action < len(masks[i]) and masks[i][action]):
+                        # A logged move libriichi does not consider legal there.
+                        # The trainer asserts on this, so drop it here, where
+                        # the game it came from is still known.
+                        where = source if not self.parquet else \
+                            'game ' + hashlib.sha1(source.encode()).hexdigest()[:12]
+                        logging.warning(
+                            f'skipping an illegal logged move: {where}, seat {player_id}, '
+                            f'move {i} in kyoku #{at_kyoku[i]}, action {action}, '
+                            f'legal {np.flatnonzero(masks[i]).tolist()}')
+                        continue
                     entry = [
                         obs[i],
                         actions[i],
