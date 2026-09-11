@@ -1,9 +1,12 @@
 import torch
 import numpy as np
 import os
+import gzip
+import json
 import shutil
 import secrets
 import logging
+from glob import glob
 from os import path
 from model import Brain, DQN
 from engine import MortalEngine
@@ -51,9 +54,17 @@ class TestPlayer:
         self.play(seed_count, mortal, dqn, device)
         return self.collect()
 
-    def clear(self):
-        if path.isdir(self.log_dir):
-            shutil.rmtree(self.log_dir)
+    def track_dir(self, track=None):
+        """Where a track's games go: `log_dir` itself, or `log_dir_<track>` beside it.
+
+        Tracks play the same seeds, so a second model can be compared with
+        the first game by game over the same walls.
+        """
+        return self.log_dir if track is None else f'{self.log_dir}_{track}'
+
+    def clear(self, track=None):
+        if path.isdir(self.track_dir(track)):
+            shutil.rmtree(self.track_dir(track))
 
     def seeds(self, seed_count):
         """This rank's contiguous slice of [10000, 10000 + seed_count).
@@ -66,7 +77,7 @@ class TestPlayer:
         last = seed_count if self.rank == self.world_size - 1 else first + per_rank
         return 10000 + first, last - first
 
-    def play(self, seed_count, mortal, dqn, device):
+    def play(self, seed_count, mortal, dqn, device, track=None):
         torch.backends.cudnn.benchmark = False
         engine_chal = MortalEngine(
             mortal,
@@ -83,9 +94,9 @@ class TestPlayer:
 
         first, count = self.seeds(seed_count)
         # One directory per rank under log_dir, which `collect` reads whole.
-        log_dir = self.log_dir
+        log_dir = self.track_dir(track)
         if self.world_size > 1:
-            log_dir = path.join(self.log_dir, f'rank{self.rank}')
+            log_dir = path.join(log_dir, f'rank{self.rank}')
         if count > 0:
             env = OneVsThree(
                 disable_progress_bar = self.rank != 0,
@@ -99,9 +110,32 @@ class TestPlayer:
             )
         torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
 
-    def collect(self):
+    def collect(self, track=None):
         # Globs **/*.json.gz, so it picks up every rank's directory at once.
-        return Stat.from_dir(self.log_dir, 'mortal')
+        return Stat.from_dir(self.track_dir(track), 'mortal')
+
+    def paired(self, track):
+        """The challenger's rank on `track` minus on the main track, game by game.
+
+        Both tracks deal the same walls from the same seats, so the luck of
+        the deal largely cancels and the difference is far tighter than two
+        separate averages. Returns (mean difference, its standard error, games).
+        """
+        def rank_in(file):
+            with gzip.open(file, 'rt') as f:
+                log = f.read()
+            names = json.loads(log.split('\n', 1)[0])['names']
+            return Stat.from_log(log, names.index('mortal')).avg_rank
+
+        diffs = []
+        for main in glob(path.join(self.log_dir, '**', '*.json.gz'), recursive=True):
+            other = path.join(self.track_dir(track), path.relpath(main, self.log_dir))
+            if path.exists(other):
+                diffs.append(rank_in(other) - rank_in(main))
+        if len(diffs) < 2:
+            return float('nan'), float('nan'), len(diffs)
+        d = np.asarray(diffs)
+        return d.mean(), d.std(ddof=1) / np.sqrt(len(d)), len(d)
 
 class TrainPlayer:
     def __init__(self):

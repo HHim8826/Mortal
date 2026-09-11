@@ -36,6 +36,10 @@ enable_compile = true
 # longer launching each of ~3,000 kernels a step. Loader decoding then fills
 # the CPUs.
 compile_mode = 'reduce-overhead'
+# An average of the weights over ~5000 steps, test-played beside the trained
+# ones on the same walls and saved as best_ema.pth when it sets its own record.
+# It is only a candidate: best.pth stays the model to use until it wins.
+ema_decay = 0.9998
 
 # Per GPU. Two ranks make the global batch 1024, what v3 trained with. 1024
 # per GPU measured slightly slower here (3,254 vs 3,339 instances/s).

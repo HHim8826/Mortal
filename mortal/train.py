@@ -5,6 +5,7 @@ def train():
     import sys
     import os
     import gc
+    import copy
     import gzip
     import json
     import shutil
@@ -142,6 +143,28 @@ def train():
         scaler.load_state_dict(state['scaler'])
         best_perf = state['best_perf']
         steps = state['steps']
+
+    # A running average of the weights, test-played beside the trained ones on
+    # the same walls. It is kept and compared, and saved as its own best, but
+    # only becomes the model to use once test play shows it is the stronger.
+    ema_decay = config['control'].get('ema_decay', 0)
+    ema_models = ()
+    best_perf_ema = {'avg_rank': 4., 'avg_pt': -135.}
+    if ema_decay > 0:
+        mortal_ema = copy.deepcopy(mortal).requires_grad_(False)
+        dqn_ema = copy.deepcopy(dqn).requires_grad_(False)
+        ema_models = (mortal_ema, dqn_ema)
+        if path.exists(state_file) and 'ema' in state:
+            mortal_ema.load_state_dict(state['ema']['mortal'])
+            dqn_ema.load_state_dict(state['ema']['current_dqn'])
+            best_perf_ema = state['best_perf_ema']
+        else:
+            logging.info('ema: starting from the current weights')
+        # Parameters and the BN running stats, in matching order.
+        ema_tensors = [t for m in ema_models for t in chain(m.parameters(), m.buffers()) if t.is_floating_point()]
+        live_tensors = [t for m in (mortal, dqn) for t in chain(m.parameters(), m.buffers()) if t.is_floating_point()]
+        best_ema_file = path.splitext(best_state_file)[0] + '_ema.pth'
+        logging.info(f'ema: decay {ema_decay}, over ~{1 / (1 - ema_decay):,.0f} steps')
 
     class TrainNet(nn.Module):
         """The three trained modules as one, so DDP syncs them with one reducer.
@@ -355,6 +378,9 @@ def train():
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                if ema_models:
+                    with torch.no_grad():
+                        torch._foreach_lerp_(ema_tensors, live_tensors, 1 - ema_decay)
             scheduler.step()
             pb.update(1)
 
@@ -413,6 +439,9 @@ def train():
                     'best_perf': best_perf,
                     'config': config,
                 }
+                if ema_models:
+                    state['ema'] = {'mortal': mortal_ema.state_dict(), 'current_dqn': dqn_ema.state_dict()}
+                    state['best_perf_ema'] = best_perf_ema
                 if ddp.is_main:
                     torch.save(state, state_file)
 
@@ -427,9 +456,14 @@ def train():
                     ddp.barrier()
                     if ddp.is_main:
                         test_player.clear()
+                        if ema_models:
+                            test_player.clear('ema')
                     ddp.barrier()
                     ddp.sync_buffers(all_models)
                     test_player.play(test_games // 4, mortal, dqn, device)
+                    if ema_models:
+                        ddp.sync_buffers(ema_models)
+                        test_player.play(test_games // 4, mortal_ema, dqn_ema, device, track='ema')
                     ddp.barrier()
                     stat = test_player.collect()
                     mortal.train()
@@ -486,8 +520,33 @@ def train():
                     writer.add_scalar('test_play/fuuro_point', stat.avg_fuuro_point, steps)
                     writer.flush()
 
+                    better_ema = False
+                    if ema_models:
+                        stat_ema = test_player.collect('ema')
+                        avg_pt_ema = stat_ema.avg_pt([90, 45, 0, -135])
+                        better_ema = avg_pt_ema >= best_perf_ema['avg_pt'] and stat_ema.avg_rank <= best_perf_ema['avg_rank']
+                        if better_ema:
+                            best_perf_ema['avg_pt'] = avg_pt_ema
+                            best_perf_ema['avg_rank'] = stat_ema.avg_rank
+                        writer.add_scalar('test_play_ema/avg_ranking', stat_ema.avg_rank, steps)
+                        writer.add_scalar('test_play_ema/avg_pt', avg_pt_ema, steps)
+                        writer.add_scalars('test_play_ema/ranking', {
+                            '1st': stat_ema.rank_1_rate,
+                            '2nd': stat_ema.rank_2_rate,
+                            '3rd': stat_ema.rank_3_rate,
+                            '4th': stat_ema.rank_4_rate,
+                        }, steps)
+                        if ddp.is_main:
+                            diff, se, n = test_player.paired('ema')
+                            writer.add_scalar('test_play_ema/rank_minus_trained', diff, steps)
+                            logging.info(f'ema avg rank: {stat_ema.avg_rank:.6}, avg pt: {avg_pt_ema:.6}; '
+                                         f'ema minus trained over the same {n} games: '
+                                         f'rank {diff:+.4f} +- {se:.4f}')
+                        writer.flush()
+
+                    if (better or better_ema) and ddp.is_main:
+                        torch.save(state, state_file)  # with the new best_perf in it
                     if better and ddp.is_main:
-                        torch.save(state, state_file)
                         logging.info(
                             'a new record has been made, '
                             f'pt: {past_best["avg_pt"]:.4} -> {best_perf["avg_pt"]:.4}, '
@@ -495,6 +554,19 @@ def train():
                             f'saving to {best_state_file}'
                         )
                         shutil.copy(state_file, best_state_file)
+                    if better_ema and ddp.is_main:
+                        # Loads anywhere mortal.pth does: the averaged weights
+                        # under the usual names.
+                        torch.save({
+                            'mortal': mortal_ema.state_dict(),
+                            'current_dqn': dqn_ema.state_dict(),
+                            'steps': steps,
+                            'timestamp': datetime.now().timestamp(),
+                            'best_perf': best_perf_ema,
+                            'config': config,
+                        }, best_ema_file)
+                        logging.info(f'a new ema record: rank {best_perf_ema["avg_rank"]:.4}, '
+                                     f'pt {best_perf_ema["avg_pt"]:.4}, saving to {best_ema_file}')
                     if online:
                         # BUG: This is a bug with unknown reason. When training
                         # in online mode, the process will get stuck here. This
