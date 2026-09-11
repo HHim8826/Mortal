@@ -128,7 +128,10 @@ class Dist:
         # BatchNorm stays per rank: each sees a full per-rank batch, and
         # SyncBatchNorm would add an all-reduce for every one of the ~80 BN
         # layers on every step. Running stats are broadcast from rank 0.
-        net = DistributedDataParallel(module, device_ids=[device.index])
+        # Gradients as views into the all-reduce buckets: without it DDP
+        # copies every parameter's gradient in and out of them, some 500
+        # memcpy launches a step that the host pays for one by one.
+        net = DistributedDataParallel(module, device_ids=[device.index], gradient_as_bucket_view=True)
         # Its first broadcast is where NCCL sets up, if setup did not.
         self.keep_cpus()
         return net

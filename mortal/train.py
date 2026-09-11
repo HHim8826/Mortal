@@ -169,7 +169,7 @@ def train():
         # to: DDP keeps overlapping the gradient all-reduce with the backward,
         # and test play, which runs the modules themselves with a batch size
         # of its own, stays uncompiled instead of recompiling for it.
-        net = torch.compile(net)
+        net = torch.compile(net, mode=config['control'].get('compile_mode'))
 
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
