@@ -1,0 +1,204 @@
+# v4 offline training on the rented 2x RTX 3060 / EPYC 7702 box, both GPUs:
+#
+#     cd /root/Mortal/mortal
+#     MORTAL_CFG=config.vast.toml torchrun --standalone --nproc_per_node=2 train.py
+#
+# Measured on that box. Each GPU alone trains at ~3,350 instances/s; under DDP
+# the step itself, on data already on the GPU, runs at 5.6 steps/s (5,750
+# instances/s) with NCCL over SHM, since GeForce cards get no P2P. End to end
+# with the loader settings below it sustains ~4.5 steps/s, ~4,600 instances/s.
+#
+# The container's cgroup allows 61 CPUs of the host's 256, and
+# distributed.available_cpus() reads that rather than os.cpu_count().
+#
+# v4 cannot inherit v3 weights (obs 934 -> 1012 channels). The v3 checkpoint is
+# the opponent test play measures against, not a starting point.
+
+[control]
+version = 4
+online = false
+
+state_file = 'logs/v4/mortal.pth'
+best_state_file = 'logs/v4/best.pth'
+tensorboard_dir = 'logs/v4'
+
+device = 'cuda:0'
+enable_cudnn_benchmark = false
+# Measured on a 6 GB 3060: batch 1024 in fp32 peaks at 7.8 GB and falls back to
+# host memory, which is ~50x slower per step. AMP is not optional here.
+enable_amp = true
+enable_compile = false
+
+# Per GPU. Two ranks make the global batch 1024, what v3 trained with. 1024
+# per GPU measured slightly slower here (3,254 vs 3,339 instances/s).
+batch_size = 512
+opt_step_every = 1
+
+save_every = 400
+# ~2.5 h of training between evaluations, each ~11 min for 2000 games.
+test_every = 40000
+submit_every = 400
+
+# using env `TRAIN_PLAY_PROFILE`
+[train_play.default]
+games = 800
+log_dir = 'challenger/train_play'
+boltzmann_epsilon = 0.005
+boltzmann_temp = 0.05
+top_p = 1.0
+repeats = 1
+
+[test_play]
+# 3000 upstream. 2000 is split 1000 per GPU; the average rank over 2000 games
+# has a standard error of about 0.025, enough to tell real gains from noise.
+games = 2000
+log_dir = 'challenger/test_play'
+
+[dataset]
+# One entry per parquet row group. `globs` stays for the gz path that online
+# training still uses.
+parquet_globs = ['/root/hf-dataset/data/*.parquet']
+globs = []
+file_index = 'logs/v4/file_index.pth'
+# A worker stops yielding while it decodes its next read. Smaller reads keep
+# each stall short, and out-of-order delivery lets another worker's batches
+# through meanwhile. In order, one worker's refill stalled the whole rank and
+# lockstep spread that to the other: 2.84 steps/s against 4.5 now.
+file_batch_size = 20
+prefetch_factor = 8
+in_order = false
+# Rows inside a shard are chronological, so carrying a slice of each batch
+# forward mixes across them.
+reserve_ratio = 0.2
+# The Rust decode is not the limit; each worker's Python side is (building
+# entries, GRP rewards, collating ~69 MB per batch into shared memory), so
+# workers scale it and rayon threads do not. Measured with prefetch 8, steps/s:
+# 2 workers 4.26, 3 workers 4.51. Each gets 61 // 2 // 3 = 10 rayon threads.
+num_workers = 3
+# The published corpus has nicknames stripped, so this filter can never match.
+# Leaving a file here would silently select zero games.
+player_names_files = []
+num_epochs = 1
+enable_augmentation = false
+augmented_first = false
+
+[env]
+gamma = 1
+# Tenhou houou uma [90, 45, 0, -135] over 30, which is also the distribution
+# the strength tables report. Upstream's v4 example uses [6, 4, 2, 0], which is
+# far flatter and trains a much less 4th-averse bot.
+pts = [3.0, 1.5, 0.0, -4.5]
+
+[resnet]
+conv_channels = 192
+num_blocks = 40
+
+[cql]
+min_q_weight = 5
+
+[aux]
+next_rank_weight = 0.2
+
+[freeze_bn]
+# `true` in online training
+mortal = false
+
+[optim]
+eps = 1e-8
+betas = [0.9, 0.999]
+weight_decay = 0.1
+max_grad_norm = 0
+
+[optim.scheduler]
+peak = 1e-4
+final = 1e-5
+warm_up_steps = 2000
+# The cosine runs over one pass of the corpus: ~1.03B instances at 1024 per
+# step is ~1M steps, about 62 h at 4.5 steps/s. Offline training stops after
+# one epoch anyway.
+max_steps = 1000000
+
+# The opponent, not the starting point. Both players carry their own version,
+# so a v3 champion measuring a v4 challenger is a fixed reference point.
+[baseline.train]
+device = 'cuda:0'
+enable_compile = false
+state_file = 'logs/baseline.pth'
+
+[baseline.test]
+device = 'cuda:0'
+enable_compile = false
+state_file = 'logs/baseline.pth'
+
+[online]
+history_window = 50
+enable_compile = false
+
+[online.remote]
+host = '127.0.0.1'
+port = 5000
+
+[online.server]
+buffer_dir = 'online/buffer'
+drain_dir = 'online/drain'
+sample_reuse_rate = 0
+sample_reuse_threshold = 0
+capacity = 1600
+force_sequential = false
+
+[test]
+stochastic_latent = false
+
+[1v3]
+seed_key = -1
+games_per_iter = 2000
+iters = 500
+log_dir = 'challenger/1v3'
+
+[1v3.challenger]
+device = 'cuda:0'
+name = 'mortal'
+state_file = 'logs/v4/best.pth'
+stochastic_latent = false
+enable_compile = false
+enable_amp = true
+enable_rule_based_agari_guard = true
+
+[1v3.champion]
+device = 'cuda:0'
+name = 'baseline'
+state_file = 'logs/baseline.pth'
+stochastic_latent = false
+enable_compile = false
+enable_amp = true
+enable_rule_based_agari_guard = true
+
+[1v3.akochan]
+enabled = false
+dir = '/path/to/akochan'
+tactics = '/path/to/tactics.json'
+
+[grp]
+state_file = 'grp_v2/grp.pth'
+
+[grp.network]
+hidden_size = 64
+num_layers = 2
+
+[grp.control]
+device = 'cuda:0'
+enable_cudnn_benchmark = false
+tensorboard_dir = 'grp_v2/log'
+
+batch_size = 1024
+save_every = 2000
+val_steps = 400
+
+[grp.dataset]
+train_globs = []
+val_globs = []
+file_index = 'grp_v2/log/grp_file/grp_file_index.pth'
+file_batch_size = 100
+
+[grp.optim]
+lr = 1e-5
