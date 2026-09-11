@@ -169,7 +169,13 @@ def train():
         # to: DDP keeps overlapping the gradient all-reduce with the backward,
         # and test play, which runs the modules themselves with a batch size
         # of its own, stays uncompiled instead of recompiling for it.
-        net = torch.compile(net, mode=config['control'].get('compile_mode'))
+        compile_mode = config['control'].get('compile_mode')
+        if compile_mode == 'reduce-overhead' and opt_step_every > 1:
+            # A CUDA graph's replay overwrites the gradients it produced last
+            # time, which accumulation still needs to add to.
+            raise ValueError("compile_mode = 'reduce-overhead' (CUDA graphs) cannot be used "
+                             'with opt_step_every > 1')
+        net = torch.compile(net, mode=compile_mode)
 
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
