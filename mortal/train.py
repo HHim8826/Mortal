@@ -44,7 +44,8 @@ def train():
 
     # One process per GPU under torchrun; otherwise the single-GPU path.
     ddp = Dist()
-    device = ddp.setup(torch.device(config['control']['device']))
+    device = ddp.setup(torch.device(config['control']['device']),
+                       loaders_per_rank=config['dataset']['num_workers'])
     if ddp.enabled and online:
         raise RuntimeError('DDP is for offline training: online mode drains one '
                            'shared replay buffer and has no notion of shards')
@@ -246,6 +247,14 @@ def train():
             enable_augmentation = enable_augmentation,
             augmented_first = augmented_first,
         )
+        # A worker stops yielding while it decodes its next read, and in-order
+        # delivery waits for that worker even with another's batches ready.
+        # Out of order, with enough queued ahead, the refills stay hidden.
+        # Both default to upstream's behaviour when not configured.
+        loader_kwargs = {}
+        if num_workers > 0:
+            loader_kwargs['prefetch_factor'] = config['dataset'].get('prefetch_factor', 2)
+            loader_kwargs['in_order'] = config['dataset'].get('in_order', True)
         data_loader = iter(DataLoader(
             dataset = file_data,
             batch_size = batch_size,
@@ -253,6 +262,7 @@ def train():
             num_workers = num_workers,
             pin_memory = True,
             worker_init_fn = worker_init_fn,
+            **loader_kwargs,
         ))
 
         pb = tqdm(total=save_every, desc='TRAIN', initial=steps % save_every,

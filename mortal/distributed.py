@@ -70,7 +70,7 @@ class Dist:
     def is_main(self):
         return self.rank == 0
 
-    def setup(self, device):
+    def setup(self, device, loaders_per_rank=1):
         """Join the process group; return the device this rank trains on."""
         if not self.enabled:
             return device
@@ -96,10 +96,11 @@ class Dist:
 
         cpus = available_cpus()
         per_rank = max(1, cpus // self.world_size)
-        # Every rank's loader fans out over rayon's global pool, which sizes
-        # itself to the whole machine. Left alone, N ranks run N pools of that
-        # size on the same cores. Set before any loader process starts.
-        os.environ.setdefault('RAYON_NUM_THREADS', str(per_rank))
+        # Every loader process fans out over its own rayon pool, which sizes
+        # itself to the whole machine. Left alone, ranks x workers pools of
+        # that size share the same cores. Set before any loader starts.
+        per_loader = max(1, per_rank // max(1, loaders_per_rank))
+        os.environ.setdefault('RAYON_NUM_THREADS', str(per_loader))
         torch.set_num_threads(per_rank)
 
         if not self.is_main:
@@ -107,7 +108,8 @@ class Dist:
             logging.getLogger().setLevel(logging.WARNING)
         logging.info(
             f'DDP: {self.world_size} ranks over {backend}, {cpus} CPUs, '
-            f'RAYON_NUM_THREADS={os.environ["RAYON_NUM_THREADS"]} per rank')
+            f'RAYON_NUM_THREADS={os.environ["RAYON_NUM_THREADS"]} per loader, '
+            f'{loaders_per_rank} loader(s) per rank')
         return device
 
     def wrap(self, module, device):
