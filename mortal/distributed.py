@@ -234,6 +234,21 @@ class Dist:
         if self.enabled:
             dist.barrier(group=self.control)
 
+    def sync_buffers(self, modules):
+        """Put rank 0's buffers, the BN running stats, on every rank.
+
+        DDP broadcasts them at the start of each forward, and each rank then
+        updates them from its own batch, so after a step they differ a little.
+        Test play has each rank play its share with its own copy, and without
+        this the ranks would score slightly different models, none of them
+        exactly the one rank 0 saves.
+        """
+        if not self.enabled:
+            return
+        for m in modules:
+            for b in m.buffers():
+                dist.broadcast(b, 0)
+
     def mean(self, value, device):
         """A scalar averaged over ranks, for logging."""
         if not self.enabled:
@@ -249,7 +264,8 @@ class Dist:
         drift - a parameter that never receives a gradient, a stray in-place
         update - stays silent until the ranks are optimising different models.
         Buffers are left out: BN running stats are broadcast from rank 0 at
-        each forward and then updated locally, so they differ by design.
+        each forward and then updated locally, so they differ by design
+        (sync_buffers evens them out before test play).
         """
         if not self.enabled:
             return

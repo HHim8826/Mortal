@@ -422,6 +422,7 @@ def train():
                     if ddp.is_main:
                         test_player.clear()
                     ddp.barrier()
+                    ddp.sync_buffers(all_models)
                     test_player.play(test_games // 4, mortal, dqn, device)
                     ddp.barrier()
                     stat = test_player.collect()
