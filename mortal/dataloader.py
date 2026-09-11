@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import os
 import queue
 import random
 import threading
@@ -218,6 +219,11 @@ class FileDatasetsIter(IterableDataset):
         return self.iterator
 
 def worker_init_fn(*args, **kwargs):
+    threads = os.environ.get('MORTAL_LOADER_RAYON_THREADS')
+    if threads:
+        # The rank's own rayon pool is sized for test play (Dist.setup); this
+        # loader's pool, made on its first decode, gets the loader's share.
+        os.environ['RAYON_NUM_THREADS'] = threads
     worker_info = torch.utils.data.get_worker_info()
     dataset = worker_info.dataset
     per_worker = int(np.ceil(len(dataset.file_list) / worker_info.num_workers))

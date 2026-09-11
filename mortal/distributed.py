@@ -109,7 +109,14 @@ class Dist:
         # itself to the whole machine. Left alone, ranks x workers pools of
         # that size share the same cores. Set before any loader starts.
         per_loader = max(1, per_rank // max(1, loaders_per_rank))
-        os.environ.setdefault('RAYON_NUM_THREADS', str(per_loader))
+        if 'RAYON_NUM_THREADS' not in os.environ:
+            # The loaders and test play take turns with the CPUs: the loaders
+            # decode while training runs and idle while the rank's own pool
+            # encodes test play's games, so that pool gets the rank's whole
+            # share (worker_init_fn gives each loader its part). Sized like
+            # the loaders, it left 2000 games a rank on 9 of 28 CPUs.
+            os.environ['RAYON_NUM_THREADS'] = str(per_rank)
+            os.environ['MORTAL_LOADER_RAYON_THREADS'] = str(per_loader)
         torch.set_num_threads(per_rank)
 
         if not self.is_main:
@@ -117,8 +124,8 @@ class Dist:
             logging.getLogger().setLevel(logging.WARNING)
         logging.info(
             f'DDP: {self.world_size} ranks over {backend}, {cpus} CPUs, '
-            f'RAYON_NUM_THREADS={os.environ["RAYON_NUM_THREADS"]} per loader, '
-            f'{loaders_per_rank} loader(s) per rank')
+            f'rayon threads: {os.environ.get("MORTAL_LOADER_RAYON_THREADS", os.environ["RAYON_NUM_THREADS"])} '
+            f'per loader x {loaders_per_rank} loader(s), {os.environ["RAYON_NUM_THREADS"]} for test play')
         return device
 
     def wrap(self, module, device):
@@ -141,10 +148,10 @@ class Dist:
 
         NCCL's setup can leave the calling thread on just the CPUs next to
         its GPU, and every thread and loader worker started from it
-        afterwards inherits that. On a rented slice those can be a handful of the CPUs
-        the process may use: one box gave rank 1 eight of its 56, and its
-        three loaders' decoding crowded onto them while rank 0 waited in the
-        all-reduce. NCCL's own threads keep their placement.
+        afterwards inherits that. On a rented slice those can be a handful
+        of the CPUs the process may use: one box gave rank 1 eight of its
+        56, and its three loaders' decoding crowded onto them while rank 0
+        waited in the all-reduce. NCCL's own threads keep their placement.
         """
         if self.cpus and os.sched_getaffinity(0) != self.cpus:
             logging.warning(
