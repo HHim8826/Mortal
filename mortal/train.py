@@ -98,7 +98,14 @@ def train():
         {'params': decay_params, 'weight_decay': weight_decay},
         {'params': no_decay_params},
     ]
-    optimizer = optim.AdamW(param_groups, lr=1, weight_decay=0, betas=betas, eps=eps)
+    # Fused keeps the step free of host syncs: with GradScaler it skips an
+    # overflowed step on the device instead of reading found_inf back, and it
+    # has no per-parameter `step.item()` for the bias correction, which the
+    # foreach version pays hundreds of times a step once a resumed state has
+    # put the step counts on the GPU. In DDP any such wait on one rank leaves
+    # the other idling in the gradient all-reduce.
+    fused = device.type == 'cuda'
+    optimizer = optim.AdamW(param_groups, lr=1, weight_decay=0, betas=betas, eps=eps, fused=fused)
     scheduler = LinearWarmUpCosineAnnealingLR(optimizer, **config['optim']['scheduler'])
     scaler = GradScaler(device.type, enabled=enable_amp)
     test_player = TestPlayer(
@@ -123,6 +130,17 @@ def train():
         aux_net.load_state_dict(state['aux_net'])
         if not online or state['config']['control']['online']:
             optimizer.load_state_dict(state['optimizer'])
+            if fused:
+                # load_state_dict takes every group setting from the checkpoint,
+                # `fused` included, so one saved by the foreach version would
+                # quietly switch it back off; and fused wants the step counts
+                # as float32 on the parameters' device.
+                for group in optimizer.param_groups:
+                    group['fused'] = True
+                    group['foreach'] = None
+                for param_state in optimizer.state.values():
+                    if 'step' in param_state:
+                        param_state['step'] = param_state['step'].to(device=device, dtype=torch.float32)
             scheduler.load_state_dict(state['scheduler'])
         scaler.load_state_dict(state['scaler'])
         best_perf = state['best_perf']
@@ -267,19 +285,23 @@ def train():
 
         pb = tqdm(total=save_every, desc='TRAIN', initial=steps % save_every,
                   disable=not ddp.is_main)
+        batch_idx = torch.arange(batch_size, device=device)
 
         def train_batch(obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks):
             nonlocal steps
             nonlocal idx
             nonlocal pb
 
-            obs = obs.to(dtype=torch.float32, device=device)
-            actions = actions.to(dtype=torch.int64, device=device)
-            masks = masks.to(dtype=torch.bool, device=device)
-            steps_to_done = steps_to_done.to(dtype=torch.int64, device=device)
-            kyoku_rewards = kyoku_rewards.to(dtype=torch.float64, device=device)
-            player_ranks = player_ranks.to(dtype=torch.int64, device=device)
-            assert masks[range(batch_size), actions].all()
+            # From pinned memory these copies need not wait for the GPU, and
+            # the mask check runs on the device, so nothing here makes the
+            # host wait: it can queue the next step while this one runs.
+            obs = obs.to(dtype=torch.float32, device=device, non_blocking=True)
+            actions = actions.to(dtype=torch.int64, device=device, non_blocking=True)
+            masks = masks.to(dtype=torch.bool, device=device, non_blocking=True)
+            steps_to_done = steps_to_done.to(dtype=torch.int64, device=device, non_blocking=True)
+            kyoku_rewards = kyoku_rewards.to(dtype=torch.float64, device=device, non_blocking=True)
+            player_ranks = player_ranks.to(dtype=torch.int64, device=device, non_blocking=True)
+            torch._assert_async(masks[batch_idx, actions].all())
 
             q_target_mc = gamma ** steps_to_done * kyoku_rewards
             q_target_mc = q_target_mc.to(torch.float32)
@@ -288,7 +310,7 @@ def train():
             with ddp.no_sync(net, (idx + 1) % opt_step_every == 0):
                 with torch.autocast(device.type, enabled=enable_amp):
                     q_out, (next_rank_logits,) = net(obs, masks)
-                    q = q_out[range(batch_size), actions]
+                    q = q_out[batch_idx, actions]
                     dqn_loss = 0.5 * mse(q, q_target_mc)
                     cql_loss = 0
                     if not online:
