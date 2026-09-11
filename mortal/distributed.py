@@ -15,7 +15,7 @@ import logging
 import os
 import random
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 
 import torch
@@ -52,6 +52,52 @@ def available_cpus():
     return len(os.sched_getaffinity(0))
 
 
+def cpu_list(text):
+    """'64-67,192-195' -> {64, 65, 66, 67, 192, 193, 194, 195}"""
+    cpus = set()
+    for part in text.strip().split(','):
+        if part:
+            lo, _, hi = part.partition('-')
+            cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def _read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def l3_domains_near(gpu, allowed):
+    """The groups of `allowed` CPUs sharing an L3 cache on `gpu`'s NUMA node.
+
+    Empty when the machine does not say where things are.
+    """
+    try:
+        p = torch.cuda.get_device_properties(gpu)
+        pci = f'{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0'
+        node = int(_read(f'/sys/bus/pci/devices/{pci}/numa_node'))
+        near = cpu_list(_read(f'/sys/devices/system/node/node{node}/cpulist')) if node >= 0 else set(allowed)
+        domains = set()
+        for cpu in sorted(near & allowed):
+            cache = f'/sys/devices/system/cpu/cpu{cpu}/cache'
+            for index in os.listdir(cache):
+                if index.startswith('index') and _read(f'{cache}/{index}/level') == '3':
+                    domains.add(frozenset(cpu_list(_read(f'{cache}/{index}/shared_cpu_list')) & allowed))
+                    break
+        return sorted(domains, key=min)
+    except Exception:  # best effort: no GPU at that index, no sysfs, an old torch
+        return []
+
+
+def pin_process(cpus):
+    """Move every thread of this process onto `cpus`; threads made later inherit it."""
+    for tid in os.listdir('/proc/self/task'):
+        try:
+            os.sched_setaffinity(int(tid), cpus)
+        except OSError:
+            pass  # the thread has exited
+
+
 class NullWriter:
     """Stands in for SummaryWriter on ranks that do not log."""
 
@@ -66,6 +112,8 @@ class Dist:
         self.local_rank = int(os.environ.get('LOCAL_RANK', '0'))
         self.enabled = self.world_size > 1
         self.control = None
+        self.cpus = None  # this rank's own CPUs, once `place` has pinned it
+        self.all_cpus = None
         self.window_start = time.perf_counter()
         self.waited = {'data': 0., 'ranks': 0.}
 
@@ -91,6 +139,7 @@ class Dist:
                     f'{self.world_size} ranks but {count} GPU(s). Set '
                     'MORTAL_DDP_SHARE_GPU=1 to put them all on one for testing.')
             device = torch.device('cuda', self.local_rank)
+            self.place()
         torch.cuda.set_device(device)
         dist.init_process_group(backend, timeout=TIMEOUT)
         # Barriers and the end-of-data vote go over gloo on the CPU, so they
@@ -104,7 +153,7 @@ class Dist:
         # that size share the same cores. Set before any loader starts.
         per_loader = max(1, per_rank // max(1, loaders_per_rank))
         os.environ.setdefault('RAYON_NUM_THREADS', str(per_loader))
-        torch.set_num_threads(per_rank)
+        torch.set_num_threads(per_rank if self.cpus is None else min(per_rank, len(self.cpus)))
 
         if not self.is_main:
             # One set of logs is enough; the others speak up only on trouble.
@@ -112,8 +161,51 @@ class Dist:
         logging.info(
             f'DDP: {self.world_size} ranks over {backend}, {cpus} CPUs, '
             f'RAYON_NUM_THREADS={os.environ["RAYON_NUM_THREADS"]} per loader, '
-            f'{loaders_per_rank} loader(s) per rank')
+            f'{loaders_per_rank} loader(s) per rank, rank {self.rank} on '
+            + ('any CPU' if self.cpus is None else f'CPUs {sorted(self.cpus)}'))
         return device
+
+    def place(self):
+        """Give each rank an L3 cache of its own next to its GPU, the loaders the rest.
+
+        A rank's threads mostly launch kernels. On cores shared with the
+        loaders' decoding - their caches, their SMT siblings - the backward
+        pass took several times the CPU time it needs and the GPUs waited on
+        it. Set MORTAL_PIN_CPUS=0 to leave placement to the kernel.
+        """
+        if os.environ.get('MORTAL_PIN_CPUS', '1') == '0' or not hasattr(os, 'sched_setaffinity'):
+            return
+        allowed = os.sched_getaffinity(0)
+        taken = []
+        for gpu in range(int(os.environ.get('LOCAL_WORLD_SIZE', self.world_size))):
+            free = [d for d in l3_domains_near(gpu, allowed) if not any(d & t for t in taken)]
+            if not free:
+                return
+            taken.append(free[0])
+        loaders = allowed - set().union(*taken)
+        if len(loaders) < len(allowed) // 2:
+            return
+        self.all_cpus, self.cpus = allowed, taken[self.local_rank]
+        pin_process(self.cpus)
+        # Read by the loader workers, which start out with the rank's CPUs.
+        os.environ['MORTAL_LOADER_CPUS'] = ','.join(map(str, sorted(loaders)))
+
+    @contextmanager
+    def unpinned(self):
+        """Let this thread, and the threads it starts, use every CPU for a while.
+
+        Test play encodes v4 observations in a rayon pool that this thread
+        starts on first use; on the rank's few cores it would crawl. The
+        loaders are idle while it runs, so nothing is taken from them.
+        """
+        if self.cpus is None:
+            yield
+            return
+        os.sched_setaffinity(0, self.all_cpus)
+        try:
+            yield
+        finally:
+            os.sched_setaffinity(0, self.cpus)
 
     def wrap(self, module, device):
         if not self.enabled:

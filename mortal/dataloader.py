@@ -1,3 +1,4 @@
+import os
 import queue
 import random
 import threading
@@ -204,6 +205,11 @@ class FileDatasetsIter(IterableDataset):
         return self.iterator
 
 def worker_init_fn(*args, **kwargs):
+    cpus = os.environ.get('MORTAL_LOADER_CPUS')
+    if cpus:
+        # Forked from a rank pinned to its own few cores (Dist.place); the
+        # decoding belongs on the others.
+        os.sched_setaffinity(0, map(int, cpus.split(',')))
     worker_info = torch.utils.data.get_worker_info()
     dataset = worker_info.dataset
     per_worker = int(np.ceil(len(dataset.file_list) / worker_info.num_workers))
