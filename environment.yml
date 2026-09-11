@@ -8,3 +8,4 @@ dependencies:
     - tqdm
     - toml
     - tensorboard
+    - pyarrow # parquet corpora (dataset.parquet_globs)
