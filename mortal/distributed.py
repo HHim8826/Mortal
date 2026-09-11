@@ -147,29 +147,43 @@ class Dist:
 
         Ranks hold different amounts of data. The first to run out would leave
         the rest waiting forever on a gradient all-reduce it never joins, so
-        before each step they vote, and one empty rank stops them all.
+        they vote on every batch, and one empty rank stops them all. Each vote
+        is cast a step ahead and runs while the step before it trains: waited
+        on at once, it tied every rank's host to the slowest one's, and a
+        host that cannot queue the next step leaves its GPU idle.
 
         Also times the waits, for `pace`: for the next batch, and for the
-        other ranks to have theirs.
+        other ranks' votes.
         """
         it = iter(batches)
         self.window_start = time.perf_counter()
         self.waited = {'data': 0., 'ranks': 0.}
-        while True:
-            t0 = time.perf_counter()
+
+        def fetch():
+            t = time.perf_counter()
             batch = next(it, None)
-            t1 = time.perf_counter()
-            if self.enabled:
-                flag = torch.tensor([0 if batch is None else 1])
-                dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.control)
-                stop = not flag.item()
-            else:
+            self.waited['data'] += time.perf_counter() - t
+            if not self.enabled:
+                return batch, None
+            flag = torch.tensor([0 if batch is None else 1])
+            work = dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.control, async_op=True)
+            return batch, (flag, work)
+
+        batch, vote = fetch()
+        while True:
+            if vote is None:
                 stop = batch is None
-            self.waited['data'] += t1 - t0
-            self.waited['ranks'] += time.perf_counter() - t1
+            else:
+                t = time.perf_counter()
+                flag, work = vote
+                work.wait()
+                self.waited['ranks'] += time.perf_counter() - t
+                stop = not flag.item()
             if stop:
                 return
-            yield batch
+            current = batch
+            batch, vote = fetch()
+            yield current
 
     def pace(self):
         """[wall, data, ranks] seconds since the last call, one list per rank.
