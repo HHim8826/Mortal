@@ -189,6 +189,15 @@ def train():
         ema_tensors = [t for m in ema_models for t in chain(m.parameters(), m.buffers()) if t.is_floating_point()]
         live_tensors = [t for m in (mortal, dqn) for t in chain(m.parameters(), m.buffers()) if t.is_floating_point()]
         best_ema_file = path.splitext(best_state_file)[0] + '_ema.pth'
+        # The average as it stood at the previous evaluation, played beside the
+        # current one on the same walls. Two absolute numbers 40,000 steps apart
+        # carry about 0.02 of noise each when compared, which is more than any
+        # progress they are being asked to show; the difference between the two
+        # models measured over the same walls is the thing worth reporting, and
+        # this is the only way to get it.
+        prev_ema_file = path.splitext(state_file)[0] + '_ema_prev.pth'
+        mortal_prev = copy.deepcopy(mortal).requires_grad_(False)
+        dqn_prev = copy.deepcopy(dqn).requires_grad_(False)
         logging.info(f'ema: decay {ema_decay}, over ~{1 / (1 - ema_decay):,.0f} steps')
 
     if enable_compile:
@@ -489,18 +498,28 @@ def train():
                     # Each rank plays its own slice of the same seeds on its own
                     # GPU. Rank 0 clears the last round's games first, and all
                     # read the finished set back once the slowest rank is done.
+                    prev_steps = None
+                    if ema_models and path.exists(prev_ema_file):
+                        was = torch.load(prev_ema_file, weights_only=True, map_location=device)
+                        mortal_prev.load_state_dict(was['mortal'])
+                        dqn_prev.load_state_dict(was['current_dqn'])
+                        prev_steps = was['steps']
+                        del was
                     ddp.barrier()
                     if ddp.is_main:
                         test_player.clear()
                         if ema_models:
                             test_player.clear('ema')
+                            test_player.clear('prev')
                     ddp.barrier()
                     ddp.sync_buffers(all_models)
                     jobs = [(mortal, dqn, None)]
                     if ema_models:
                         ddp.sync_buffers(ema_models)
                         jobs.append((mortal_ema, dqn_ema, 'ema'))
-                    # Both tracks at once: one arena alone leaves most of the
+                        if prev_steps is not None:
+                            jobs.append((mortal_prev, dqn_prev, 'prev'))
+                    # All of them at once: one arena alone leaves most of the
                     # box idle, and they are independent games. See play_all.
                     test_player.play_all(test_games // 4, jobs, device)
                     ddp.barrier()
@@ -581,6 +600,18 @@ def train():
                             logging.info(f'ema avg rank: {stat_ema.avg_rank:.6}, avg pt: {avg_pt_ema:.6}; '
                                          f'ema minus trained over the same {games:,} games '
                                          f'({seeds:,} walls): rank {diff:+.4f} +- {se:.4f}')
+                            if prev_steps is not None:
+                                # Negative is better, as everywhere else here.
+                                gain, gain_se, _, walls = test_player.paired('ema', against='prev')
+                                writer.add_scalar('test_play_ema/rank_since_last', gain, steps)
+                                logging.info(
+                                    f'progress since step {prev_steps:,}, over the same '
+                                    f'{walls:,} walls: rank {gain:+.4f} +- {gain_se:.4f}')
+                            torch.save({
+                                'mortal': mortal_ema.state_dict(),
+                                'current_dqn': dqn_ema.state_dict(),
+                                'steps': steps,
+                            }, prev_ema_file)
                         writer.flush()
 
                     if (better or better_ema) and ddp.is_main:

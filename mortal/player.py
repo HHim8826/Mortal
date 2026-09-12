@@ -155,8 +155,8 @@ class TestPlayer:
         # Globs **/*.json.gz, so it picks up every rank's directory at once.
         return Stat.from_dir(self.track_dir(track), 'mortal')
 
-    def paired(self, track):
-        """The challenger's rank on `track` minus on the main track, by seed.
+    def paired(self, track, against=None):
+        """The challenger's rank on `track` minus on `against`, by seed.
 
         Both tracks deal the same walls from the same seats, so the luck of the
         deal largely cancels and the difference is far tighter than two
@@ -178,9 +178,10 @@ class TestPlayer:
             names = json.loads(log.split('\n', 1)[0])['names']
             return Stat.from_log(log, names.index('mortal')).avg_rank
 
+        base = self.track_dir(against)
         by_seed = defaultdict(list)
-        for main in glob(path.join(self.log_dir, '**', '*.json.gz'), recursive=True):
-            other = path.join(self.track_dir(track), path.relpath(main, self.log_dir))
+        for main in glob(path.join(base, '**', '*.json.gz'), recursive=True):
+            other = path.join(self.track_dir(track), path.relpath(main, base))
             if path.exists(other):
                 # libriichi names them <seed>_<key>_<a|b|c|d>.json.gz, one
                 # letter per seat of the same wall.
