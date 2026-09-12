@@ -211,6 +211,19 @@ def train():
                              'with opt_step_every > 1')
         net = torch.compile(net, mode=compile_mode)
 
+    def optimizer_step():
+        """Apply what has accumulated, and move the weight average with it."""
+        if max_grad_norm > 0:
+            scaler.unscale_(optimizer)
+            params = chain.from_iterable(g['params'] for g in optimizer.param_groups)
+            clip_grad_norm_(params, max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        if ema_models:
+            with torch.no_grad():
+                torch._foreach_lerp_(ema_tensors, live_tensors, 1 - ema_decay)
+
     def save_state():
         """Write the checkpoint and return it.
 
@@ -379,7 +392,13 @@ def train():
             q_target_mc = q_target_mc.to(torch.float32)
 
             # Only the step that updates the weights needs the all-reduce.
-            with ddp.no_sync(net, (idx + 1) % opt_step_every == 0):
+            # Accumulation boundaries are counted in `steps`, which nothing
+            # resets, rather than in `idx`, which the save window zeroes. Keyed
+            # to `idx` a save landing mid-accumulation dropped the boundary,
+            # and the batches on either side of it were summed into one update
+            # that was still scaled as though there had been opt_step_every of
+            # them. Counted this way a resume also lands where it left off.
+            with ddp.no_sync(net, (steps + 1) % opt_step_every == 0):
                 with torch.autocast(device.type, enabled=enable_amp):
                     q_out, (next_rank_logits,) = net(obs, masks)
                     q = q_out[batch_idx, actions]
@@ -407,17 +426,8 @@ def train():
 
             steps += 1
             idx += 1
-            if idx % opt_step_every == 0:
-                if max_grad_norm > 0:
-                    scaler.unscale_(optimizer)
-                    params = chain.from_iterable(g['params'] for g in optimizer.param_groups)
-                    clip_grad_norm_(params, max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                if ema_models:
-                    with torch.no_grad():
-                        torch._foreach_lerp_(ema_tensors, live_tensors, 1 - ema_decay)
+            if steps % opt_step_every == 0:
+                optimizer_step()
             scheduler.step()
             pb.update(1)
 
@@ -437,21 +447,26 @@ def train():
                 # waits; a slow rank as the others waiting on it.
                 pace = ddp.pace()
                 wall = pace[0][0]
-                writer.add_scalar('perf/steps_per_sec', save_every / wall, steps)
+                # `idx`, not save_every: a window cut short by a resume holds
+                # fewer batches than the save interval names, and every average
+                # over it has to be divided by what it actually holds.
+                writer.add_scalar('perf/steps_per_sec', idx / wall, steps)
                 writer.add_scalar('perf/data_wait', max(data for _, data, _ in pace) / wall, steps)
                 logging.info(
-                    f'{save_every} steps in {wall:.0f} s; waiting for data / other ranks: '
+                    f'{idx} steps in {wall:.0f} s; waiting for data / other ranks: '
                     + ', '.join(f'rank {r} {data / wall:.0%} / {ranks / wall:.0%}'
                                 for r, (_, data, ranks) in enumerate(pace)))
 
-                # downsample to reduce tensorboard event size
-                all_q_1d = all_q.cpu().numpy().flatten()[::128]
-                all_q_target_1d = all_q_target.cpu().numpy().flatten()[::128]
+                # downsample to reduce tensorboard event size. Only the rows
+                # this window actually filled: a window cut short by a resume
+                # leaves the rest holding the last run's numbers.
+                all_q_1d = all_q[:idx].cpu().numpy().flatten()[::128]
+                all_q_target_1d = all_q_target[:idx].cpu().numpy().flatten()[::128]
 
-                writer.add_scalar('loss/dqn_loss', stats['dqn_loss'] / save_every, steps)
+                writer.add_scalar('loss/dqn_loss', stats['dqn_loss'] / idx, steps)
                 if not online:
-                    writer.add_scalar('loss/cql_loss', stats['cql_loss'] / save_every, steps)
-                writer.add_scalar('loss/next_rank_loss', stats['next_rank_loss'] / save_every, steps)
+                    writer.add_scalar('loss/cql_loss', stats['cql_loss'] / idx, steps)
+                writer.add_scalar('loss/next_rank_loss', stats['next_rank_loss'] / idx, steps)
                 writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
                 writer.add_histogram('q_predicted', all_q_1d, steps)
                 writer.add_histogram('q_target', all_q_target_1d, steps)
@@ -633,6 +648,11 @@ def train():
         if not online:
             # only run one epoch for offline for easier control
             break
+    # Whatever is still accumulated belongs in the weights before they are
+    # written down; the checkpoint holds no gradients, so anything left here is
+    # simply lost.
+    if steps % opt_step_every != 0:
+        optimizer_step()
     # The corpus ran out mid-window, so the last steps are in no checkpoint
     # yet, and the line below tells a supervisor to stop watching for a run to
     # come back. They would be lost between the two.

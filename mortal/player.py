@@ -269,18 +269,22 @@ class TrainPlayer:
 
     def play_arenas(self, engine_chal):
         """Every arena at once, and the rankings they came to, added up."""
-        if self.arenas <= 1:
+        # Never more arenas than there are seeds to give them: an arena handed
+        # an empty slice fails in Rust, which wants at least one game, and
+        # takes the whole session down with it.
+        arenas = max(1, min(self.arenas, self.seed_count))
+        if arenas <= 1:
             return np.array(self.play_slice(engine_chal, self.train_seed,
                                             self.seed_count, False))
 
-        results, failures = [None] * self.arenas, []
+        results, failures = [None] * arenas, []
         # Contiguous slices that tile the range exactly, so the session plays
         # the same seeds however many arenas it is split across.
-        per = self.seed_count // self.arenas
+        per = self.seed_count // arenas
         threads = []
-        for i in range(self.arenas):
+        for i in range(arenas):
             first = self.train_seed + i * per
-            count = self.seed_count - i * per if i == self.arenas - 1 else per
+            count = self.seed_count - i * per if i == arenas - 1 else per
 
             def run(i=i, first=first, count=count):
                 try:
