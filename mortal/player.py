@@ -170,7 +170,11 @@ class TrainPlayer:
         logging.info(f'using profile {profile}')
         cfg = config['train_play'][profile]
         self.chal_version = config['control']['version']
-        self.log_dir = path.abspath(cfg['log_dir'])
+        # Several self-play workers share a box and a config, and each one
+        # empties its log directory before every session, so they must not
+        # share one. MORTAL_WORKER, set by the launcher, keeps them apart.
+        worker = os.environ.get('MORTAL_WORKER', '')
+        self.log_dir = path.abspath(cfg['log_dir'] + (f'_{worker}' if worker else ''))
         self.train_key = secrets.randbits(64)
         self.train_seed = 10000
 
