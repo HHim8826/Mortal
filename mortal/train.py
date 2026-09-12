@@ -144,9 +144,34 @@ def train():
         best_perf = state['best_perf']
         steps = state['steps']
 
+    class TrainNet(nn.Module):
+        """The three trained modules as one, so DDP syncs them with one reducer.
+
+        Checkpoints still save each module on its own, so nothing that loads
+        them needs to know this exists.
+        """
+        def __init__(self):
+            super().__init__()
+            self.mortal = mortal
+            self.dqn = dqn
+            self.aux_net = aux_net
+
+        def forward(self, obs, masks):
+            phi = self.mortal(obs)
+            return self.dqn(phi, masks), self.aux_net(phi)
+
+    # Wrapped after loading, so every rank starts from the same weights.
+    net = ddp.wrap(TrainNet(), device)
+
     # A running average of the weights, test-played beside the trained ones on
     # the same walls. It is kept and compared, and saved as its own best, but
     # only becomes the model to use once test play shows it is the stronger.
+    #
+    # After the wrap, never before it: starting from scratch the ranks hold
+    # different random weights until DDP broadcasts rank 0's, and an average
+    # copied before that would carry weights no rank is training, for the
+    # ~1/(1-decay) steps it takes to forget them. Each rank test-plays its own
+    # average, so they would not even be measuring one model.
     ema_decay = config['control'].get('ema_decay', 0)
     ema_models = ()
     best_perf_ema = {'avg_rank': 4., 'avg_pt': -135.}
@@ -166,24 +191,6 @@ def train():
         best_ema_file = path.splitext(best_state_file)[0] + '_ema.pth'
         logging.info(f'ema: decay {ema_decay}, over ~{1 / (1 - ema_decay):,.0f} steps')
 
-    class TrainNet(nn.Module):
-        """The three trained modules as one, so DDP syncs them with one reducer.
-
-        Checkpoints still save each module on its own, so nothing that loads
-        them needs to know this exists.
-        """
-        def __init__(self):
-            super().__init__()
-            self.mortal = mortal
-            self.dqn = dqn
-            self.aux_net = aux_net
-
-        def forward(self, obs, masks):
-            phi = self.mortal(obs)
-            return self.dqn(phi, masks), self.aux_net(phi)
-
-    # Wrapped after loading, so every rank starts from the same weights.
-    net = ddp.wrap(TrainNet(), device)
     if enable_compile:
         # Fuses the ResNet's thousands of small kernels a step, whose launches
         # otherwise leave the GPU waiting on the host: 240 -> 138 ms a step on
@@ -193,12 +200,42 @@ def train():
         # and test play, which runs the modules themselves with a batch size
         # of its own, stays uncompiled instead of recompiling for it.
         compile_mode = config['control'].get('compile_mode')
-        if compile_mode == 'reduce-overhead' and opt_step_every > 1:
+        # Every mode that captures CUDA graphs, which is more than the obvious
+        # one: max-autotune captures them too, and says so only by not being
+        # the -no-cudagraphs spelling of itself.
+        cuda_graphs = compile_mode in ('reduce-overhead', 'max-autotune')
+        if cuda_graphs and opt_step_every > 1:
             # A CUDA graph's replay overwrites the gradients it produced last
             # time, which accumulation still needs to add to.
-            raise ValueError("compile_mode = 'reduce-overhead' (CUDA graphs) cannot be used "
+            raise ValueError(f'compile_mode = {compile_mode!r} (CUDA graphs) cannot be used '
                              'with opt_step_every > 1')
         net = torch.compile(net, mode=compile_mode)
+
+    def save_state():
+        """Write the checkpoint and return it.
+
+        Everything needed to carry on from here, which is more than the
+        weights: resuming without the optimizer's moments and the schedule
+        restarts the run in all but name.
+        """
+        state = {
+            'mortal': mortal.state_dict(),
+            'current_dqn': dqn.state_dict(),
+            'aux_net': aux_net.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
+            'steps': steps,
+            'timestamp': datetime.now().timestamp(),
+            'best_perf': best_perf,
+            'config': config,
+        }
+        if ema_models:
+            state['ema'] = {'mortal': mortal_ema.state_dict(), 'current_dqn': dqn_ema.state_dict()}
+            state['best_perf_ema'] = best_perf_ema
+        if ddp.is_main:
+            torch.save(state, state_file)
+        return state
 
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
@@ -427,23 +464,7 @@ def train():
                 before_next_test_play = (test_every - steps % test_every) % test_every
                 logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
 
-                state = {
-                    'mortal': mortal.state_dict(),
-                    'current_dqn': dqn.state_dict(),
-                    'aux_net': aux_net.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'steps': steps,
-                    'timestamp': datetime.now().timestamp(),
-                    'best_perf': best_perf,
-                    'config': config,
-                }
-                if ema_models:
-                    state['ema'] = {'mortal': mortal_ema.state_dict(), 'current_dqn': dqn_ema.state_dict()}
-                    state['best_perf_ema'] = best_perf_ema
-                if ddp.is_main:
-                    torch.save(state, state_file)
+                state = save_state()
 
                 if online and steps % submit_every != 0:
                     submit_param(mortal, dqn, is_idle=False)
@@ -460,10 +481,13 @@ def train():
                             test_player.clear('ema')
                     ddp.barrier()
                     ddp.sync_buffers(all_models)
-                    test_player.play(test_games // 4, mortal, dqn, device)
+                    jobs = [(mortal, dqn, None)]
                     if ema_models:
                         ddp.sync_buffers(ema_models)
-                        test_player.play(test_games // 4, mortal_ema, dqn_ema, device, track='ema')
+                        jobs.append((mortal_ema, dqn_ema, 'ema'))
+                    # Both tracks at once: one arena alone leaves most of the
+                    # box idle, and they are independent games. See play_all.
+                    test_player.play_all(test_games // 4, jobs, device)
                     ddp.barrier()
                     stat = test_player.collect()
                     mortal.train()
@@ -537,11 +561,11 @@ def train():
                             '4th': stat_ema.rank_4_rate,
                         }, steps)
                         if ddp.is_main:
-                            diff, se, n = test_player.paired('ema')
+                            diff, se, games, seeds = test_player.paired('ema')
                             writer.add_scalar('test_play_ema/rank_minus_trained', diff, steps)
                             logging.info(f'ema avg rank: {stat_ema.avg_rank:.6}, avg pt: {avg_pt_ema:.6}; '
-                                         f'ema minus trained over the same {n} games: '
-                                         f'rank {diff:+.4f} +- {se:.4f}')
+                                         f'ema minus trained over the same {games:,} games '
+                                         f'({seeds:,} walls): rank {diff:+.4f} +- {se:.4f}')
                         writer.flush()
 
                     if (better or better_ema) and ddp.is_main:
@@ -555,15 +579,15 @@ def train():
                         )
                         shutil.copy(state_file, best_state_file)
                     if better_ema and ddp.is_main:
-                        # Loads anywhere mortal.pth does: the averaged weights
-                        # under the usual names.
+                        # A whole checkpoint, with the averaged weights under
+                        # the usual names: it loads anywhere mortal.pth does,
+                        # including as the state an online run starts from,
+                        # which wants aux_net and the optimizer as well.
                         torch.save({
+                            **state,
                             'mortal': mortal_ema.state_dict(),
                             'current_dqn': dqn_ema.state_dict(),
-                            'steps': steps,
-                            'timestamp': datetime.now().timestamp(),
                             'best_perf': best_perf_ema,
-                            'config': config,
                         }, best_ema_file)
                         logging.info(f'a new ema record: rank {best_perf_ema["avg_rank"]:.4}, '
                                      f'pt {best_perf_ema["avg_pt"]:.4}, saving to {best_ema_file}')
@@ -609,6 +633,11 @@ def train():
         if not online:
             # only run one epoch for offline for easier control
             break
+    # The corpus ran out mid-window, so the last steps are in no checkpoint
+    # yet, and the line below tells a supervisor to stop watching for a run to
+    # come back. They would be lost between the two.
+    if steps % save_every != 0:
+        save_state()
     ddp.close()
     if ddp.is_main:
         # The last line of a run that ended because it was finished. A

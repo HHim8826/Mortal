@@ -6,6 +6,8 @@ import json
 import shutil
 import secrets
 import logging
+import threading
+from collections import defaultdict
 from glob import glob
 from os import path
 from model import Brain, DQN
@@ -78,7 +80,47 @@ class TestPlayer:
         return 10000 + first, last - first
 
     def play(self, seed_count, mortal, dqn, device, track=None):
+        self.play_all(seed_count, [(mortal, dqn, track)], device)
+
+    def play_all(self, seed_count, jobs, device):
+        """Play this rank's seeds with each (mortal, dqn, track), all at once.
+
+        The tracks are separate games that only share seeds, and libriichi
+        releases the GIL while it plays them, so threads here really do run at
+        the same time. It is worth the trouble because one arena leaves most of
+        the box idle: it advances every game in flight on a single thread, then
+        encodes the ones that must act in parallel, then runs one forward, and
+        through the first and last of those the cores have nothing to do. An
+        evaluation measured 14 of 56 cores busy against 51 while training. Two
+        arenas fall into each other's gaps.
+
+        They share the champion, which holds nothing between calls, so it stays
+        one copy of one model on the GPU.
+        """
         torch.backends.cudnn.benchmark = False
+        failures = []
+
+        def run(job, quiet):
+            try:
+                self.play_one(seed_count, *job, device=device, quiet=quiet)
+            except BaseException as exc:
+                failures.append(exc)
+
+        try:
+            # Only the first track draws a progress bar; two of them writing to
+            # one terminal produce a log nobody can read.
+            threads = [threading.Thread(target=run, args=(job, i > 0))
+                       for i, job in enumerate(jobs)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            if failures:
+                raise failures[0]
+        finally:
+            torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
+
+    def play_one(self, seed_count, mortal, dqn, track=None, device=None, quiet=False):
         engine_chal = MortalEngine(
             mortal,
             dqn,
@@ -99,7 +141,7 @@ class TestPlayer:
             log_dir = path.join(log_dir, f'rank{self.rank}')
         if count > 0:
             env = OneVsThree(
-                disable_progress_bar = self.rank != 0,
+                disable_progress_bar = quiet or self.rank != 0,
                 log_dir = log_dir,
             )
             env.py_vs_py(
@@ -108,18 +150,27 @@ class TestPlayer:
                 seed_start = (first, 0x2000),
                 seed_count = count,
             )
-        torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
 
     def collect(self, track=None):
         # Globs **/*.json.gz, so it picks up every rank's directory at once.
         return Stat.from_dir(self.track_dir(track), 'mortal')
 
     def paired(self, track):
-        """The challenger's rank on `track` minus on the main track, game by game.
+        """The challenger's rank on `track` minus on the main track, by seed.
 
-        Both tracks deal the same walls from the same seats, so the luck of
-        the deal largely cancels and the difference is far tighter than two
-        separate averages. Returns (mean difference, its standard error, games).
+        Both tracks deal the same walls from the same seats, so the luck of the
+        deal largely cancels and the difference is far tighter than two
+        separate averages.
+
+        The error is taken over walls, not games. A seed is played four times,
+        once from each seat, off one wall, and those four differences are not
+        four independent draws. In practice they are very nearly independent --
+        on the 280,000-step evaluation this widened the interval from 0.0184 to
+        0.0188, because pairing has already cancelled the wall and what is left
+        is each seat's own decisions -- but averaging a wall's four first costs
+        nothing and does not rest on that holding.
+
+        Returns (mean difference, its standard error, games, seeds).
         """
         def rank_in(file):
             with gzip.open(file, 'rt') as f:
@@ -127,15 +178,19 @@ class TestPlayer:
             names = json.loads(log.split('\n', 1)[0])['names']
             return Stat.from_log(log, names.index('mortal')).avg_rank
 
-        diffs = []
+        by_seed = defaultdict(list)
         for main in glob(path.join(self.log_dir, '**', '*.json.gz'), recursive=True):
             other = path.join(self.track_dir(track), path.relpath(main, self.log_dir))
             if path.exists(other):
-                diffs.append(rank_in(other) - rank_in(main))
-        if len(diffs) < 2:
-            return float('nan'), float('nan'), len(diffs)
-        d = np.asarray(diffs)
-        return d.mean(), d.std(ddof=1) / np.sqrt(len(d)), len(d)
+                # libriichi names them <seed>_<key>_<a|b|c|d>.json.gz, one
+                # letter per seat of the same wall.
+                seed = path.basename(main).rsplit('_', 1)[0]
+                by_seed[seed].append(rank_in(other) - rank_in(main))
+        games = sum(len(v) for v in by_seed.values())
+        if len(by_seed) < 2:
+            return float('nan'), float('nan'), games, len(by_seed)
+        d = np.array([np.mean(v) for v in by_seed.values()])
+        return d.mean(), d.std(ddof=1) / np.sqrt(len(d)), games, len(d)
 
 class TrainPlayer:
     def __init__(self):
