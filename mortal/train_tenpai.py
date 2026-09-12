@@ -112,6 +112,8 @@ def main():
     ap.add_argument('--val-batches', type=int, default=60)
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--out', default='logs/tenpai/tenpai.pth')
+    ap.add_argument('--validate-only', default=None,
+                    help='score a saved model instead of training one')
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -135,6 +137,15 @@ def main():
     net = TenpaiNet(TenpaiDataset(train).channels, args.channels, args.blocks).to(device)
     params = sum(p.numel() for p in net.parameters())
     logging.info(f'{params:,} parameters')
+
+    if args.validate_only:
+        saved = torch.load(args.validate_only, weights_only=True, map_location=device)
+        net.load_state_dict(saved['model'])
+        # The same held-out groups and the same rule rates the run was scored
+        # with, since the split is seeded and the rates travel in the file.
+        validate(net, loader(val, seed=1, workers=min(args.workers, 4)),
+                 np.asarray(saved['baseline']), device, args.val_batches)
+        return
     optimizer = optim.AdamW(net.parameters(), lr=args.lr, weight_decay=0.01)
     schedule = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.steps, args.lr / 20)
     scaler = torch.amp.GradScaler(device.type)
@@ -228,6 +239,30 @@ def validate(net, loader, baseline_rates, device, batches):
     logging.info('reliability of the per-tile waits, predicted vs observed:')
     for lo, hi, mean_p, mean_y, n in reliability(data['p'], data['y']):
         logging.info(f'  {lo:.1f}-{hi:.1f}  said {mean_p:.3f}  was {mean_y:.3f}  n={n:,}')
+
+    # What a Brier score of 0.066 against 0.069 actually buys, in the only
+    # terms a player can act on: sort the tiles the rules cannot separate by
+    # what the model thinks of them, and see how often each end is a wait.
+    # What a Brier of 0.066 against 0.069 actually buys. Brier is dominated by
+    # the tiles nobody could call either way; what a player acts on is the
+    # ordering, so sort each subset by what each side thinks and look at the
+    # ends. Within "riichi, non-suji" the rules have spent everything they know
+    # -- all that is left to them is the turn -- so this is the line where the
+    # model either reads something or does not.
+    logging.info(f'{"ranked within subset":<20}{"safest tenth":>26}{"riskiest tenth":>22}')
+    logging.info(f'{"":<20}{"model":>13}{"rules":>13}{"model":>11}{"rules":>11}')
+    for name, mask in subsets.items():
+        if mask.sum() < 10000:
+            continue
+        y = data['y'][mask]
+        n = len(y)
+        cut = max(1, n // 10)
+        ends = []
+        for scores in (data['p'][mask], data['base'][mask]):
+            order = np.argsort(scores, kind='stable')
+            ends.append((y[order[:cut]].mean(), y[order[-cut:]].mean()))
+        logging.info(f'  {name:<18}{ends[0][0]:>13.4f}{ends[1][0]:>13.4f}'
+                     f'{ends[0][1]:>11.4f}{ends[1][1]:>11.4f}')
 
 
 if __name__ == '__main__':
