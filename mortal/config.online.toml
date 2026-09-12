@@ -58,9 +58,14 @@ submit_every = 400
 
 # using env `TRAIN_PLAY_PROFILE`
 [train_play.default]
-# One session per worker per round trip: ~800 trainee-seat games, ~80k
-# instances, ~78 training steps at batch 1024.
-games = 800
+# Games in flight, and the one setting that moved self-play throughput: the
+# arena advances every game it holds in one pass, so a pass costs about the
+# same whether it is carrying 400 games or 3,200, and what it returns per pass
+# scales with how many it holds. Measured on the idle box, one arena against
+# three v4 copies: 400 games 2.75 hanchans/s, 1,600 games 5.55. The cost is
+# staleness -- a session is a round trip, and nothing in it sees a parameter
+# update -- which at ~6 hanchans/s is about nine minutes here.
+games = 3200
 log_dir = 'challenger/train_play'
 # Exploration. Upstream's v3 online used this and it is already more than it
 # sounds: it is the chance per decision of sampling from a temperature-0.05
@@ -69,6 +74,13 @@ boltzmann_epsilon = 0.005
 boltzmann_temp = 0.05
 top_p = 1.0
 repeats = 1
+# Arenas this worker splits its session across, in threads. Measured worse at
+# every setting tried -- 400 games in one arena 2.75 hanchans/s, in two 2.48,
+# in four 1.82 -- because splitting a session is splitting the games in flight,
+# and that is what throughput scales with. Left here at 1 because the knob is
+# what the measurement is recorded against; more *processes* is the way to use
+# more of the box (see WORKERS in launch_online.sh).
+arenas = 1
 
 [test_play]
 # The same 4000 seeds and the same v3 opponent as offline, so avg_rank stays on
@@ -166,7 +178,7 @@ drain_dir = 'online/drain'
 # Games the buffer holds before it tells the workers to stop submitting. Two
 # sessions' worth per worker: enough that the trainer is never idle, small
 # enough that nothing it trains on is many parameter versions old.
-capacity = 4800
+capacity = 19200
 sample_reuse_rate = 0
 sample_reuse_threshold = 0
 # false: the trainer takes whatever has arrived rather than waiting for a full

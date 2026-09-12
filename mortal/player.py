@@ -240,6 +240,62 @@ class TrainPlayer:
 
         self.repeats = cfg['repeats']
         self.repeat_counter = 0
+        # How many arenas this worker runs side by side. One arena uses a
+        # fraction of a box: it advances every game in flight on a single
+        # thread, then encodes what must act in parallel, then runs one
+        # forward, so the cores are idle through the first and last of those.
+        # An evaluation measured 14 of 56 cores busy. Arenas in threads fall
+        # into each other's gaps -- libriichi releases the GIL while it plays
+        # -- and share the one copy of the weights on the GPU, which a second
+        # worker process would not.
+        self.arenas = cfg.get('arenas', 1)
+
+    def play_slice(self, engine_chal, first, count, quiet):
+        """`count` seeds from `first`, into the session's own directory.
+
+        Games are named after their seed, so slices never collide and the
+        whole session still reads back as one directory.
+        """
+        env = OneVsThree(
+            disable_progress_bar = quiet,
+            log_dir = self.log_dir,
+        )
+        return env.py_vs_py(
+            challenger = engine_chal,
+            champion = self.baseline_engine,
+            seed_start = (first, self.train_key),
+            seed_count = count,
+        )
+
+    def play_arenas(self, engine_chal):
+        """Every arena at once, and the rankings they came to, added up."""
+        if self.arenas <= 1:
+            return np.array(self.play_slice(engine_chal, self.train_seed,
+                                            self.seed_count, False))
+
+        results, failures = [None] * self.arenas, []
+        # Contiguous slices that tile the range exactly, so the session plays
+        # the same seeds however many arenas it is split across.
+        per = self.seed_count // self.arenas
+        threads = []
+        for i in range(self.arenas):
+            first = self.train_seed + i * per
+            count = self.seed_count - i * per if i == self.arenas - 1 else per
+
+            def run(i=i, first=first, count=count):
+                try:
+                    results[i] = self.play_slice(engine_chal, first, count, i > 0)
+                except BaseException as exc:
+                    failures.append(exc)
+
+            threads.append(threading.Thread(target=run))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if failures:
+            raise failures[0]
+        return np.sum([np.array(r) for r in results], axis=0)
 
     def train_play(self, mortal, dqn, device):
         torch.backends.cudnn.benchmark = False
@@ -260,16 +316,7 @@ class TrainPlayer:
         if path.isdir(self.log_dir):
             shutil.rmtree(self.log_dir)
 
-        env = OneVsThree(
-            disable_progress_bar = False,
-            log_dir = self.log_dir,
-        )
-        rankings = env.py_vs_py(
-            challenger = engine_chal,
-            champion = self.baseline_engine,
-            seed_start = (self.train_seed, self.train_key),
-            seed_count = self.seed_count,
-        )
+        rankings = self.play_arenas(engine_chal)
         self.repeat_counter += 1
         if self.repeat_counter == self.repeats:
             self.train_seed += self.seed_count
