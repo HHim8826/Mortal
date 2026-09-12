@@ -141,16 +141,36 @@ class FileDatasetsIter(IterableDataset):
             ahead.release()
             yield entries
 
+    def where(self, source):
+        """How a game names itself in a log line: its path, or a digest of it."""
+        if not self.parquet:
+            return source
+        return 'game ' + hashlib.sha1(source.encode()).hexdigest()[:12]
+
+    def decode_batch(self, batch):
+        """`batch` decoded and paired with its sources, minus unreadable games.
+
+        One call for the whole batch: encoding a v4 observation costs enough
+        that fanning out over games in Rust rather than looping here is the
+        difference between 1.8k and 4k instances/s. But a game libriichi
+        refuses to replay (a kakan of a tile already seen, say) fails that one
+        call for the whole batch, and the corpus holds a few, so halve the
+        batch until the offender is alone, name it, and drop only it. Batches
+        without one, which is nearly all of them, decode in a single call.
+        """
+        load = self.loader.load_logs if self.parquet else self.loader.load_gz_log_files
+        try:
+            return list(zip(batch, load(batch)))
+        except Exception as exc:
+            if len(batch) > 1:
+                half = len(batch) // 2
+                return self.decode_batch(batch[:half]) + self.decode_batch(batch[half:])
+            logging.warning(f'skipping an unreadable game: {self.where(batch[0])}: {exc}')
+            return []
+
     def load_entries(self, batch):
         entries = []
-        if self.parquet:
-            # One call for the whole batch: encoding a v4 observation costs
-            # enough that fanning out over games in Rust rather than looping
-            # here is the difference between 1.8k and 4k instances/s.
-            data = self.loader.load_logs(batch)
-        else:
-            data = self.loader.load_gz_log_files(batch)
-        for source, file in zip(batch, data):
+        for source, file in self.decode_batch(batch):
             for game in file:
                 # per move
                 obs = game.take_obs()
@@ -193,10 +213,8 @@ class FileDatasetsIter(IterableDataset):
                         # A logged move libriichi does not consider legal there.
                         # The trainer asserts on this, so drop it here, where
                         # the game it came from is still known.
-                        where = source if not self.parquet else \
-                            'game ' + hashlib.sha1(source.encode()).hexdigest()[:12]
                         logging.warning(
-                            f'skipping an illegal logged move: {where}, seat {player_id}, '
+                            f'skipping an illegal logged move: {self.where(source)}, seat {player_id}, '
                             f'move {i} in kyoku #{at_kyoku[i]}, action {action}, '
                             f'legal {np.flatnonzero(masks[i]).tolist()}')
                         continue
