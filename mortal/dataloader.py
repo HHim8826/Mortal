@@ -143,6 +143,10 @@ class FileDatasetsIter(IterableDataset):
 
     def where(self, source):
         """How a game names itself in a log line: its path, or a digest of it."""
+        if not isinstance(source, str):
+            # A null cell in a parquet shard, say. Whatever it is, naming it
+            # must not be the thing that takes the run down.
+            return repr(source)
         if not self.parquet:
             return source
         return 'game ' + hashlib.sha1(source.encode()).hexdigest()[:12]
@@ -161,7 +165,12 @@ class FileDatasetsIter(IterableDataset):
         load = self.loader.load_logs if self.parquet else self.loader.load_gz_log_files
         try:
             return list(zip(batch, load(batch)))
-        except Exception as exc:
+        except BaseException as exc:
+            # Not `Exception`: a Rust panic arrives as pyo3's PanicException,
+            # which inherits from BaseException and would sail straight past
+            # that and end the run. A real interrupt still has to.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
             if len(batch) > 1:
                 half = len(batch) // 2
                 return self.decode_batch(batch[:half]) + self.decode_batch(batch[half:])
