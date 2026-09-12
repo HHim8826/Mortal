@@ -610,6 +610,10 @@ def train():
             # only run one epoch for offline for easier control
             break
     ddp.close()
+    if ddp.is_main:
+        # The last line of a run that ended because it was finished. A
+        # supervisor watching the log tells that from a crash by this.
+        logging.info(f'training is complete after {steps:,} steps')
 
 def main():
     import os
