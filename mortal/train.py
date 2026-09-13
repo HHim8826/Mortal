@@ -290,7 +290,11 @@ def train():
         if online:
             player_names = ['trainee']
             dirname = drain()
-            file_list = list(map(lambda p: path.join(dirname, p), os.listdir(dirname)))
+            # Files only. The drain directory is shared with whatever else
+            # walks the box's filesystem -- Jupyter leaves `.ipynb_checkpoints`
+            # behind -- and a directory handed to the loader is not a game.
+            file_list = [path.join(dirname, p) for p in sorted(os.listdir(dirname))
+                         if path.isfile(path.join(dirname, p))]
         else:
             player_names_set = set()
             for filename in config['dataset']['player_names_files']:

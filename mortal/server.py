@@ -15,6 +15,25 @@ from threading import Lock
 from common import send_msg, recv_msg, UnexpectedEOF
 from config import config
 
+def logs_in(dirname):
+    """The game logs in a directory, and nothing else that happens to be there.
+
+    These directories belong to the run, but the run does not have the machine
+    to itself: the rented box serves Jupyter over the whole filesystem, and it
+    leaves a `.ipynb_checkpoints` directory wherever it has been. One appeared
+    in the drain directory. `os.remove` raised IsADirectoryError, the handler
+    thread died with the connection under it, and the trainer -- which sees a
+    dropped connection as an unexpected EOF -- went down with it. Every restart
+    met the same directory and died again, so the run stayed down until someone
+    deleted a folder by hand.
+
+    One in the buffer directory would have been worse: the count would no
+    longer match `buffer_size` and the assertion below would take the handler
+    out in the same way, from the other side.
+    """
+    return sorted(name for name in os.listdir(dirname)
+                  if path.isfile(path.join(dirname, name)))
+
 @dataclass
 class State:
     buffer_dir: str
@@ -96,11 +115,11 @@ class Handler(BaseRequestHandler):
     def handle_drain(self):
         drained_size = 0
         with S.dir_lock:
-            buffer_list = os.listdir(S.buffer_dir)
+            buffer_list = logs_in(S.buffer_dir)
             raw_count = len(buffer_list)
             assert raw_count == S.buffer_size
             if (not S.force_sequential or raw_count >= S.capacity) and raw_count > 0:
-                old_drain_list = os.listdir(S.drain_dir)
+                old_drain_list = logs_in(S.drain_dir)
                 for filename in old_drain_list:
                     filepath = path.join(S.drain_dir, filename)
                     os.remove(filepath)
