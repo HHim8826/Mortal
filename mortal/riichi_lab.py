@@ -140,9 +140,16 @@ def _same_action(reaction, candidate):
     if reaction.get('type') != candidate.get('type'):
         return False
     for key, value in candidate.items():
-        if key in ('type', 'actor'):
+        # Only the fields both sides have. The server describes an ankan as
+        # {"type","actor","consumed","pai"} and mjai's ankan has no `pai` at
+        # all, so demanding every field the server names refused a kan whose
+        # four tiles matched exactly -- and threw away a dora indicator and a
+        # replacement draw each time. What this cannot do is tell two
+        # candidates apart on a field only one side carries, so `choose`
+        # insists the match be the only one.
+        if key in ('type', 'actor') or key not in reaction:
             continue
-        mine = reaction.get(key)
+        mine = reaction[key]
         # `consumed` is which tiles the meld is made of, and a meld is not
         # ordered: an ankan offered as ["5m","5m","5m","5mr"] is the one Mortal
         # asked for as ["5mr","5m","5m","5m"]. Compared in order, every kan and
@@ -173,9 +180,16 @@ def choose(reaction, possible, seat, drawn=None):
     when a bot runs out of time.
     """
     if reaction is not None:
-        for candidate in possible:
-            if _same_action(reaction, candidate):
-                return dict(candidate, actor=seat), None
+        matches = [c for c in possible if _same_action(reaction, c)]
+        if len(matches) == 1:
+            return dict(matches[0], actor=seat), None
+        if len(matches) > 1:
+            # Two offers fit what Mortal asked for, so the fields they differ
+            # on are ones it did not name. Guessing between them is how an
+            # action the server did not mean gets sent, and that is a chombo.
+            return _give_up(possible, seat, drawn,
+                            f'{len(matches)} offers fit {json.dumps(reaction.get("type"))}: '
+                            f'{json.dumps(matches)}')
         # Both sides, in full: a type that is in the list and still did not
         # match means the two disagree about the fields, and only the values
         # show which.
@@ -188,6 +202,11 @@ def choose(reaction, possible, seat, drawn=None):
     else:
         why = 'no reaction was held for this request'
 
+    return _give_up(possible, seat, drawn, why)
+
+
+def _give_up(possible, seat, drawn, why):
+    """Forfeit the decision, in the order that costs the least."""
     for candidate in possible:
         if candidate.get('type') == 'none':
             return dict(candidate, actor=seat), why
