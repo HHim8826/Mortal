@@ -39,9 +39,18 @@ from os import path
 
 import torch
 
-from config import config
 from engine import MortalEngine
 from model import Brain, DQN
+
+# Only for the default checkpoint, and only if a training config happens to be
+# here. Playing needs a checkpoint and nothing else -- the shape of the network
+# is inside it -- so somewhere with just the weights and libriichi, which is
+# the sensible place to run a bot from, `--state-file` is the whole setup.
+try:
+    from config import config
+    DEFAULT_STATE_FILE = config['control']['state_file']
+except Exception:
+    DEFAULT_STATE_FILE = None
 
 # Sent to say what happened. Everything here goes to the bot verbatim: libriichi
 # tracks the table from these and nothing else.
@@ -55,7 +64,7 @@ MJAI_EVENTS = frozenset([
 CONTROL_EVENTS = frozenset(['request_action', 'action_ack', 'error'])
 
 
-def load_bot_engine(state_file, device):
+def load_bot_engine(state_file, device, trust=False):
     """Mortal's engine and a tag for it, from a checkpoint on disk.
 
     `enable_quick_eval` is on: it skips the network where the rules leave one
@@ -63,7 +72,27 @@ def load_bot_engine(state_file, device):
     The agari guard is on because the released bot has it on, and a model
     measured without it is a player nobody runs.
     """
-    state = torch.load(state_file, weights_only=True, map_location='cpu')
+    # `weights_only=True` is worth keeping -- a checkpoint is a pickle and this
+    # one may have come off a hub -- but older ones wrote `best_perf` as numpy
+    # scalars, which it refuses by default. Allowing that one type back is a
+    # much smaller hole than turning the check off.
+    try:
+        state = torch.load(state_file, weights_only=True, map_location='cpu')
+    except Exception:
+        # Checkpoints from before 2025 stored `best_perf` as numpy scalars,
+        # which `weights_only=True` refuses, and the allowlist cannot take them
+        # back because numpy 2 moved the class the pickle names. The safe
+        # default stays the default: a checkpoint is a pickle, and one off a
+        # hub can run anything it likes while it loads. Passing
+        # --trust-checkpoint says you know where this one came from.
+        if not trust:
+            raise SystemExit(
+                f'{state_file} will not load under weights_only=True, which is '
+                'usually an older checkpoint holding numpy scalars. Loading it '
+                'the other way runs whatever the file says to run, so pass '
+                '--trust-checkpoint only for a file you produced yourself.')
+        logging.warning('loading %s with weights_only=False, as asked', state_file)
+        state = torch.load(state_file, weights_only=False, map_location='cpu')
     cfg = state['config']
     version = cfg['control'].get('version', 1)
     num_blocks = cfg['resnet']['num_blocks']
@@ -112,7 +141,7 @@ def _same_action(reaction, candidate):
     return True
 
 
-def choose(reaction, possible, seat):
+def choose(reaction, possible, seat, drawn=None):
     """What to send: Mortal's choice if the server offers it, else a safe one.
 
     An action the server did not list is a chombo -- a mangan and the kyoku
@@ -120,6 +149,12 @@ def choose(reaction, possible, seat):
     means the two disagree about the table, which is worth a loud log and a
     forfeited decision, not a forfeited game: `none` gives up the call, and a
     discard gives up the turn, and both leave the hanchan running.
+
+    The discard it gives up with is the tile just drawn, when that is on offer.
+    Taking the first tile the server happens to list is how a hand that was one
+    tile from complete gets taken apart to save a single decision; tsumogiri
+    leaves the hand exactly as it was, and is what the platform itself plays
+    when a bot runs out of time.
     """
     if reaction is not None:
         for candidate in possible:
@@ -132,6 +167,9 @@ def choose(reaction, possible, seat):
     for candidate in possible:
         if candidate.get('type') == 'none':
             return dict(candidate, actor=seat), why
+    for candidate in possible:
+        if candidate.get('type') == 'dahai' and candidate.get('pai') == drawn:
+            return dict(candidate, actor=seat, tsumogiri=True), why
     for candidate in possible:
         if candidate.get('type') == 'dahai':
             return dict(candidate, actor=seat), why
@@ -149,6 +187,7 @@ class Session:
         self.bot = None
         self.seat = None
         self.reaction = None        # held from the event until the request
+        self.drawn = None           # this seat's newest draw, for the fallback
         self.lines = []             # this game's events, as they arrived
         self.games = 0
         self.results = []           # (placement, own score) per game
@@ -188,6 +227,12 @@ class Session:
         elapsed = time.perf_counter() - started
         self.slowest = max(self.slowest, elapsed)
 
+        # What a forfeited discard should give up, if it comes to that.
+        if kind == 'tsumo' and event.get('actor') == self.seat:
+            self.drawn = event.get('pai')
+        elif kind == 'dahai' and event.get('actor') == self.seat:
+            self.drawn = None
+
         if answer:
             self.reaction = json.loads(answer)
         if kind == 'end_game':
@@ -196,7 +241,7 @@ class Session:
     def respond(self, event):
         """Answer one `request_action`, echoing its id."""
         action, why = choose(self.reaction, event.get('possible_actions') or [],
-                             self.seat if self.seat is not None else 0)
+                             self.seat if self.seat is not None else 0, self.drawn)
         if why:
             self.fallbacks += 1
             logging.warning('falling back to %s: %s', action.get('type'), why)
@@ -302,8 +347,10 @@ def main():
     ap.add_argument('--ranked', action='store_true',
                     help='the ranked ladder instead of validation')
     ap.add_argument('--host', default='wss://game.riichi.dev')
-    ap.add_argument('--state-file', default=config['control']['state_file'],
-                    help='the checkpoint to play (default: the config\'s)')
+    ap.add_argument('--state-file', default=DEFAULT_STATE_FILE,
+                    required=DEFAULT_STATE_FILE is None,
+                    help='the checkpoint to play'
+                         + (' (default: the config\'s)' if DEFAULT_STATE_FILE else ''))
     ap.add_argument('--device', default='cpu',
                     help='cpu is enough: one decision at a time, and the grace '
                          'period is three seconds')
@@ -311,6 +358,9 @@ def main():
     ap.add_argument('--log-dir', help='write each game as mjai lines, for review')
     ap.add_argument('--once', action='store_true',
                     help='do not reconnect after a disconnection')
+    ap.add_argument('--trust-checkpoint', action='store_true',
+                    help='load a checkpoint that weights_only=True refuses; '
+                         'only for a file you produced yourself')
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -325,8 +375,8 @@ def main():
     if not args.url:
         args.url = args.host + ('/ws/ranked' if args.ranked else '/ws/validate')
 
-    engine, tag, steps, best = load_bot_engine(args.state_file,
-                                               torch.device(args.device))
+    engine, tag, steps, best = load_bot_engine(
+        args.state_file, torch.device(args.device), args.trust_checkpoint)
     logging.info('playing %s from %s%s%s', tag, args.state_file,
                  f', step {steps:,}' if steps else '',
                  f', test play {best["avg_rank"]:.4f} / {best["avg_pt"]:+.3f}'
