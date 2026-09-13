@@ -165,6 +165,29 @@ class Dist:
             return net.no_sync()
         return nullcontext()
 
+    def all_reduce_grads(self, net):
+        """Average the gradients across ranks, as a synced backward would.
+
+        For the accumulation group that never finishes: the corpus runs out
+        part way through one, so every backward in it ran under `no_sync` --
+        the step that would have synced never came -- and each rank is left
+        holding only what it saw. Stepping on that gives every rank a different
+        model, and only rank 0's is written down.
+
+        On a synced backward DDP's reducer all-reduces the whole gradient
+        bucket, not just that microbatch's part, so doing the same by hand
+        leaves the weights where a full group would have left them.
+
+        The default process group, not `control`: that one is gloo, for small
+        flags on the CPU, and these are on the GPU.
+        """
+        if not self.enabled:
+            return
+        for p in net.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad)
+                p.grad /= self.world_size
+
     def shard(self, items, seed):
         """This rank's share of `items`; the same split on every rank.
 

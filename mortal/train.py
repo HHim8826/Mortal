@@ -290,11 +290,13 @@ def train():
         if online:
             player_names = ['trainee']
             dirname = drain()
-            # Files only. The drain directory is shared with whatever else
-            # walks the box's filesystem -- Jupyter leaves `.ipynb_checkpoints`
-            # behind -- and a directory handed to the loader is not a game.
+            # Game logs by name, the same rule the server drains by. The
+            # directory is shared with whatever else walks the box's
+            # filesystem -- Jupyter leaves `.ipynb_checkpoints` behind, editors
+            # leave swap files -- and none of that is a game.
             file_list = [path.join(dirname, p) for p in sorted(os.listdir(dirname))
-                         if path.isfile(path.join(dirname, p))]
+                         if p.endswith('.json.gz')
+                         and path.isfile(path.join(dirname, p))]
         else:
             player_names_set = set()
             for filename in config['dataset']['player_names_files']:
@@ -695,6 +697,12 @@ def train():
     # written down; the checkpoint holds no gradients, so anything left here is
     # simply lost.
     if steps % opt_step_every != 0:
+        # Every backward in this unfinished group ran under `no_sync`, so the
+        # gradients are still each rank's own. Averaging them here is what the
+        # synced backward at the end of a full group would have done; without
+        # it the ranks step to different weights and the checkpoint keeps only
+        # rank 0's, with the others' last batches simply gone.
+        ddp.all_reduce_grads(net)
         optimizer_step()
     # The corpus ran out mid-window, so the last steps are in no checkpoint
     # yet, and the line below tells a supervisor to stop watching for a run to
