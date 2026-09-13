@@ -63,6 +63,12 @@ MJAI_EVENTS = frozenset([
 # Sent to ask for something, or to say nothing at all.
 CONTROL_EVENTS = frozenset(['request_action', 'action_ack', 'error'])
 
+# The verdict on a validation game, and the reason to have played it. The
+# platform closes the connection right after, so this is the last thing said
+# and the only place the answer appears; its fields are the server's business,
+# so it is printed whole rather than picked apart against a guess.
+VERDICT_EVENTS = frozenset(['validation_result'])
+
 
 def load_bot_engine(state_file, device, trust=False):
     """Mortal's engine and a tag for it, from a checkpoint on disk.
@@ -193,6 +199,7 @@ class Session:
         self.results = []           # (placement, own score) per game
         self.slowest = 0.0
         self.fallbacks = 0
+        self.verdicts = []          # whatever the platform said about the games
 
     def on_mjai(self, line, event):
         """Feed one event to the bot and hold whatever it answers."""
@@ -309,6 +316,9 @@ async def play(url, token, session, games, ping_interval=20):
                     logging.info('played %d games; closing', session.games)
                     await ws.close()
                     return True
+            elif kind in VERDICT_EVENTS:
+                logging.info('%s: %s', kind, json.dumps(event, ensure_ascii=False))
+                session.verdicts.append(event)
             elif kind == 'error':
                 logging.error('server: %s', event)
             elif kind not in CONTROL_EVENTS:
@@ -393,6 +403,8 @@ def main():
                      'slowest decision %.0f ms',
                      len(ranks), sum(ranks) / len(ranks), session.fallbacks,
                      session.slowest * 1000)
+        for verdict in session.verdicts:
+            logging.info('%s', json.dumps(verdict, ensure_ascii=False))
 
 
 if __name__ == '__main__':
