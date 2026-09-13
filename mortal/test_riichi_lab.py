@@ -169,6 +169,53 @@ class DisplayTests(unittest.TestCase):
         self.assertNotIn('captured warning', ansi)  # never printed above the screen
 
 
+class ActionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from riichi_lab import choose
+        cls.choose = staticmethod(choose)
+
+    def test_duplicate_discard_offers_preserve_model_choice(self):
+        for tile, count in (('9m', 2), ('7m', 3), ('F', 2)):
+            with self.subTest(tile=tile, count=count):
+                candidate = {'actor': 0, 'pai': tile, 'type': 'dahai'}
+                possible = [dict(candidate) for _ in range(count)]
+                possible.append({'type': 'dahai', 'pai': '5p', 'actor': 0})
+                reaction = dict(candidate, tsumogiri=False)
+                action, why = self.choose(reaction, possible, seat=0, drawn='5p')
+                self.assertIsNone(why)
+                self.assertEqual(action, candidate)
+                self.assertIsNot(action, possible[0])
+                self.assertEqual(len(possible), count + 1)
+
+    def test_duplicate_none_and_meld_offers(self):
+        for candidate in ({'type': 'none'},
+                          {'type': 'ankan', 'actor': 0, 'pai': '5m',
+                           'consumed': ['5m', '5m', '5m', '5mr']}):
+            with self.subTest(kind=candidate['type']):
+                reaction = {k: v for k, v in candidate.items() if k != 'pai'}
+                if 'consumed' in reaction:
+                    reaction['consumed'] = list(reversed(reaction['consumed']))
+                action, why = self.choose(reaction, [candidate, dict(reversed(list(candidate.items())))], 0)
+                self.assertIsNone(why)
+                self.assertEqual(action, dict(candidate, actor=0))
+
+    def test_distinct_server_fields_still_require_fallback(self):
+        reaction = {'type': 'dahai', 'pai': '9m'}
+        candidates = [dict(reaction, tsumogiri=False), dict(reaction, tsumogiri=True)]
+        possible = candidates + [dict(candidates[0]), {'type': 'none'}]
+        action, why = self.choose(reaction, possible, 0)
+        self.assertEqual(action, {'type': 'none', 'actor': 0})
+        self.assertIn('2 offers fit', why)
+
+    def test_red_five_and_absent_reaction_keep_fallback(self):
+        possible = [{'type': 'dahai', 'pai': '5m'}] * 2 + [{'type': 'none'}]
+        for reaction in (None, {'type': 'dahai', 'pai': '5mr'}):
+            action, why = self.choose(reaction, possible, 0)
+            self.assertEqual(action, {'type': 'none', 'actor': 0})
+            self.assertIsNotNone(why)
+
+
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_buffered_events_allow_ui_to_run(self):
         import riichi_lab
@@ -214,7 +261,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             {'type': 'start_kyoku', 'bakaze': 'E', 'kyoku': 1, 'scores': [25000] * 4},
             {'type': 'tsumo', 'actor': 1, 'pai': '5mr'},
             {'type': 'request_action', 'request_id': 'turn-123',
-             'possible_actions': [{'type': 'dahai', 'pai': '5mr'}]},
+             'possible_actions': [{'type': 'dahai', 'pai': '5mr'},
+                                  {'type': 'dahai', 'pai': '5mr'}]},
             {'type': 'dahai', 'actor': 1, 'pai': '5mr', 'tsumogiri': True},
             {'type': 'ryukyoku', 'deltas': [-1000, 3000, -1000, -1000]},
             {'type': 'end_game', 'scores': [24000, 28000, 24000, 24000]},

@@ -163,7 +163,7 @@ class NoticeHandler(logging.Handler):
     def emit(self, record):
         message = clean(record.getMessage())
         if record.msg == 'falling back to %s: %s':
-            message = f'Fallback to {clean(record.args[0])}: model choice did not match server offers.'
+            message = f'Fallback to {clean(record.args[0])}: model choice has no unique legal match.'
         self.messages.append(message)
         if record.levelno >= logging.WARNING:
             self.warning = f'{record.levelname}: {message}'

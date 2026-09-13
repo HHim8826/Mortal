@@ -188,7 +188,14 @@ def choose(reaction, possible, seat, drawn=None):
     when a bot runs out of time.
     """
     if reaction is not None:
-        matches = [c for c in possible if _same_action(reaction, c)]
+        matches = []
+        for candidate in possible:
+            # Validation can repeat the exact same discard in its list of
+            # legal actions. Repeated identical offers are still one
+            # action; only distinct offers make a match ambiguous. Compare
+            # the entire candidate so differing server fields stay distinct.
+            if _same_action(reaction, candidate) and candidate not in matches:
+                matches.append(candidate)
         if len(matches) == 1:
             return dict(matches[0], actor=seat), None
         if len(matches) > 1:
