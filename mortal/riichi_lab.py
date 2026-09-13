@@ -142,7 +142,17 @@ def _same_action(reaction, candidate):
     for key, value in candidate.items():
         if key in ('type', 'actor'):
             continue
-        if reaction.get(key) != value:
+        mine = reaction.get(key)
+        # `consumed` is which tiles the meld is made of, and a meld is not
+        # ordered: an ankan offered as ["5m","5m","5m","5mr"] is the one Mortal
+        # asked for as ["5mr","5m","5m","5m"]. Compared in order, every kan and
+        # every pon whose spelling differed was refused and thrown away on the
+        # fallback. Sorted keeps the red five distinct, which it must be -- a
+        # pon of three plain fives is a different call from one holding the red.
+        if isinstance(value, list) and isinstance(mine, list):
+            if sorted(value) != sorted(mine):
+                return False
+        elif mine != value:
             return False
     return True
 
@@ -166,7 +176,15 @@ def choose(reaction, possible, seat, drawn=None):
         for candidate in possible:
             if _same_action(reaction, candidate):
                 return dict(candidate, actor=seat), None
-        why = f'{reaction.get("type")} is not among {[c.get("type") for c in possible]}'
+        # Both sides, in full: a type that is in the list and still did not
+        # match means the two disagree about the fields, and only the values
+        # show which.
+        same_type = [c for c in possible if c.get('type') == reaction.get('type')]
+        why = (f'wanted {json.dumps(reaction, default=str)}; '
+               + (f'the server offered {json.dumps(same_type)} under that type'
+                  if same_type else
+                  f'nothing of that type was offered, only '
+                  f'{sorted({c.get("type") for c in possible})}'))
     else:
         why = 'no reaction was held for this request'
 
@@ -322,7 +340,7 @@ async def play(url, token, session, games, ping_interval=20):
             elif kind == 'error':
                 logging.error('server: %s', event)
             elif kind not in CONTROL_EVENTS:
-                logging.info('unknown message type %r, ignored', kind)
+                logging.info('unknown message %.300s, ignored', line)
     return False
 
 
