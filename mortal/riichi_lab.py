@@ -218,6 +218,8 @@ class Session:
         self.slowest = 0.0
         self.fallbacks = 0
         self.verdicts = []          # whatever the platform said about the games
+        self.since = time.time()    # when the current wait or game began
+        self.where = 'waiting for a match'
 
     def on_mjai(self, line, event):
         """Feed one event to the bot and hold whatever it answers."""
@@ -236,6 +238,27 @@ class Session:
             logging.warning('%s before start_game; ignored', kind)
             return
         self.lines.append(line)
+
+        # Matched, and then one line a kyoku. Between these the process is
+        # silent for minutes at a time, and silence while queued looks exactly
+        # like silence while stuck.
+        if kind == 'start_game':
+            names = event.get('names') or []
+            logging.info('matched: seat %d of 4%s', self.seat,
+                         f', against {", ".join(str(n) for n in names)}' if names else '')
+            self.where, self.since = 'in a game', time.time()
+        elif kind == 'start_kyoku':
+            bakaze = event.get('bakaze', '?')
+            self.where = (f'{bakaze}{event.get("kyoku", "?")}'
+                          f'-{event.get("honba", 0)}')
+            logging.info('%s | scores %s', self.where, event.get('scores'))
+        elif kind == 'hora':
+            who = 'we' if event.get('actor') == self.seat else f'seat {event.get("actor")}'
+            off = event.get('target')
+            logging.info('%s won %s%s', who,
+                         (event.get('deltas') or ['?'])[event.get('actor', 0)]
+                         if event.get('deltas') else 'a hand',
+                         '' if off == event.get('actor') else f' off seat {off}')
 
         started = time.perf_counter()
         try:
@@ -297,6 +320,21 @@ class Session:
             logging.info('log written to %s', out)
         self.bot = None
         self.lines = []
+        self.where, self.since = 'waiting for a match', time.time()
+
+
+async def heartbeat(session, every=60):
+    """Say where things stand while nothing is arriving.
+
+    A queue and a hang produce the same thing on the wire, which is nothing, so
+    the only way to tell them apart from outside is for the process to keep
+    saying which one it thinks it is in.
+    """
+    while True:
+        await asyncio.sleep(every)
+        logging.info('%s, %.0f min so far (%d games played)',
+                     session.where, (time.time() - session.since) / 60,
+                     session.games)
 
 
 async def play(url, token, session, games, ping_interval=20):
@@ -315,32 +353,44 @@ async def play(url, token, session, games, ping_interval=20):
 
     async with connect as ws:
         logging.info('connected to %s', url)
-        async for raw in ws:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                logging.warning('not JSON, ignored: %.120s', line)
-                continue
-            kind = event.get('type')
+        # Beside the socket, not in it: the loop below is blocked waiting for
+        # a message for minutes at a time, which is exactly when somebody
+        # wants to know whether anything is happening.
+        pulse = asyncio.ensure_future(heartbeat(session))
+        try:
+            return await _pump(ws, session, games)
+        finally:
+            pulse.cancel()
 
-            if kind == 'request_action':
-                await ws.send(json.dumps(session.respond(event)))
-            elif kind in MJAI_EVENTS:
-                session.on_mjai(line, event)
-                if kind == 'end_game' and games and session.games >= games:
-                    logging.info('played %d games; closing', session.games)
-                    await ws.close()
-                    return True
-            elif kind in VERDICT_EVENTS:
-                logging.info('%s: %s', kind, json.dumps(event, ensure_ascii=False))
-                session.verdicts.append(event)
-            elif kind == 'error':
-                logging.error('server: %s', event)
-            elif kind not in CONTROL_EVENTS:
-                logging.info('unknown message %.300s, ignored', line)
+
+async def _pump(ws, session, games):
+    """Read messages until the budget is met or the server stops sending."""
+    async for raw in ws:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            logging.warning('not JSON, ignored: %.120s', line)
+            continue
+        kind = event.get('type')
+
+        if kind == 'request_action':
+            await ws.send(json.dumps(session.respond(event)))
+        elif kind in MJAI_EVENTS:
+            session.on_mjai(line, event)
+            if kind == 'end_game' and games and session.games >= games:
+                logging.info('played %d games; closing', session.games)
+                await ws.close()
+                return True
+        elif kind in VERDICT_EVENTS:
+            logging.info('%s: %s', kind, json.dumps(event, ensure_ascii=False))
+            session.verdicts.append(event)
+        elif kind == 'error':
+            logging.error('server: %s', event)
+        elif kind not in CONTROL_EVENTS:
+            logging.info('unknown message %.300s, ignored', line)
     return False
 
 
@@ -348,16 +398,31 @@ async def run(args, engine):
     session = Session(engine, args.log_dir)
     attempt = 0
     while True:
+        before = session.games
         try:
             done = await play(args.url, args.token, session, args.games)
             if done:
                 return session
             logging.info('server closed the connection')
-            attempt = 0
         except (KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:
-            logging.error('connection failed: %r', exc)
+            # A game per connection is how the platform works: it hangs up when
+            # the hanchan ends, and on the ranked endpoint it does so abruptly
+            # enough that websockets calls it an error rather than a close. So
+            # the log line says what it is, and whether to back off is decided
+            # below by whether anything was played, not by how the socket ended.
+            played = session.games > before
+            logging.log(logging.INFO if played else logging.ERROR,
+                        'connection ended: %r', exc)
+        if session.games > before:
+            # This connection played a game, so the token and the server and
+            # the protocol are all fine, whatever it did on the way out.
+            # Counting those as failures walked the backoff up to a minute
+            # between hanchans and never came back down, because every game
+            # ends this way.
+            attempt = 0
+        else:
             attempt += 1
         if args.once:
             return session
