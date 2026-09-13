@@ -252,6 +252,19 @@ class Session:
             self.where = (f'{bakaze}{event.get("kyoku", "?")}'
                           f'-{event.get("honba", 0)}')
             logging.info('%s | scores %s', self.where, event.get('scores'))
+        elif kind == 'ryukyoku':
+            # A draw ends a kyoku as surely as a win does, and said nothing:
+            # the next kyoku simply appeared with different scores and a honba
+            # nobody had explained. On an exhaustive draw the seats with a
+            # positive delta are the ones that were tenpai; an abortive one
+            # moves nothing, and says so by having nobody.
+            deltas = event.get('deltas') or [0, 0, 0, 0]
+            held = [i for i, d in enumerate(deltas) if d > 0]
+            mine = deltas[self.seat] if self.seat is not None and self.seat < len(deltas) else 0
+            logging.info('%s | tenpai: %s | we %+d',
+                         event.get('reason', 'draw'),
+                         ', '.join(('we' if i == self.seat else f'seat {i}') for i in held)
+                         or 'nobody', mine)
         elif kind == 'hora':
             who = 'we' if event.get('actor') == self.seat else f'seat {event.get("actor")}'
             off = event.get('target')
