@@ -95,8 +95,16 @@ class TenpaiDataset(IterableDataset):
                         continue
                     try:
                         yield from self.samples(log, rng)
-                    except Exception:
-                        # One unreadable game is not worth an epoch.
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException:
+                        # One unreadable game is not worth an epoch. Not
+                        # `Exception`: a malformed log makes the Rust side
+                        # panic, and pyo3 raises that as a PanicException,
+                        # which inherits from BaseException and so walked
+                        # straight out of an `except Exception` and killed the
+                        # run. The main loader learned this in 2ac97f9; this
+                        # pipeline was written afterwards and repeated it.
                         continue
 
     def samples(self, log, rng):

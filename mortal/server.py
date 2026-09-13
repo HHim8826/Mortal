@@ -30,9 +30,17 @@ def logs_in(dirname):
     One in the buffer directory would have been worse: the count would no
     longer match `buffer_size` and the assertion below would take the handler
     out in the same way, from the other side.
+
+    A game log is recognised by its name, not by being a file: excluding only
+    directories still let a `note.txt` or an editor's swap file into the count,
+    and left the same assertion to fail on the next drain -- and `handle_drain`
+    would have deleted it, which is nobody's idea of a temporary file. What the
+    workers submit is what libriichi wrote, `<seed>_<key>_<seat>.json.gz`, with
+    a submission number in front.
     """
     return sorted(name for name in os.listdir(dirname)
-                  if path.isfile(path.join(dirname, name)))
+                  if name.endswith('.json.gz')
+                  and path.isfile(path.join(dirname, name)))
 
 @dataclass
 class State:

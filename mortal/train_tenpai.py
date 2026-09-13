@@ -26,6 +26,7 @@ the honest "no idea" the rules give.
 """
 import argparse
 import logging
+import os
 import time
 from glob import glob
 from os import path
@@ -115,6 +116,17 @@ def main():
     ap.add_argument('--validate-only', default=None,
                     help='score a saved model instead of training one')
     args = ap.parse_args()
+
+    # Before anything long runs, not after. The first save is the one at the
+    # end, so a missing parent directory -- which the default `logs/tenpai`
+    # is, in a fresh checkout -- surfaced as a torch.save failure with the
+    # whole training behind it and nothing written down.
+    out_dir = path.dirname(path.abspath(args.out))
+    os.makedirs(out_dir, exist_ok=True)
+    probe = path.join(out_dir, '.writable')
+    with open(probe, 'w'):
+        pass
+    os.remove(probe)
 
     device = torch.device(args.device)
     groups = row_groups(args.globs)
