@@ -33,7 +33,14 @@ device = 'cuda:0'
 enable_cudnn_benchmark = true
 enable_amp = true
 enable_compile = true
-compile_mode = 'reduce-overhead'
+# Not 'reduce-overhead' here, which captures CUDA graphs. A graph's memory
+# lives in a private pool that no other allocation can borrow, and offline's
+# 1024 was split across two GPUs where online's sits whole on one: the first
+# evaluation died with 14.04 GiB in graph pools and 53 MB free, on a 132 MB
+# request. It costs nothing to give up. The trainer waits on the workers for
+# 91% of its time -- self-play is what online is short of, never step speed --
+# so a slower step is a step that still finishes long before the next game does.
+compile_mode = 'default'
 # Over ~5,000 steps as offline, but online steps are ~10x rarer, so this is a
 # much longer window in games played. Kept because the average was ahead of the
 # trained weights in every offline evaluation.

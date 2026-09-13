@@ -519,6 +519,14 @@ def train():
                         jobs.append((mortal_ema, dqn_ema, 'ema'))
                         if prev_steps is not None:
                             jobs.append((mortal_prev, dqn_prev, 'prev'))
+                    # Training's cached blocks back to the driver first. Online
+                    # puts the whole batch and the test play on one GPU -- the
+                    # workers have the other -- and the first test play there
+                    # died on 132 MB with 15.1 GiB held by the trainer. Between
+                    # evaluations the cache is worth keeping; at one, whatever
+                    # it is holding is worth less than the measurement.
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
                     # All of them at once: one arena alone leaves most of the
                     # box idle, and they are independent games. See play_all.
                     test_player.play_all(test_games // 4, jobs, device)
