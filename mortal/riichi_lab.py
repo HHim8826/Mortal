@@ -1,10 +1,16 @@
 """Play Mortal against other people's bots on RiichiLab (riichi.dev).
 
-    pip install websockets
+    pip install websockets rich
     export RIICHI_BOT_TOKEN=...                 # from riichi.dev/bots
     python riichi_lab.py                        # validation ladder
     python riichi_lab.py --ranked               # ranked, once validated
     python riichi_lab.py --ranked --games 50 --log-dir logs/riichi
+    python riichi_lab.py --display plain        # line logs for pipes / services
+
+Interactive terminals use a quiet full-screen dashboard, sampled at 2 Hz.
+Resize the terminal to show more of the rivers; Ctrl+C restores the prompt.
+Use --refresh-rate to change the display cadence without slowing the bots.
+--log-dir also keeps a complete riichi_lab.log while the display is running.
 
 The platform speaks mjai, which is the language Mortal already thinks in, so
 this is mostly plumbing: the server sends the same event stream `mortal.py`
@@ -36,11 +42,13 @@ import os
 import time
 from datetime import datetime, timezone
 from os import path
+from contextlib import nullcontext
 
 import torch
 
 from engine import MortalEngine
 from model import Brain, DQN
+from riichi_lab_ui import Dashboard, TableState, use_dashboard
 
 # Only for the default checkpoint, and only if a training config happens to be
 # here. Playing needs a checkpoint and nothing else -- the shape of the network
@@ -239,6 +247,14 @@ class Session:
         self.verdicts = []          # whatever the platform said about the games
         self.since = time.time()    # when the current wait or game began
         self.where = 'waiting for a match'
+        self.table = TableState()
+        self.phase = 'Loading model'
+        self.phase_since = time.monotonic()
+        self.last_received = None
+
+    def set_phase(self, phase):
+        self.phase = phase
+        self.phase_since = time.monotonic()
 
     def on_mjai(self, line, event):
         """Feed one event to the bot and hold whatever it answers."""
@@ -257,6 +273,7 @@ class Session:
             logging.warning('%s before start_game; ignored', kind)
             return
         self.lines.append(line)
+        self.table.update(event)
 
         # Matched, and then one line a kyoku. Between these the process is
         # silent for minutes at a time, and silence while queued looks exactly
@@ -266,6 +283,7 @@ class Session:
             logging.info('matched: seat %d of 4%s', self.seat,
                          f', against {", ".join(str(n) for n in names)}' if names else '')
             self.where, self.since = 'in a game', time.time()
+            self.set_phase('Playing')
         elif kind == 'start_kyoku':
             bakaze = event.get('bakaze', '?')
             self.where = (f'{bakaze}{event.get("kyoku", "?")}'
@@ -353,6 +371,7 @@ class Session:
         self.bot = None
         self.lines = []
         self.where, self.since = 'waiting for a match', time.time()
+        self.set_phase('Game complete')
 
 
 async def heartbeat(session, every=60):
@@ -385,6 +404,7 @@ async def play(url, token, session, games, ping_interval=20):
 
     async with connect as ws:
         logging.info('connected to %s', url)
+        session.set_phase('Waiting for match')
         # Beside the socket, not in it: the loop below is blocked waiting for
         # a message for minutes at a time, which is exactly when somebody
         # wants to know whether anything is happening.
@@ -393,11 +413,16 @@ async def play(url, token, session, games, ping_interval=20):
             return await _pump(ws, session, games)
         finally:
             pulse.cancel()
+            try:
+                await pulse
+            except asyncio.CancelledError:
+                pass
 
 
 async def _pump(ws, session, games):
     """Read messages until the budget is met or the server stops sending."""
     async for raw in ws:
+        session.last_received = time.monotonic()
         line = raw.strip()
         if not line:
             continue
@@ -423,14 +448,22 @@ async def _pump(ws, session, games):
             logging.error('server: %s', event)
         elif kind not in CONTROL_EVENTS:
             logging.info('unknown message %.300s, ignored', line)
+        # recv() can complete immediately for a buffered burst. Let the
+        # sampled display and heartbeat run even while the socket stays busy.
+        await asyncio.sleep(0)
     return False
 
 
-async def run(args, engine):
-    session = Session(engine, args.log_dir)
+async def run(args, engine, session=None):
+    session = session if session is not None else Session(engine, args.log_dir)
     attempt = 0
     while True:
         before = session.games
+        # Never show an interrupted table as though it were still playing.
+        session.bot = None
+        session.reaction = None
+        session.drawn = None
+        session.set_phase('Connecting')
         try:
             done = await play(args.url, args.token, session, args.games)
             if done:
@@ -457,12 +490,14 @@ async def run(args, engine):
         else:
             attempt += 1
         if args.once:
+            session.set_phase('Disconnected')
             return session
         # Backing off rather than hammering: a server that just refused us is
         # not helped by being asked again immediately, and a bot that spins on
         # a rejected token is how a token gets rate limited.
         delay = min(60, 2 ** min(attempt, 6))
         logging.info('reconnecting in %ds', delay)
+        session.set_phase(f'Reconnecting in {delay}s')
         await asyncio.sleep(delay)
 
 
@@ -483,15 +518,22 @@ def main():
     ap.add_argument('--log-dir', help='write each game as mjai lines, for review')
     ap.add_argument('--once', action='store_true',
                     help='do not reconnect after a disconnection')
+    ap.add_argument('--display', choices=('auto', 'live', 'plain'), default='auto',
+                    help='auto uses a full-screen dashboard on a TTY, plain logs otherwise')
+    ap.add_argument('--refresh-rate', type=float, default=2,
+                    help='dashboard updates per second, 0.5 to 10 (default: 2)')
     ap.add_argument('--trust-checkpoint', action='store_true',
                     help='load a checkpoint that weights_only=True refuses; '
                          'only for a file you produced yourself')
     args = ap.parse_args()
+    if not 0.5 <= args.refresh_rate <= 10:
+        ap.error('--refresh-rate must be between 0.5 and 10')
+    live = use_dashboard(args.display)
 
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(levelname)s %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S')
+        datefmt='%Y-%m-%d %H:%M:%S', force=True)
 
     args.token = os.environ.get('RIICHI_BOT_TOKEN')
     if not args.token:
@@ -500,19 +542,34 @@ def main():
     if not args.url:
         args.url = args.host + ('/ws/ranked' if args.ranked else '/ws/validate')
 
-    engine, tag, steps, best = load_bot_engine(
-        args.state_file, torch.device(args.device), args.trust_checkpoint)
-    logging.info('playing %s from %s%s%s', tag, args.state_file,
-                 f', step {steps:,}' if steps else '',
-                 f', test play {best["avg_rank"]:.4f} / {best["avg_pt"]:+.3f}'
-                 if best and 'avg_rank' in best else '')
+    if args.log_dir:
+        os.makedirs(args.log_dir, exist_ok=True)
+        file_handler = logging.FileHandler(path.join(args.log_dir, 'riichi_lab.log'),
+                                           encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        logging.getLogger().addHandler(file_handler)
 
-    session = None
+    session = Session(None, args.log_dir)
+    mode = {args.host + '/ws/ranked': 'RANKED',
+            args.host + '/ws/validate': 'VALIDATION'}.get(args.url, 'CUSTOM')
+    dashboard = (Dashboard(session, mode, path.basename(args.state_file), args.refresh_rate)
+                 if live else None)
     try:
-        session = asyncio.run(run(args, engine))
+        with dashboard if dashboard else nullcontext():
+            engine, tag, steps, best = load_bot_engine(
+                args.state_file, torch.device(args.device), args.trust_checkpoint)
+            session.engine = engine
+            if dashboard:
+                dashboard.model = tag
+            logging.info('playing %s from %s%s%s', tag, args.state_file,
+                         f', step {steps:,}' if steps else '',
+                         f', test play {best["avg_rank"]:.4f} / {best["avg_pt"]:+.3f}'
+                         if best and 'avg_rank' in best else '')
+            task = run(args, engine, session)
+            asyncio.run(dashboard.run(task) if dashboard else task)
     except KeyboardInterrupt:
-        pass
-    if session and session.results:
+        logging.info('stopped by user')
+    if session.results:
         ranks = [p for p, _ in session.results]
         logging.info('%d games, average placement %.4f, %d fallbacks, '
                      'slowest decision %.0f ms',
