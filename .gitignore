@@ -12,3 +12,5 @@ __pycache__
 *.ipynb
 
 /_draft
+/mortal/test_riichi_lab.py
+/mortal/test_riichi_lab_analysis.py
