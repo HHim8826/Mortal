@@ -90,16 +90,26 @@ class TableAnalysis:
                 return
             shanten = self.state.shanten
             settled = sum(self.state.tehai) % 3 == 1
-            if settled and shanten == 0:
+            drawn = self.table.players[self.table.seat].drawn
+            before_draw = not settled and drawn is not None
+            # libriichi leaves shanten/waits at the pre-draw hand on tsumo.
+            # Keep those waits visible while the extra tile is on screen;
+            # they aren't the waits of an arbitrary future discard. After
+            # chi/pon there is no drawn tile and the old waits are invalid.
+            if shanten == 0 and (settled or before_draw):
                 waits = [tile for tile, waiting in zip(TILES, self.state.waits) if waiting]
                 status = 'TENPAI: ' + (' '.join(waits) or 'no live waits')
                 if self.state.at_furiten:
                     status += ' | FURITEN'
+            elif before_draw:
+                status = f'{shanten} shanten'
             elif not settled:
-                status = ('COMPLETE' if shanten < 0 else
-                          f'{shanten} shanten after best discard')
+                status = ('Discard pending' if shanten == 0 else
+                          f'{shanten} shanten after call')
             else:
                 status = f'{shanten} shanten'
+            if before_draw:
+                status += ' | before draw'
             self.table.hand_status = status
         except (KeyboardInterrupt, SystemExit):
             raise
