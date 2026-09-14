@@ -27,6 +27,19 @@ def tile_key(tile):
     return (3, 'ESWNPFC?'.find(tile), False)
 
 
+def score_scale(players):
+    highest = max(p.score for p in players)
+    return max(50000, ((highest + 9999) // 10000) * 10000)
+
+
+def score_bar(score, ceiling, width=10):
+    """Eighth-cell resolution keeps small positive scores visible."""
+    units = max(1, round(max(0, score) / ceiling * width * 8)) if score > 0 else 0
+    full, fraction = divmod(min(width * 8, units), 8)
+    filled = '█' * full + ('▏▎▍▌▋▊▉'[fraction - 1] if fraction else '')
+    return filled + '─' * (width - len(filled))
+
+
 @dataclass
 class Discard:
     tile: str
@@ -61,6 +74,9 @@ class TableState:
         self.dora = []
         self.result = 'No completed hand yet'
         self.last_move = 'Waiting for table events'
+        self.hand_status = 'waiting'
+        self.prediction = None
+        self.prediction_status = 'Opponent estimates off'
 
     def _remove(self, player, tile):
         if tile in player.hand:
@@ -74,7 +90,9 @@ class TableState:
         player = self.players[actor] if actor in range(4) else None
         tile = event.get('pai', '?')
         if kind == 'start_game':
+            prediction_status = self.prediction_status
             self.__init__()
+            self.prediction_status = prediction_status
             self.seat = event.get('id', 0)
             for p, name in zip(self.players, event.get('names') or []):
                 p.name = clean(name)
@@ -249,6 +267,10 @@ class Dashboard:
         status = f'{session.phase} {age // 60:02}:{age % 60:02} | RX {heard}'
         summary = (f'Games {session.games} | Avg {average} | '
                    f'Fallbacks {session.fallbacks} | Max {session.slowest * 1000:.0f}ms')
+        prediction = board.prediction
+        predicted_seats = prediction['by_seat'] if prediction else {}
+        prediction_note = (f'Opponent estimates {int(time.monotonic() - prediction["captured"])}s old; '
+                           'waits are not ron odds' if prediction else board.prediction_status)
 
         def text(value, style=''):
             return Text(clean(value), style=style, no_wrap=True, overflow='ellipsis')
@@ -286,30 +308,56 @@ class Dashboard:
             for i, p in enumerate(board.players):
                 lines.append(text(f'{">" if i == board.seat else " "} Seat {i} '
                                   f'{p.score:>7,} {"RIICHI" if p.reach else ""}  {p.name}'))
-            lines += [hand_line, text(board.result), text(self.notices.warning, 'yellow'),
+            lines += [text(f'MORTAL HAND ({board.hand_status})'), hand_line,
+                      text(board.result), text(self.notices.warning, 'yellow'),
                       text(summary), text('Ctrl+C quit | Enlarge to 72x24 for rivers', 'dim')]
             return Group(*lines[:height])
 
         scores = Table(expand=True, box=None, padding=(0, 1), header_style='dim')
+        ceiling = score_scale(board.players)
         scores.add_column('Seat', width=9)
         scores.add_column('Player', ratio=1, overflow='ellipsis', no_wrap=True)
+        scores.add_column('Tenpai~', width=7, justify='right')
+        if width >= 110:
+            scores.add_column('Furiten~', width=8, justify='right')
+            scores.add_column('Wait tiles~', ratio=2, no_wrap=True, overflow='ellipsis')
         scores.add_column('Score', width=8, justify='right')
-        if width >= 100:
-            scores.add_column('/ 50k', width=10)
-        scores.add_column('Delta', width=7, justify='right')
+        if width >= 110:
+            scores.add_column(f'/ {ceiling // 1000}k', width=10)
+        if width >= 110:
+            scores.add_column('Delta', width=7, justify='right')
         scores.add_column('State / melds', ratio=1, no_wrap=True, overflow='ellipsis')
         for i, p in enumerate(board.players):
             wind = WINDS[(i - board.dealer) % 4] if board.dealer is not None else '-'
             label = f'{i} {wind}' + (' / YOU' if i == board.seat else '')
             state = ('RIICHI ' if p.reach else '') + ('DEALER ' if i == board.dealer else '')
             state += ' '.join(f'{kind}({" ".join(values)})' for kind, values in p.melds)
+            estimate = predicted_seats.get(i)
+            # The prediction columns occupy the previously empty middle of
+            # the scoreboard. Stable percentages, no changing bar colours.
             cells = [text(label, 'cyan' if i == board.seat else ''), text(p.name),
-                     text(f'{p.score:,}')]
-            if width >= 100:
-                filled = max(0, min(10, p.score // 5000))
-                cells.append(text('━' * filled + '─' * (10 - filled), 'dim cyan'))
-            cells += [text(f'{p.delta:+,}' if p.delta else '--'),
-                      text(state or '--', 'yellow' if p.reach else '')]
+                     text(f'{estimate["tenpai"]:.1%}' if estimate else '--')]
+            if width >= 110:
+                wait_text = '--'
+                if estimate:
+                    from riichi_lab_analysis import TILES
+                    top = sorted(range(34), key=lambda k: estimate['waits'][k], reverse=True)[
+                        :3 if width >= 150 else 2]
+                    wait_text = ' '.join(f'{TILES[k]} {estimate["waits"][k]:.1%}' for k in top)
+                elif i == board.seat and prediction:
+                    from riichi_lab_analysis import TILES
+                    available = {tile.rstrip('r') for tile in p.hand} & set(TILES)
+                    top = sorted(available, key=lambda t: prediction['any_wait'][TILES.index(t)],
+                                 reverse=True)[:2]
+                    wait_text = 'Any: ' + ' '.join(
+                        f'{t} {prediction["any_wait"][TILES.index(t)]:.1%}' for t in top)
+                cells += [text(f'{estimate["furiten"]:.1%}' if estimate else '--'), text(wait_text)]
+            cells.append(text(f'{p.score:,}'))
+            if width >= 110:
+                cells.append(text(score_bar(p.score, ceiling), 'dim cyan'))
+            if width >= 110:
+                cells.append(text(f'{p.delta:+,}' if p.delta else '--'))
+            cells.append(text(state or '--', 'yellow' if p.reach else ''))
             scores.add_row(*cells)
 
         root = Layout()
@@ -321,7 +369,7 @@ class Dashboard:
         root['header'].update(panel(text(f'RIICHI LAB / {self.mode} | {status}', 'cyan')))
         root['round'].update(panel(round_line, clean(self.model)))
         root['scores'].update(panel(scores))
-        root['hand'].update(panel(hand_line, 'MORTAL HAND / m man  p pin  s sou  r red'))
+        root['hand'].update(panel(hand_line, f'MORTAL HAND ({board.hand_status})'))
 
         def river(player, count):
             line = Text(no_wrap=True, overflow='ellipsis')
@@ -362,7 +410,7 @@ class Dashboard:
         notice = self.notices.warning or (self.notices.messages[-1] if self.notices.messages else board.result)
         notes = [text(notice, 'yellow' if self.notices.warning else '')]
         if notes_height > 3:
-            notes.append(text(board.last_move + ' | dim = drawn discard', 'dim'))
+            notes.append(text(prediction_note, 'dim'))
         root['notes'].update(panel(Group(*notes), board.result))
         root['footer'].update(text(f'{summary} | * riichi x called | Ctrl+C quit', 'dim'))
         return root

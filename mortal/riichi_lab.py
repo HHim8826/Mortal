@@ -11,6 +11,12 @@ Interactive terminals use a quiet full-screen dashboard, sampled at 2 Hz.
 Resize the terminal to show more of the rivers; Ctrl+C restores the prompt.
 Use --refresh-rate to change the display cadence without slowing the bots.
 --log-dir also keeps a complete riichi_lab.log while the display is running.
+The hand title shows exact shanten / waits from libriichi. Optional opponent
+estimates update at most once per second using logs/tenpai.pth, a native
+TenpaiNet checkpoint from train_tenpai.py (loaded with torch only). Use
+--tenpai-file to replace it, or --no-predictions to disable the estimates.
+The ~ columns are estimates; Any means at least one opponent is waiting on
+that tile, not the probability of dealing into a winning hand.
 
 The platform speaks mjai, which is the language Mortal already thinks in, so
 this is mostly plumbing: the server sends the same event stream `mortal.py`
@@ -40,15 +46,18 @@ import json
 import logging
 import os
 import time
+import inspect
 from datetime import datetime, timezone
 from os import path
 from contextlib import nullcontext
+from urllib.parse import urlparse
 
 import torch
 
 from engine import MortalEngine
 from model import Brain, DQN
 from riichi_lab_ui import Dashboard, TableState, use_dashboard
+from riichi_lab_analysis import TableAnalysis, TenpaiPredictor
 
 # Only for the default checkpoint, and only if a training config happens to be
 # here. Playing needs a checkpoint and nothing else -- the shape of the network
@@ -120,8 +129,10 @@ def load_bot_engine(state_file, device, trust=False):
 
     tag = state.get('tag')
     if not tag:
-        when = datetime.fromtimestamp(state['timestamp'], tz=timezone.utc)
-        tag = f'mortal{version}-b{num_blocks}c{conv_channels}-t{when:%y%m%d%H}'
+        tag = f'mortal{version}-b{num_blocks}c{conv_channels}'
+        if state.get('timestamp') is not None:
+            when = datetime.fromtimestamp(state['timestamp'], tz=timezone.utc)
+            tag += f'-t{when:%y%m%d%H}'
 
     engine = MortalEngine(
         mortal, dqn,
@@ -197,7 +208,15 @@ def choose(reaction, possible, seat, drawn=None):
             if _same_action(reaction, candidate) and candidate not in matches:
                 matches.append(candidate)
         if len(matches) == 1:
-            return dict(matches[0], actor=seat), None
+            action = dict(matches[0], actor=seat)
+            # possible_actions may omit a call's target/consumed even though
+            # the response schema needs them. Retain matching model fields,
+            # but never send inference metadata or override the server offer.
+            if action['type'] in ('chi', 'pon', 'daiminkan', 'kakan'):
+                for key in ('target', 'consumed'):
+                    if key not in action and key in reaction:
+                        action[key] = reaction[key]
+            return action, None
         if len(matches) > 1:
             # Two offers fit what Mortal asked for, so the fields they differ
             # on are ones it did not name. Guessing between them is how an
@@ -226,7 +245,8 @@ def _give_up(possible, seat, drawn, why):
         if candidate.get('type') == 'none':
             return dict(candidate, actor=seat), why
     for candidate in possible:
-        if candidate.get('type') == 'dahai' and candidate.get('pai') == drawn:
+        if (candidate.get('type') == 'dahai' and candidate.get('pai') == drawn
+                and candidate.get('tsumogiri') is not False):
             return dict(candidate, actor=seat, tsumogiri=True), why
     for candidate in possible:
         if candidate.get('type') == 'dahai':
@@ -252,12 +272,16 @@ class Session:
         self.slowest = 0.0
         self.fallbacks = 0
         self.verdicts = []          # whatever the platform said about the games
+        self.validation_cutoffs = 0  # verdict-only runs, without final scores
         self.since = time.time()    # when the current wait or game began
         self.where = 'waiting for a match'
         self.table = TableState()
+        self.analysis = TableAnalysis(self.table)
         self.phase = 'Loading model'
         self.phase_since = time.monotonic()
         self.last_received = None
+        self.time_budget = {}
+        self.last_ack = None
 
     def set_phase(self, phase):
         self.phase = phase
@@ -275,12 +299,21 @@ class Session:
             self.bot = Bot(self.engine, self.seat)
             self.lines = []
             self.reaction = None
+            self.drawn = None
 
         if self.bot is None:
             logging.warning('%s before start_game; ignored', kind)
             return
         self.lines.append(line)
         self.table.update(event)
+        self.analysis.update(line, event)
+        # Announcements can sit between a decision event and its request.
+        # All other events replace that decision, even if react() returns
+        # nothing or fails. Never reuse a discard from a previous round.
+        if kind not in ('reach_accepted', 'dora'):
+            self.reaction = None
+        if kind in ('start_kyoku', 'end_kyoku', 'end_game'):
+            self.drawn = None
 
         # Matched, and then one line a kyoku. Between these the process is
         # silent for minutes at a time, and silence while queued looks exactly
@@ -297,18 +330,17 @@ class Session:
                           f'-{event.get("honba", 0)}')
             logging.info('%s | scores %s', self.where, event.get('scores'))
         elif kind == 'ryukyoku':
-            # A draw ends a kyoku as surely as a win does, and said nothing:
-            # the next kyoku simply appeared with different scores and a honba
-            # nobody had explained. On an exhaustive draw the seats with a
-            # positive delta are the ones that were tenpai; an abortive one
-            # moves nothing, and says so by having nobody.
+            # Zero deltas cannot distinguish all-tenpai from all-noten.
+            # Penalty payments also aren't evidence of who was tenpai.
             deltas = event.get('deltas') or [0, 0, 0, 0]
-            held = [i for i, d in enumerate(deltas) if d > 0]
+            reason = event.get('reason', 'draw')
+            held = ([i for i, d in enumerate(deltas) if d > 0]
+                    if reason == 'exhaustive_draw' and any(deltas) else [])
             mine = deltas[self.seat] if self.seat is not None and self.seat < len(deltas) else 0
             logging.info('%s | tenpai: %s | we %+d',
-                         event.get('reason', 'draw'),
+                         reason,
                          ', '.join(('we' if i == self.seat else f'seat {i}') for i in held)
-                         or 'nobody', mine)
+                         or 'not reported', mine)
         elif kind == 'hora':
             who = 'we' if event.get('actor') == self.seat else f'seat {event.get("actor")}'
             off = event.get('target')
@@ -328,6 +360,7 @@ class Session:
             # not an Exception. Losing the reaction costs one decision; letting
             # it out of here costs the connection.
             logging.error('react(%s) failed: %r', kind, exc)
+            self.reaction = None
             answer = None
         elapsed = time.perf_counter() - started
         self.slowest = max(self.slowest, elapsed)
@@ -345,6 +378,7 @@ class Session:
 
     def respond(self, event):
         """Answer one `request_action`, echoing its id."""
+        self.time_budget = event.get('time') or {}
         action, why = choose(self.reaction, event.get('possible_actions') or [],
                              self.seat if self.seat is not None else 0, self.drawn)
         if why:
@@ -354,6 +388,23 @@ class Session:
         action['request_id'] = event.get('request_id')
         return action
 
+    def acknowledge(self, event):
+        self.last_ack = event
+        if 'bank_ms' in event:
+            self.time_budget['bank_ms'] = event['bank_ms']
+        if event.get('status') in ('rejected', 'unparseable', 'stale', 'defaulted'):
+            logging.warning('action %s: %s%s', event.get('request_id'), event['status'],
+                            f' ({event["reason"]})' if event.get('reason') else '')
+
+    def save_log(self, suffix=''):
+        if self.log_dir and self.lines:
+            os.makedirs(self.log_dir, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
+            out = path.join(self.log_dir, f'{stamp}{suffix}-seat{self.seat}.json')
+            with open(out, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(self.lines) + '\n')
+            logging.info('log written to %s', out)
+
     def finish(self, event):
         """A game ended: record where it placed and keep the log."""
         self.games += 1
@@ -361,20 +412,15 @@ class Session:
         if self.seat is not None and len(scores) > self.seat:
             mine = scores[self.seat]
             # Placement by score, the seat's own rank among the four.
-            place = 1 + sum(1 for s in scores if s > mine)
+            place = 1 + sum(1 for i, s in enumerate(scores)
+                            if s > mine or (s == mine and i < self.seat))
             self.results.append((place, mine))
             ranks = [p for p, _ in self.results]
             logging.info('game %d: %s, placed %d of 4 with %d; '
                          'average placement so far %.3f over %d',
                          self.games, scores, place, mine,
                          sum(ranks) / len(ranks), len(ranks))
-        if self.log_dir and self.lines:
-            os.makedirs(self.log_dir, exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
-            out = path.join(self.log_dir, f'{stamp}-seat{self.seat}.json')
-            with open(out, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(self.lines) + '\n')
-            logging.info('log written to %s', out)
+        self.save_log()
         self.bot = None
         self.lines = []
         self.where, self.since = 'waiting for a match', time.time()
@@ -400,14 +446,11 @@ async def play(url, token, session, games, ping_interval=20):
     import websockets
 
     headers = {'Authorization': f'Bearer {token}'}
-    # websockets renamed this in 12.0 and kept the old name working for a
-    # while; accept whichever this install has rather than pinning a version.
-    try:
-        connect = websockets.connect(url, additional_headers=headers,
-                                     ping_interval=ping_interval)
-    except TypeError:
-        connect = websockets.connect(url, extra_headers=headers,
-                                     ping_interval=ping_interval)
+    # The top-level alias changed in 14.0. Legacy implementations accept
+    # arbitrary kwargs, and only reject an unknown header kwarg on await.
+    header_key = ('additional_headers' if 'additional_headers' in
+                  inspect.signature(websockets.connect).parameters else 'extra_headers')
+    connect = websockets.connect(url, **{header_key: headers}, ping_interval=ping_interval)
 
     async with connect as ws:
         logging.info('connected to %s', url)
@@ -417,7 +460,8 @@ async def play(url, token, session, games, ping_interval=20):
         # wants to know whether anything is happening.
         pulse = asyncio.ensure_future(heartbeat(session))
         try:
-            return await _pump(ws, session, games)
+            return await _pump(ws, session, games,
+                               validation=urlparse(url).path.rstrip('/') == '/ws/validate')
         finally:
             pulse.cancel()
             try:
@@ -426,10 +470,31 @@ async def play(url, token, session, games, ping_interval=20):
                 pass
 
 
-async def _pump(ws, session, games):
+async def _pump(ws, session, games, *, validation=False, verdict_timeout=5):
     """Read messages until the budget is met or the server stops sending."""
-    async for raw in ws:
+    from websockets.exceptions import ConnectionClosed
+
+    messages = ws.__aiter__()
+    verdict_deadline = None
+    game_ended = False
+    while True:
+        try:
+            if verdict_deadline is None:
+                raw = await messages.__anext__()
+            else:
+                remaining = max(0, verdict_deadline - time.monotonic())
+                raw = await asyncio.wait_for(messages.__anext__(), remaining)
+        except (StopAsyncIteration, ConnectionClosed):
+            if verdict_deadline is not None:
+                logging.warning('connection closed before validation result')
+            break
+        except asyncio.TimeoutError:
+            logging.warning('validation result not received within %ss', verdict_timeout)
+            await ws.close()
+            break
         session.last_received = time.monotonic()
+        if not isinstance(raw, str):
+            continue
         line = raw.strip()
         if not line:
             continue
@@ -438,19 +503,39 @@ async def _pump(ws, session, games):
         except json.JSONDecodeError:
             logging.warning('not JSON, ignored: %.120s', line)
             continue
+        if not isinstance(event, dict):
+            logging.warning('non-object JSON ignored')
+            continue
         kind = event.get('type')
 
         if kind == 'request_action':
             await ws.send(json.dumps(session.respond(event)))
         elif kind in MJAI_EVENTS:
             session.on_mjai(line, event)
-            if kind == 'end_game' and games and session.games >= games:
-                logging.info('played %d games; closing', session.games)
-                await ws.close()
-                return True
+            if kind == 'end_game':
+                game_ended = True
+                if validation:
+                    session.set_phase('Awaiting validation result')
+                    verdict_deadline = time.monotonic() + verdict_timeout
+                else:
+                    await ws.close()
+                    return bool(games and session.games >= games)
         elif kind in VERDICT_EVENTS:
             logging.info('%s: %s', kind, json.dumps(event, ensure_ascii=False))
             session.verdicts.append(event)
+            session.analysis.pause()
+            session.set_phase('Validation passed' if event.get('passed') else 'Validation failed')
+            if validation:
+                # Some validation runs end at the verdict without end_game.
+                # Preserve their partial log without inventing final scores.
+                if not game_ended:
+                    session.validation_cutoffs += 1
+                if session.bot is not None:
+                    session.save_log('-validation')
+                await ws.close()
+                return bool(games and session.games + session.validation_cutoffs >= games)
+        elif kind == 'action_ack':
+            session.acknowledge(event)
         elif kind == 'error':
             logging.error('server: %s', event)
         elif kind not in CONTROL_EVENTS:
@@ -458,7 +543,7 @@ async def _pump(ws, session, games):
         # recv() can complete immediately for a buffered burst. Let the
         # sampled display and heartbeat run even while the socket stays busy.
         await asyncio.sleep(0)
-    return False
+    return bool(games and session.games + session.validation_cutoffs >= games)
 
 
 async def run(args, engine, session=None):
@@ -466,6 +551,7 @@ async def run(args, engine, session=None):
     attempt = 0
     while True:
         before = session.games
+        verdicts_before = len(session.verdicts)
         # Never show an interrupted table as though it were still playing.
         session.bot = None
         session.reaction = None
@@ -487,7 +573,12 @@ async def run(args, engine, session=None):
             played = session.games > before
             logging.log(logging.INFO if played else logging.ERROR,
                         'connection ended: %r', exc)
-        if session.games > before:
+        finally:
+            # A pending worker must not republish the disconnected table.
+            session.analysis.pause()
+        if args.games and session.games + session.validation_cutoffs >= args.games:
+            return session
+        if session.games > before or len(session.verdicts) > verdicts_before:
             # This connection played a game, so the token and the server and
             # the protocol are all fine, whatever it did on the way out.
             # Counting those as failures walked the backoff up to a minute
@@ -519,8 +610,7 @@ def main():
                     help='the checkpoint to play'
                          + (' (default: the config\'s)' if DEFAULT_STATE_FILE else ''))
     ap.add_argument('--device', default='cpu',
-                    help='cpu is enough: one decision at a time, and the grace '
-                         'period is three seconds')
+                    help='playing model device (default: cpu); server time limits vary')
     ap.add_argument('--games', type=int, default=0, help='0 plays until stopped')
     ap.add_argument('--log-dir', help='write each game as mjai lines, for review')
     ap.add_argument('--once', action='store_true',
@@ -529,10 +619,15 @@ def main():
                     help='auto uses a full-screen dashboard on a TTY, plain logs otherwise')
     ap.add_argument('--refresh-rate', type=float, default=2,
                     help='dashboard updates per second, 0.5 to 10 (default: 2)')
+    ap.add_argument('--tenpai-file', default='logs/tenpai.pth',
+                    help='native TenpaiNet checkpoint (default: logs/tenpai.pth)')
+    ap.add_argument('--no-predictions', action='store_true', help='disable opponent estimates')
     ap.add_argument('--trust-checkpoint', action='store_true',
                     help='load a checkpoint that weights_only=True refuses; '
                          'only for a file you produced yourself')
     args = ap.parse_args()
+    if args.games < 0:
+        ap.error('--games must be zero or positive')
     if not 0.5 <= args.refresh_rate <= 10:
         ap.error('--refresh-rate must be between 0.5 and 10')
     live = use_dashboard(args.display)
@@ -566,13 +661,23 @@ def main():
             engine, tag, steps, best = load_bot_engine(
                 args.state_file, torch.device(args.device), args.trust_checkpoint)
             session.engine = engine
+            if live and not args.no_predictions:
+                if path.isfile(args.tenpai_file):
+                    try:
+                        session.analysis.predictor = TenpaiPredictor.load(args.tenpai_file)
+                        session.table.prediction_status = 'Opponent estimates warming up'
+                    except Exception as exc:
+                        session.table.prediction_status = 'Opponent estimates unavailable'
+                        logging.warning('tenpai model not loaded: %s', exc)
+                else:
+                    session.table.prediction_status = 'Opponent model not found'
             if dashboard:
                 dashboard.model = tag
             logging.info('playing %s from %s%s%s', tag, args.state_file,
                          f', step {steps:,}' if steps else '',
                          f', test play {best["avg_rank"]:.4f} / {best["avg_pt"]:+.3f}'
                          if best and 'avg_rank' in best else '')
-            task = run(args, engine, session)
+            task = session.analysis.run(run(args, engine, session))
             asyncio.run(dashboard.run(task) if dashboard else task)
     except KeyboardInterrupt:
         logging.info('stopped by user')

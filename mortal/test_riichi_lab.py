@@ -245,12 +245,16 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                                once=True, log_dir=None)
 
         async def disconnected(*args):
+            session.analysis.active = True
+            session.table.prediction = {'captured': 0}
             raise ConnectionError('local test disconnect')
 
         with patch.object(riichi_lab, 'play', side_effect=disconnected):
             result = await riichi_lab.run(args, None, session)
         self.assertIs(result, session)
         self.assertEqual(session.phase, 'Disconnected')
+        self.assertFalse(session.analysis.active)
+        self.assertIsNone(session.table.prediction)
 
     async def test_local_websocket_keeps_actions_and_state(self):
         import riichi_lab
@@ -258,7 +262,10 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
         events = [
             {'type': 'start_game', 'id': 1},
-            {'type': 'start_kyoku', 'bakaze': 'E', 'kyoku': 1, 'scores': [25000] * 4},
+            {'type': 'start_kyoku', 'bakaze': 'E', 'kyoku': 1, 'honba': 0,
+             'kyotaku': 0, 'oya': 0, 'dora_marker': '1m', 'scores': [25000] * 4,
+             'tehais': [['?'] * 13, ['1m', '2m', '3m', '1p', '2p', '3p', '1s', '2s',
+                                    '3s', 'E', 'E', 'E', '5p'], ['?'] * 13, ['?'] * 13]},
             {'type': 'tsumo', 'actor': 1, 'pai': '5mr'},
             {'type': 'request_action', 'request_id': 'turn-123',
              'possible_actions': [{'type': 'dahai', 'pai': '5mr'},
@@ -266,7 +273,7 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             {'type': 'dahai', 'actor': 1, 'pai': '5mr', 'tsumogiri': True},
             {'type': 'ryukyoku', 'deltas': [-1000, 3000, -1000, -1000]},
             {'type': 'end_game', 'scores': [24000, 28000, 24000, 24000]},
-            {'type': 'validation_result', 'valid': True},
+            {'type': 'validation_result', 'passed': True},
         ]
         received = []
 
@@ -282,14 +289,14 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             async with serve(server, '127.0.0.1', 0) as host:
                 port = host.sockets[0].getsockname()[1]
                 session = riichi_lab.Session(None)
-                await asyncio.wait_for(riichi_lab.play(f'ws://127.0.0.1:{port}', 'local-test',
+                await asyncio.wait_for(riichi_lab.play(f'ws://127.0.0.1:{port}/ws/validate', 'local-test',
                                                        session, games=0), timeout=5)
         self.assertEqual(received, [{'type': 'dahai', 'pai': '5mr', 'actor': 1,
                                      'request_id': 'turn-123'}])
         self.assertEqual(session.results, [(1, 28000)])
         self.assertEqual(session.table.players[1].score, 28000)
         self.assertEqual(session.fallbacks, 0)
-        self.assertEqual(session.verdicts, [{'type': 'validation_result', 'valid': True}])
+        self.assertEqual(session.verdicts, [{'type': 'validation_result', 'passed': True}])
         self.assertIsNotNone(session.last_received)
 
     async def test_render_sampling_and_cleanup_on_cancellation(self):
