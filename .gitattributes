@@ -1,2 +1,5 @@
 log-viewer/* linguist-vendored
 docs/css/mdbook-admonish.css linguist-vendored
+
+# Shell scripts run on Linux boxes; a CR breaks bash (it did once).
+ops/**/*.sh text eol=lf
