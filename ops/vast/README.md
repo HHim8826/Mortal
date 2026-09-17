@@ -40,7 +40,6 @@ Each script does one job. The table groups them by when you use them.
 | `launch_online.sh` | Starts the server, the trainer, and the workers, or whichever of them is down. |
 | `online_status.sh` | Shows online progress, including the self-play rank against the frozen start. |
 | `watchdog.sh` | Restarts whichever phase is current when it crashes or stops saving. `touch /root/watchdog.off` pauses it. |
-| `test_watchdog.sh` | Runs the watchdog's decisions against made-up logs; no process is started or stopped. |
 | `watch_tick.sh` | Prints only new alerts and measurements, for calling on a timer. |
 | `backup_hf.py` | Copies checkpoints to Hugging Face every 2 hours, only after they load. |
 | `selfplay_bench.py`, `bench_grid.sh` | Measure self-play throughput by games in flight, arenas, and opponent version. |
@@ -51,12 +50,10 @@ checkpoints on fixed, named sets of walls and compares them paired.
 
 ## Checking a change
 
-You can test the watchdog's logic anywhere with bash, because the test sources
-only its functions and points them at a temporary tree.
-
-```bash
-bash ops/vast/test_watchdog.sh
-```
+Test files stay out of the repository (`.gitignore` excludes `test_*.py` and
+`test_*.sh`). The watchdog's test, `test_watchdog.sh`, is kept locally beside
+`watchdog.sh`; it sources only the watchdog's functions and points them at a
+temporary tree, so you can run it anywhere with bash.
 
 Every shell script must keep LF line endings. A CR once broke `watchdog.sh` on
 the box, and `.gitattributes` now forces LF for `ops/**/*.sh`.
@@ -70,8 +67,8 @@ from what last ran.
   Two spot checks passed: `restart_v4.sh` has the same size in bytes as the
   box's copy, and `launch_online.sh`, before the three later patches, matches
   the copy the box printed on September 12 line for line.
-- `test_watchdog.sh` passes 22 of 22 checks, the same result it gave on the
-  box.
+- The local watchdog test passes 22 of 22 checks, the same result it gave on
+  the box.
 - `restart_v4.sh` copies a freshly built `libriichi.so` into place before it
   relaunches, because it was written for a libriichi update.
 - Throughput numbers in the comments come from a 2x RTX 4070 Ti SUPER box with
@@ -80,4 +77,4 @@ from what last ran.
 ## Next steps
 
 Before the next rented run, adapt the paths and GPU layout to that box, run
-`bash -n` on every script, and run `test_watchdog.sh`.
+`bash -n` on every script, and run the local watchdog test.

@@ -14,3 +14,6 @@ __pycache__
 /_draft
 /mortal/test_riichi_lab.py
 /mortal/test_riichi_lab_analysis.py
+# Tests stay local, whatever their name or folder.
+test_*.py
+test_*.sh
