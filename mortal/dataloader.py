@@ -123,23 +123,39 @@ class FileDatasetsIter(IterableDataset):
         """
         ready = queue.Queue()
         ahead = threading.Semaphore(1)
+        stop = threading.Event()
         done = object()
 
         def decode():
             try:
                 for batch in batches:
                     ahead.acquire()
+                    if stop.is_set():
+                        return
                     ready.put(self.load_entries(batch))
                 ready.put(done)
             except BaseException as exc:
                 ready.put(exc)
 
-        threading.Thread(target=decode, daemon=True).start()
-        while (entries := ready.get()) is not done:
-            if isinstance(entries, BaseException):
-                raise entries
+        thread = threading.Thread(target=decode, daemon=True)
+        thread.start()
+        try:
+            while (entries := ready.get()) is not done:
+                if isinstance(entries, BaseException):
+                    raise entries
+                ahead.release()
+                yield entries
+        finally:
+            # A consumer that stops early -- a finished run, an exception, a
+            # closed generator -- leaves this thread waiting on a semaphore
+            # nothing will release, or part way through a decode. A daemon
+            # thread killed in either state at interpreter shutdown aborts the
+            # process ("FATAL: exception not rethrown"), which is a crash where
+            # there was none. Told to stop it finishes at most the batch it
+            # holds, so waiting for it is bounded by one decode.
+            stop.set()
             ahead.release()
-            yield entries
+            thread.join(timeout=300)
 
     def where(self, source):
         """How a game names itself in a log line: its path, or a digest of it."""
