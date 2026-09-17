@@ -104,8 +104,16 @@ class Handler(BaseRequestHandler):
 
     def handle_submit_replay(self, msg):
         with S.dir_lock:
+            # The parameters that played these games, in the name of every file
+            # they produced. A policy gradient divides by the probability the
+            # behaviour policy gave the action it took, and the only way to
+            # know that later is to know which weights were playing: the
+            # trainer moves on while a session is still being played, so "the
+            # current model" is the wrong answer by the time a batch arrives.
+            version = msg.get('param_version', -1)
             for filename, content in msg['logs'].items():
-                filepath = path.join(S.buffer_dir, f'{S.submission_id}_{filename}')
+                filepath = path.join(S.buffer_dir,
+                                     f'{S.submission_id}_v{version}_{filename}')
                 with open(filepath, 'wb') as f:
                     f.write(content)
             S.buffer_size += len(msg['logs'])
