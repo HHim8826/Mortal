@@ -230,6 +230,56 @@ class DQN(nn.Module):
         q = (v + a - a_mean).masked_fill(~mask, -torch.inf)
         return q
 
+class PolicyHead(nn.Module):
+    """What to play, as logits over the legal actions.
+
+    Kept apart from `DQN` on purpose. Mortal's Q carries three jobs at once:
+    it is the estimate of the return, the thing the CQL term shapes into
+    human-action logits, and, divided by a temperature nobody calibrated, the
+    scale exploration is drawn on. A policy gradient needs a distribution that
+    is free to move without dragging a value estimate with it, so this owns the
+    distribution and `RankCritic` owns the value.
+
+    The same shape as v4's Q head, a single linear map of the 1024 trunk
+    features, and for a reason: masked softmax of a v4 Q is softmax of its
+    advantage -- the state value and the mean cancel -- so a linear policy can
+    reproduce the teacher it is distilled from exactly, and any gap that
+    remains is optimization, not capacity.
+    """
+
+    def __init__(self, *, version=4):
+        super().__init__()
+        if version != 4:
+            raise ValueError(f'Unexpected version {version}')
+        self.version = version
+        self.net = nn.Linear(1024, ACTION_SPACE)
+        nn.init.constant_(self.net.bias, 0)
+
+    def forward(self, phi: Tensor, mask: Tensor) -> Tensor:
+        return self.net(phi).masked_fill(~mask, -torch.inf)
+
+class RankCritic(nn.Module):
+    """How the hanchan ends, as the probability of each final placement.
+
+    The whole game, not the kyoku: the thing being played for is the placement
+    at the end, and a distribution over the four of them carries what a single
+    number cannot -- that a hand which avoids fourth is worth more than its
+    average says. `value` turns it back into the expected placement utility
+    when a baseline needs one number.
+    """
+
+    def __init__(self, *, pts=(3., 1.5, 0., -4.5)):
+        super().__init__()
+        self.net = nn.Linear(1024, 4)
+        nn.init.constant_(self.net.bias, 0)
+        self.register_buffer('pts', torch.tensor(pts, dtype=torch.float32))
+
+    def forward(self, phi: Tensor) -> Tensor:
+        return self.net(phi)
+
+    def value(self, logits: Tensor) -> Tensor:
+        return logits.float().softmax(-1) @ self.pts
+
 class GRP(nn.Module):
     def __init__(self, hidden_size=64, num_layers=2):
         super().__init__()

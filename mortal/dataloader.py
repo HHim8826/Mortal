@@ -27,6 +27,8 @@ class FileDatasetsIter(IterableDataset):
         num_epochs = 1,
         enable_augmentation = False,
         augmented_first = False,
+        final_rank = False,
+        skip_rewards = False,
     ):
         super().__init__()
         self.version = version
@@ -42,14 +44,23 @@ class FileDatasetsIter(IterableDataset):
         self.num_epochs = num_epochs
         self.enable_augmentation = enable_augmentation
         self.augmented_first = augmented_first
+        # The rank the seat finished the hanchan in, 0 for first, appended to
+        # every one of its instances. What a critic of the whole game has to
+        # predict, where `player_ranks` is only the standing at the end of the
+        # kyoku the instance is in.
+        self.final_rank = final_rank
+        # Distillation and the critic learn from actions and results, not from
+        # the per-kyoku return, and the return costs a GRP forward per game.
+        self.skip_rewards = skip_rewards
         self.iterator = None
 
     def build_iter(self):
         # do not put it in __init__, it won't work on Windows
-        self.grp = GRP(**config['grp']['network'])
-        grp_state = torch.load(config['grp']['state_file'], weights_only=True, map_location=torch.device('cpu'))
-        self.grp.load_state_dict(grp_state['model'])
-        self.reward_calc = RewardCalculator(self.grp, self.pts)
+        if not self.skip_rewards:
+            self.grp = GRP(**config['grp']['network'])
+            grp_state = torch.load(config['grp']['state_file'], weights_only=True, map_location=torch.device('cpu'))
+            self.grp.load_state_dict(grp_state['model'])
+            self.reward_calc = RewardCalculator(self.grp, self.pts)
 
         for _ in range(self.num_epochs):
             yield from self.load_files(self.augmented_first)
@@ -219,7 +230,10 @@ class FileDatasetsIter(IterableDataset):
 
                 grp_feature = grp.take_feature()
                 rank_by_player = grp.take_rank_by_player()
-                kyoku_rewards = self.reward_calc.calc_delta_pt(player_id, grp_feature, rank_by_player)
+                if self.skip_rewards:
+                    kyoku_rewards = np.zeros(at_kyoku[-1] + 1, dtype=np.float64)
+                else:
+                    kyoku_rewards = self.reward_calc.calc_delta_pt(player_id, grp_feature, rank_by_player)
                 assert len(kyoku_rewards) >= at_kyoku[-1] + 1 # usually they are equal, unless there is no action in the last kyoku
 
                 final_scores = grp.take_final_scores()
@@ -253,6 +267,10 @@ class FileDatasetsIter(IterableDataset):
                     ]
                     if self.oracle:
                         entry.insert(1, invisible_obs[i])
+                    if self.final_rank:
+                        # Appended, so every field train.py unpacks keeps its
+                        # place and only what asks for this sees it.
+                        entry.append(player_ranks[-1])
                     entries.append(entry)
         return entries
 

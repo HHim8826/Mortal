@@ -189,8 +189,8 @@ class Spec:
         if not sep:
             label, rest = '', text
         file, _, part = rest.partition('#')
-        if part not in ('', 'ema'):
-            raise SystemExit(f'{text}: only #ema can follow a checkpoint')
+        if part not in ('', 'ema', 'policy'):
+            raise SystemExit(f'{text}: only #ema or #policy can follow a checkpoint')
         if not path.exists(file):
             raise SystemExit(f'{file}: no such checkpoint')
         return cls(label or path.splitext(path.basename(file))[0] + (f'#{part}' if part else ''),
@@ -285,17 +285,26 @@ def summarize_logs(log_dir, player_name):
 
 def load_model(spec, device):
     import torch
-    from model import Brain, DQN
+    from model import Brain, DQN, PolicyHead
     state = torch.load(spec.file, weights_only=True, map_location='cpu')
     weights = state['ema'] if spec.part == 'ema' else state
     cfg = state['config']
     version = cfg['control'].get('version', 1)
     brain = Brain(version=version, conv_channels=cfg['resnet']['conv_channels'],
                   num_blocks=cfg['resnet']['num_blocks']).eval()
-    dqn = DQN(version=version).eval()
     brain.load_state_dict(weights['mortal'])
-    dqn.load_state_dict(weights['current_dqn'])
-    return brain.to(device), dqn.to(device), version, state.get('steps')
+    if spec.part == 'policy':
+        # A policy head answers the same call as the Q head -- logits over the
+        # legal actions -- so the engine plays it without knowing the
+        # difference, and the two are measured on one ruler.
+        if 'policy' not in state:
+            raise SystemExit(f'{spec.file} has no policy head; train one with train_policy.py')
+        head = PolicyHead(version=version).eval()
+        head.load_state_dict(state['policy'])
+    else:
+        head = DQN(version=version).eval()
+        head.load_state_dict(weights['current_dqn'])
+    return brain.to(device), head.to(device), version, state.get('steps')
 
 
 def engine_for(spec, device, name):
