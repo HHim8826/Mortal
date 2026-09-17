@@ -216,6 +216,10 @@ def choose(reaction, possible, seat, drawn=None):
                 for key in ('target', 'consumed'):
                     if key not in action and key in reaction:
                         action[key] = reaction[key]
+            if action['type'] == 'dahai' and 'tsumogiri' not in action:
+                origin = _discard_origin(reaction, action.get('pai'), drawn)
+                if origin is not None:
+                    action['tsumogiri'] = origin
             return action, None
         if len(matches) > 1:
             # Two offers fit what Mortal asked for, so the fields they differ
@@ -237,6 +241,32 @@ def choose(reaction, possible, seat, drawn=None):
         why = 'no reaction was held for this request'
 
     return _give_up(possible, seat, drawn, why)
+
+
+def _discard_origin(reaction, pai, drawn):
+    """The `tsumogiri` to send with a matched discard, or None to leave it out.
+
+    The server lists a discard by its tile alone, so a hand holding a copy of
+    the tile just drawn is offered the same `{"type": "dahai", "pai": ...}`
+    for both, and sending the offer back lets the server take either. Mortal
+    said which one it meant, and which one is played is seen by the other
+    three players: dropping it turned a tsumogiri into a tedashi without a
+    single fallback being counted (issue #5).
+
+    The protocol makes an impossible `tsumogiri` a chombo, so it is only sent
+    where the server's own events prove it possible. `drawn` is the tile the
+    server dealt this seat and nothing else. True needs that tile to be the
+    one discarded. False needs a copy that is not the draw, which the offer
+    itself proves whenever the discarded tile is not the draw; when it is the
+    draw, nothing the server sent shows a second copy, so it is left out as
+    before.
+    """
+    wants_draw = reaction.get('tsumogiri')
+    if wants_draw is True and drawn is not None and pai == drawn:
+        return True
+    if wants_draw is False and pai != drawn:
+        return False
+    return None
 
 
 def _give_up(possible, seat, drawn, why):
