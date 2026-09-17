@@ -268,9 +268,36 @@ def train():
     else:
         logging.info(f'device: {device}')
 
+    # What the workers are playing with, kept under the number the server gave
+    # it. The games that come back are stamped with that number, and a policy
+    # gradient has to price them under the weights that played them, which the
+    # trainer has long since moved past. Only the last few are needed -- a
+    # session is a round trip of minutes, and these are ~43 MB each -- so the
+    # rest are dropped as they age out.
+    param_dir = path.join(path.dirname(state_file), 'params')
+    param_history = config['online'].get('param_history', 8) if online else 0
+
+    def publish(is_idle):
+        version = submit_param(mortal, dqn, is_idle=is_idle)
+        logging.info(f'param has been submitted, version {version}')
+        if not (ddp.is_main and param_history > 0):
+            return version
+        os.makedirs(param_dir, exist_ok=True)
+        torch.save({
+            'mortal': mortal.state_dict(),
+            'current_dqn': dqn.state_dict(),
+            'param_version': version,
+            'steps': steps,
+            'config': config,
+        }, path.join(param_dir, f'v{version}.pth'))
+        kept = sorted((int(f[1:-4]) for f in os.listdir(param_dir)
+                       if f.startswith('v') and f.endswith('.pth')), reverse=True)
+        for old_version in kept[param_history:]:
+            os.remove(path.join(param_dir, f'v{old_version}.pth'))
+        return version
+
     if online:
-        submit_param(mortal, dqn, is_idle=True)
-        logging.info('param has been submitted')
+        publish(is_idle=True)
 
     writer = SummaryWriter(config['control']['tensorboard_dir']) if ddp.is_main else NullWriter()
     stats = {
@@ -447,8 +474,7 @@ def train():
             pb.update(1)
 
             if online and steps % submit_every == 0:
-                submit_param(mortal, dqn, is_idle=False)
-                logging.info('param has been submitted')
+                publish(is_idle=False)
 
             if steps % save_every == 0:
                 pb.close()
@@ -497,8 +523,7 @@ def train():
                 state = save_state()
 
                 if online and steps % submit_every != 0:
-                    submit_param(mortal, dqn, is_idle=False)
-                    logging.info('param has been submitted')
+                    publish(is_idle=False)
 
                 if steps % test_every == 0:
                     # Each rank plays its own slice of the same seeds on its own
@@ -682,8 +707,7 @@ def train():
         pb.close()
 
         if online:
-            submit_param(mortal, dqn, is_idle=True)
-            logging.info('param has been submitted')
+            publish(is_idle=True)
 
     while True:
         train_epoch()

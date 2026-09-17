@@ -40,6 +40,13 @@ def drain():
         return msg['drain_dir']
 
 def submit_param(mortal, dqn, is_idle=False):
+    """Publish the weights the workers play with, and return their version.
+
+    The server counts the versions, so it is the only place that knows what
+    this one is called, and a worker stamps that number on every game it
+    submits. Learning from those games means being able to find these exact
+    weights again, so the version comes back here.
+    """
     remote = (config['online']['remote']['host'], config['online']['remote']['port'])
     with socket.socket() as conn:
         conn.connect(remote)
@@ -49,6 +56,7 @@ def submit_param(mortal, dqn, is_idle=False):
             'dqn': dqn.state_dict(),
             'is_idle': is_idle,
         })
+        return recv_msg(conn)['param_version']
 
 def send_msg(conn: socket.socket, msg, packed=False):
     if packed:

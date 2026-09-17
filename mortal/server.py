@@ -127,6 +127,11 @@ class Handler(BaseRequestHandler):
             S.param_version += 1
             if msg['is_idle']:
                 S.idle_param_version = S.param_version
+            version = S.param_version
+        # The trainer keeps a copy of what it just published under this number,
+        # because the games that come back carrying it have to be learned from
+        # with the weights that played them.
+        self.send_msg({'param_version': version})
 
     def handle_drain(self):
         drained_size = 0

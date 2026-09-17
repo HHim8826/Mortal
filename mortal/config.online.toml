@@ -173,6 +173,13 @@ state_file = 'logs/baseline.pth'
 
 [online]
 history_window = 50
+# Published parameter sets kept on disk, newest first, as logs/v4o/params/v<n>.pth.
+# The games a worker submits carry the version that played them, and pricing
+# them for a policy gradient means loading those exact weights again. A session
+# is a round trip of about ten minutes, which at ~1.5 steps/s and a publish
+# every 400 steps is three or four versions, so eight covers a worker that
+# falls well behind. Each is ~43 MB.
+param_history = 8
 enable_compile = false
 
 [online.remote]
