@@ -171,6 +171,13 @@ def main():
     step = 0
     started = time.time()
     while step < args.steps:
+        # Each pass is seeded by the step it starts at, so a pass that trains
+        # on nothing starts the next one at the same step with the same seed,
+        # samples the same positions, and trains on nothing again, for ever:
+        # no update, and no save (issue #6). drop_last makes that easy to hit
+        # on a small corpus, and each worker drops its own tail, so there being
+        # more samples than a batch in total is not enough.
+        pass_started_at = step
         for batch in loader(train, seed=step, workers=args.workers):
             gpu = {k: v.to(device, non_blocking=True) for k, v in batch.items()
                    if k != 'context'}
@@ -195,6 +202,13 @@ def main():
                              + ' '.join(f'{k} {v.item():.4f}' for k, v in parts.items()))
             if step >= args.steps:
                 break
+        if step == pass_started_at:
+            raise SystemExit(
+                f'a whole pass over {len(train):,} training row groups gave no full batch of '
+                f'{args.batch_size:,} (step {step:,} of {args.steps:,}). Each of the '
+                f'{max(args.workers, 1)} loader worker(s) reads its own share of the groups, '
+                f'keeps a position with probability {args.keep_prob}, and drops its own last '
+                f'partial batch. Lower --batch-size or --workers, raise --keep-prob, or add data.')
 
     torch.save({'model': net.state_dict(), 'args': vars(args),
                 'baseline': (hits / np.maximum(seen, 1)).tolist()}, args.out)
@@ -225,6 +239,12 @@ def validate(net, loader, baseline_rates, device, batches):
                 context[:, :, DISCARDED:DISCARDED + TILE_KINDS].reshape(-1))
             keep['tenpai_p'].append(torch.sigmoid(out['tenpai'].float()).cpu().numpy().reshape(-1))
             keep['tenpai_y'].append(batch['tenpai'].numpy().reshape(-1))
+    if not keep['p']:
+        # The same drop_last as training: held-out groups too small to fill one
+        # batch per worker give nothing, and np.concatenate would say only that
+        # it needs at least one array.
+        raise SystemExit('the held-out row groups gave no full batch to validate on; '
+                         'lower --batch-size or --workers, or raise --val-groups or --keep-prob')
     data = {k: np.concatenate(v) for k, v in keep.items()}
 
     logging.info(f'validated on {len(data["y"]):,} (seat, tile) pairs')
