@@ -216,19 +216,52 @@ def chunks(wall_set, per_chunk, limit=None):
             for first in range(wall_set.first_seed, end, per_chunk)]
 
 
+def chunk_range(name):
+    """(first seed, count) from a chunk directory's name."""
+    _, first, count = name.split('-')
+    return int(first), int(count)
+
+
+def finished_chunks(model_dir):
+    return sorted(n for n in os.listdir(model_dir)
+                  if n.startswith('seeds-') and not n.endswith('.partial')
+                  and path.exists(path.join(model_dir, n, SUMMARY)))
+
+
+def drop_covered(model_dir, first, count):
+    """Remove finished chunks lying wholly inside [first, first + count).
+
+    A chunk of another size can overlap one already played. The ranks are
+    keyed by game and do not mind, but Stat.from_dir reads every log under the
+    model and would count those games twice.
+    """
+    keep = chunk_name(first, count)
+    for name in finished_chunks(model_dir):
+        f, c = chunk_range(name)
+        if name != keep and first <= f and f + c <= first + count:
+            shutil.rmtree(path.join(model_dir, name))
+
+
 def read_games(model_dir):
     """Every finished chunk's games for a model, as {(seed, split): rank}."""
     games = {}
     if not path.isdir(model_dir):
         return games
-    for name in sorted(os.listdir(model_dir)):
-        summary = path.join(model_dir, name, SUMMARY)
-        if name.startswith('seeds-') and path.exists(summary):
-            with open(summary, encoding='utf-8') as f:
-                for key, rank in json.load(f)['ranks'].items():
-                    seed, split = key.split('_')
-                    games[(int(seed), split)] = rank
+    for name in finished_chunks(model_dir):
+        with open(path.join(model_dir, name, SUMMARY), encoding='utf-8') as f:
+            for key, rank in json.load(f)['ranks'].items():
+                seed, split = key.split('_')
+                games[(int(seed), split)] = rank
     return games
+
+
+def logged_games(model_dir):
+    """Games on disk, counting a game once per chunk that holds it."""
+    total = 0
+    for name in finished_chunks(model_dir):
+        with open(path.join(model_dir, name, SUMMARY), encoding='utf-8') as f:
+            total += len(json.load(f)['ranks'])
+    return total
 
 
 def summarize_logs(log_dir, player_name):
@@ -324,6 +357,7 @@ def play_chunk(engine, champion, wall_set, first, count, model_dir, quiet):
                    'rankings': list(rankings), 'ranks': ranks,
                    'finished': datetime.now(timezone.utc).isoformat()}, f)
     os.replace(partial, final)
+    drop_covered(model_dir, first, count)
     return rankings
 
 
@@ -430,6 +464,12 @@ def cmd_report(args):
     if stale and not args.no_style:
         print(f'  note: interrupted chunks under {", ".join(stale)} are counted in the style '
               f'rates until the next play clears them')
+    for spec in models:
+        model_dir = path.join(base, spec.ident)
+        extra = logged_games(model_dir) - len(read_games(model_dir))
+        if extra and not args.no_style:
+            print(f'  note: {spec.label} has {extra} games in overlapping chunks, counted twice '
+                  f'in its style rates (ranks are not affected)')
 
     report = {
         'set': wall_set.name, 'key': wall_set.key, 'champion': champion_spec.label,

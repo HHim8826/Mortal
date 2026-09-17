@@ -105,6 +105,26 @@ class Storage(unittest.TestCase):
             os.makedirs(os.path.join(d, ev.chunk_name(1, 1) + '.partial'))
             self.assertEqual(ev.walls_of(ev.read_games(d)), {0: [1, 2, 3, 4]})
 
+    def test_a_wider_chunk_replaces_the_ones_inside_it(self):
+        def finish(d, first, count):
+            chunk = os.path.join(d, ev.chunk_name(first, count))
+            os.makedirs(chunk)
+            ranks = {f'{s}_{x}': 1 + i for s in range(first, first + count)
+                     for i, x in enumerate(ev.SPLITS)}
+            with open(os.path.join(chunk, ev.SUMMARY), 'w') as f:
+                json.dump({'ranks': ranks}, f)
+
+        with tempfile.TemporaryDirectory() as d:
+            finish(d, 0, 1)
+            finish(d, 1, 1)
+            finish(d, 3, 2)
+            finish(d, 0, 4)
+            self.assertEqual(ev.logged_games(d), 4 * (1 + 1 + 2 + 4))
+            ev.drop_covered(d, 0, 4)
+            # [3, 5) sticks out past the new chunk, so it stays, overlap and all.
+            self.assertEqual(ev.finished_chunks(d), [ev.chunk_name(0, 4), ev.chunk_name(3, 2)])
+            self.assertEqual(ev.logged_games(d) - len(ev.read_games(d)), 4)
+
     def test_summary_files_are_not_game_logs(self):
         # Stat.from_dir reads every *.json and *.json.gz as a game.
         for name in (ev.SUMMARY, ev.META):
