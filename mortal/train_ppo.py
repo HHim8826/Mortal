@@ -18,9 +18,18 @@ objective could have stopped it. This trains the policy instead:
     the clip      an update that would move a decision's probability by more
                   than `--clip` stops paying. This is the brake the MC recipe
                   had no way to express.
-    the baseline  the critic's expected placement utility, subtracted from what
-                  the hanchan actually paid, so the gradient sees what a
-                  decision changed rather than how the game happened to end.
+    the return    the GRP's change in expected placement utility over the kyoku
+                  the decision is in, which is what the offline Q was trained
+                  on. The hanchan's final placement was tried first and gave
+                  no gradient at all: 248 decisions share one outcome, and the
+                  cosine between consecutive batches' gradients measured 0.003
+                  while the policy walked 0.0068 of KL in 106,000 steps and
+                  played exactly as well at the end. A kyoku is shared by about
+                  thirty decisions instead.
+    the baseline  a value head predicting that same return, started from the
+                  teacher's own dueling value stream -- the same linear
+                  function of the same features, fitted to the same return --
+                  so it is worth subtracting from the first step.
     the anchor    an exact KL to a reference policy, over the legal actions
                   rather than sampled. `--ref-refresh` decides whether it stays
                   the distilled start (a fixed anchor) or follows the policy
@@ -50,7 +59,7 @@ import prelude                                          # noqa: F401
 from common import drain, submit_param
 from config import config
 from dataloader import FileDatasetsIter, worker_init_fn
-from model import Brain, PolicyHead, RankCritic
+from model import Brain, DQN, KyokuValue, PolicyHead, RankCritic
 from rollout import version_in
 
 
@@ -76,7 +85,13 @@ def load_start(file, device):
     policy.load_state_dict(state['policy'])
     critic = RankCritic(pts=tuple(state.get('pts', config['env']['pts'])))
     critic.load_state_dict(state['critic'])
-    return brain.to(device), policy.to(device), critic.to(device), state, cfg
+    # The baseline the advantage is taken against, started from the teacher's
+    # own value stream -- the same function, trained on the same return.
+    teacher = DQN(version=4)
+    teacher.load_state_dict(state['current_dqn'])
+    value = KyokuValue.from_dueling(teacher)
+    return (brain.to(device), policy.to(device), critic.to(device),
+            value.to(device), state, cfg)
 
 
 class Behaviour:
@@ -256,7 +271,10 @@ def parse_args(argv=None):
     ap.add_argument('--ref-refresh', type=int, default=0,
                     help='rounds between reference updates; 0 keeps the start policy')
     ap.add_argument('--ent-coef', type=float, default=1e-3)
-    ap.add_argument('--v-coef', type=float, default=0.5)
+    ap.add_argument('--v-coef', type=float, default=0.5,
+                    help='weight of the kyoku value the advantage rests on')
+    ap.add_argument('--rank-coef', type=float, default=0.1,
+                    help='weight of the placement critic, which is only a diagnostic now')
     ap.add_argument('--grad-clip', type=float, default=1.0)
     ap.add_argument('--target-kl', type=float, default=0.02,
                     help='end a round once the policy has moved this far from the '
@@ -280,7 +298,7 @@ def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device or config['control']['device'])
-    brain, policy, critic, state, cfg = load_start(args.start, device)
+    brain, policy, critic, value_head, state, cfg = load_start(args.start, device)
     frozen_trunk = not args.train_trunk
     brain.requires_grad_(not frozen_trunk)
     logging.info(f'start {args.start}: distilled at step {state.get("steps")}, '
@@ -291,7 +309,8 @@ def main():
     # resumed: a fixed reference means fixed, and rebuilding it from a resumed
     # policy would quietly re-anchor the run to wherever it had got to.
     reference = deepcopy(policy).eval().requires_grad_(False) if args.kl_coef > 0 else None
-    groups = [{'params': list(policy.parameters()) + list(critic.parameters()), 'lr': args.lr}]
+    groups = [{'params': list(policy.parameters()) + list(critic.parameters())
+                         + list(value_head.parameters()), 'lr': args.lr}]
     if not frozen_trunk:
         groups.append({'params': list(brain.parameters()), 'lr': args.trunk_lr})
     optimizer = optim.AdamW(groups, weight_decay=0.)
@@ -307,6 +326,8 @@ def main():
         held = torch.load(carry_on, weights_only=True, map_location='cpu')
         policy.load_state_dict(held['policy'])
         critic.load_state_dict(held['critic'])
+        if 'value' in held:
+            value_head.load_state_dict(held['value'])
         if not frozen_trunk and 'mortal' in held:
             brain.load_state_dict(held['mortal'])
         if 'optimizer' in held:
@@ -320,6 +341,8 @@ def main():
                      f'(--fresh would start over and overwrite it)')
         del held
     cross_entropy = nn.CrossEntropyLoss()
+    huber = nn.SmoothL1Loss()
+    gamma = config['env']['gamma']
     trained = [p for g in groups for p in g['params']]
 
     keep = args.keep_versions or (128 if frozen_trunk
@@ -340,6 +363,7 @@ def main():
         torch.save({
             'policy': policy.state_dict(),
             'critic': critic.state_dict(),
+            'value': value_head.state_dict(),
             'mortal': brain.state_dict(),
             'current_dqn': state['current_dqn'],
             'config': cfg,
@@ -385,10 +409,9 @@ def main():
             num_epochs = 1,
             final_rank = True,
             param_version = True,
-            # The advantage is the hanchan's own result against the critic's
-            # estimate of it, so the per-kyoku GRP return -- and the GRP
-            # forward each game would cost -- is not needed.
-            skip_rewards = True,
+            # The GRP forward per game buys the only thing that made the
+            # gradient point anywhere: a return the decision had a hand in.
+            skip_rewards = False,
         )
         loader_kwargs = {}
         if workers > 0:
@@ -428,12 +451,14 @@ def main():
         # cheaper than learning from it against the wrong policy.
         drift = 0.
         for batch in batches:
-            (obs, actions, masks, _steps_to_done, _kyoku_rewards,
+            (obs, actions, masks, steps_to_done, kyoku_rewards,
              _player_ranks, final_rank, versions) = batch
             obs = obs.to(dtype=torch.float32, device=device, non_blocking=True)
             actions = actions.to(dtype=torch.int64, device=device, non_blocking=True)
             masks = masks.to(dtype=torch.bool, device=device, non_blocking=True)
             final_rank = final_rank.to(dtype=torch.int64, device=device, non_blocking=True)
+            steps_to_done = steps_to_done.to(dtype=torch.int64, device=device, non_blocking=True)
+            kyoku_rewards = kyoku_rewards.to(dtype=torch.float32, device=device, non_blocking=True)
             versions = versions.to(dtype=torch.int64)
 
             in_round.update(int(v) for v in versions.unique())
@@ -452,6 +477,7 @@ def main():
                     phi = phi.detach()
                 logits = policy(phi, masks)
                 rank_logits = critic(phi)
+                value = value_head(phi).float()
 
                 with torch.no_grad():
                     mu_logp = torch.zeros_like(actions, dtype=torch.float32)
@@ -463,8 +489,10 @@ def main():
 
                 logp = log_prob_of(logits.float(), actions)
                 ratio = (logp - mu_logp).exp()
-                value = critic.value(rank_logits.float())
-                paid = critic.pts[final_rank]
+                # What this decision's kyoku paid, in expected placement
+                # utility, discounted back to it. gamma is 1 in every config
+                # this has run under, so it is the kyoku's own GRP delta.
+                paid = gamma ** steps_to_done * kyoku_rewards
                 advantage = paid - value.detach()
                 advantage = (advantage - advantage[keep].mean()) / (advantage[keep].std() + 1e-8)
 
@@ -472,8 +500,13 @@ def main():
                 policy_loss = -torch.min(ratio * advantage, clipped * advantage)
                 entropy, kl = entropy_and_kl(logits.float(), ref_logits)
                 per_decision = policy_loss - args.ent_coef * entropy + args.kl_coef * kl
+                value_loss = huber(value[keep], paid[keep])
+                # The placement critic is no longer what the advantage rests
+                # on, but it is what says how a hanchan ends and it costs one
+                # matrix multiply, so it keeps learning beside it.
                 critic_loss = cross_entropy(rank_logits[keep], final_rank[keep])
-                loss = per_decision[keep].mean() + args.v_coef * critic_loss
+                loss = (per_decision[keep].mean() + args.v_coef * value_loss
+                        + args.rank_coef * critic_loss)
 
             if unchecked:
                 # Only the first batch can be checked this way: after one
@@ -557,6 +590,7 @@ def main():
                 meter.add(
                     policy_loss = policy_loss[keep].mean(),
                     critic_loss = critic_loss,
+                    value_loss = value_loss,
                     ratio = ratio[keep].mean(),
                     clipped = ((ratio[keep] - 1).abs() > args.clip).float().mean(),
                     approx_kl = (mu_logp - logp)[keep].mean(),
@@ -578,7 +612,8 @@ def main():
                 writer.add_scalar('ppo/steps_per_second', rate, steps)
                 logging.info(
                     f'round {round_no} step {steps:,} ({rate:.1f}/s) '
-                    f'policy {m["policy_loss"]:+.4f} critic {m["critic_loss"]:.4f} | '
+                    f'policy {m["policy_loss"]:+.4f} value {m["value_loss"]:.4f} '
+                    f'critic {m["critic_loss"]:.4f} | '
                     f'ratio {m["ratio"]:.4f}, clipped {m["clipped"]:.1%}, '
                     f'kl to mu {m["approx_kl"]:+.5f}, to ref {m["ref_kl"]:.5f} | '
                     f'entropy {m["entropy"]:.3f}, grad {m["grad_norm"]:.3g} '

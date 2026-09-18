@@ -307,6 +307,45 @@ class RankCritic(nn.Module):
     def value(self, logits: Tensor) -> Tensor:
         return logits.float().softmax(-1) @ self.pts
 
+class KyokuValue(nn.Module):
+    """What this kyoku is still worth, in expected placement utility.
+
+    The critic a policy gradient needs is one that predicts the same return the
+    advantage is taken against. `RankCritic` predicts how the hanchan ends,
+    which makes every decision in it share one number: 248 decisions, one
+    outcome, and a gradient that measured out as pure noise -- cosine between
+    consecutive batches 0.003, a policy that walked 0.0068 of KL in 106,000
+    steps and played exactly as well at the end.
+
+    This predicts the per-kyoku return instead, the GRP's change in expected
+    placement utility over the kyoku the decision is in. About thirty decisions
+    share one of those rather than 248.
+
+    It starts as the teacher's own value: a v4 Q head is a dueling
+    `Linear(1024, 1 + ACTION_SPACE)` whose first row is exactly this, V(s), and
+    it was trained on exactly this return. So the baseline is useful from the
+    first step rather than after a warm-up.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Linear(1024, 1)
+        nn.init.constant_(self.net.bias, 0)
+
+    @classmethod
+    def from_dueling(cls, dqn):
+        """The value stream of a v4 Q head, which is already this function."""
+        if getattr(dqn, 'version', None) != 4:
+            raise ValueError('only a v4 Q head carries a linear value stream')
+        head = cls()
+        with torch.no_grad():
+            head.net.weight.copy_(dqn.net.weight[:1])
+            head.net.bias.copy_(dqn.net.bias[:1])
+        return head
+
+    def forward(self, phi: Tensor) -> Tensor:
+        return self.net(phi).squeeze(-1)
+
 class GRP(nn.Module):
     def __init__(self, hidden_size=64, num_layers=2):
         super().__init__()
