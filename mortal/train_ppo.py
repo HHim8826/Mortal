@@ -311,7 +311,13 @@ def main():
     # The anchor is the policy this run departed from, taken before anything is
     # resumed: a fixed reference means fixed, and rebuilding it from a resumed
     # policy would quietly re-anchor the run to wherever it had got to.
-    reference = deepcopy(policy).eval().requires_grad_(False) if args.kl_coef > 0 else None
+    # Always built, even when nothing is anchored to it. How far the policy has
+    # travelled from where it started is the measurement, not a side effect of
+    # the penalty: with `--kl-coef 0` the reference used to be dropped and the
+    # run reported a distance of exactly zero for ever, which is the one number
+    # the no-anchor variant exists to produce. It costs one linear forward, and
+    # `kl_coef` of zero still contributes no gradient.
+    reference = deepcopy(policy).eval().requires_grad_(False)
     groups = [{'params': list(policy.parameters()) + list(critic.parameters())
                          + list(value_head.parameters()), 'lr': args.lr}]
     if not frozen_trunk:
@@ -491,7 +497,7 @@ def main():
                         rows = (versions == v).to(device) & keep
                         mu_logits = behaviour.logits(v, phi[rows], obs[rows], masks[rows])
                         mu_logp[rows] = log_prob_of(mu_logits.float(), actions[rows])
-                    ref_logits = reference(phi, masks) if reference is not None else None
+                    ref_logits = reference(phi, masks)
 
                 logp = log_prob_of(logits.float(), actions)
                 ratio = (logp - mu_logp).exp()
@@ -650,7 +656,7 @@ def main():
             logging.warning(f'round {round_no}: dropped {dropped:,} of {dropped + kept:,} '
                             'decisions whose parameters are no longer held')
 
-        if args.ref_refresh and reference is not None and round_no % args.ref_refresh == 0:
+        if args.ref_refresh and args.kl_coef > 0 and round_no % args.ref_refresh == 0:
             reference = deepcopy(policy).eval().requires_grad_(False)
             logging.info(f'reference refreshed to the policy after round {round_no}')
 
