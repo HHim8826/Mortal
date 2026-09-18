@@ -316,7 +316,10 @@ def main():
     skipped = 0
     unchecked_rounds = 0
     meter = Meter()
-    started = time.time()
+    # The rate is over the last window of steps, not over the life of the
+    # process: most of a round is spent waiting for games, and averaging that
+    # in reported 1.3 steps/s for a trainer that was doing 16.
+    since = time.time()
     round_no = 0
     while not args.rounds or round_no < args.rounds:
         round_no += 1
@@ -496,11 +499,14 @@ def main():
                 )
             if steps % args.log_every == 0:
                 m = meter.take()
+                rate = args.log_every / max(time.time() - since, 1e-9)
+                since = time.time()
                 for key, val in m.items():
                     writer.add_scalar(f'ppo/{key}', val, steps)
                 writer.add_scalar('ppo/drift_from_behaviour', drift, steps)
+                writer.add_scalar('ppo/steps_per_second', rate, steps)
                 logging.info(
-                    f'round {round_no} step {steps:,} ({steps / (time.time() - started):.1f}/s) '
+                    f'round {round_no} step {steps:,} ({rate:.1f}/s) '
                     f'policy {m["policy_loss"]:+.4f} critic {m["critic_loss"]:.4f} | '
                     f'ratio {m["ratio"]:.4f}, clipped {m["clipped"]:.1%}, '
                     f'kl to mu {m["approx_kl"]:+.5f}, to ref {m["ref_kl"]:.5f} | '
