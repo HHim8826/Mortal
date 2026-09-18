@@ -39,10 +39,12 @@ import time
 from collections import OrderedDict
 from copy import deepcopy
 from os import path
+from pathlib import Path
 
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 import prelude                                          # noqa: F401
 from common import drain, submit_param
@@ -94,6 +96,20 @@ class Behaviour:
         self.device = device
         self.heads = OrderedDict()
         self.nets = OrderedDict()
+        # A restart should not throw away the games already in flight. The
+        # workers play a session for ten minutes and stamp it with the version
+        # they fetched; if the trainer comes back knowing only what it has
+        # published since, every one of those decisions is dropped. The
+        # snapshots on disk are what it published before, so take them back.
+        for file in sorted(Path(self.dir).glob('v*.pth'),
+                           key=lambda f: int(f.stem[1:])):
+            head = PolicyHead(version=4).eval().requires_grad_(False)
+            head.load_state_dict(torch.load(file, weights_only=True,
+                                            map_location='cpu')['policy'])
+            self.heads[int(file.stem[1:])] = head.to(device)
+        if self.heads:
+            logging.info(f'{len(self.heads)} published policies recovered from {self.dir}: '
+                         f'v{min(self.heads)} to v{max(self.heads)}')
 
     def add(self, version, brain, policy, protect=()):
         """Keep this version, and drop the oldest ones that nothing still needs.
@@ -280,6 +296,9 @@ def main():
         }, out)
         return out
 
+    # Beside the run, so `tensorboard --logdir logs/ppo` shows every variant on
+    # one chart and the three can be read against each other.
+    writer = SummaryWriter(path.join(args.out, 'tb'))
     steps = 0
     unchecked_rounds = 0
     meter = Meter()
@@ -341,6 +360,7 @@ def main():
         unchecked_rounds += 1
         dropped = kept = 0
         in_round = set()
+        round_started_at = steps
         # How far the policy has walked from the one that played this round's
         # games. A round is hundreds of thousands of decisions and a single
         # pass over them is still hundreds of updates, so by the end the data
@@ -447,6 +467,9 @@ def main():
                 )
             if steps % args.log_every == 0:
                 m = meter.take()
+                for key, val in m.items():
+                    writer.add_scalar(f'ppo/{key}', val, steps)
+                writer.add_scalar('ppo/drift_from_behaviour', drift, steps)
                 logging.info(
                     f'round {round_no} step {steps:,} ({steps / (time.time() - started):.1f}/s) '
                     f'policy {m["policy_loss"]:+.4f} critic {m["critic_loss"]:.4f} | '
@@ -474,6 +497,14 @@ def main():
         if args.ref_refresh and reference is not None and round_no % args.ref_refresh == 0:
             reference = deepcopy(policy).eval().requires_grad_(False)
             logging.info(f'reference refreshed to the policy after round {round_no}')
+
+        writer.add_scalar('round/games', len(file_list), round_no)
+        writer.add_scalar('round/steps', steps - round_started_at, round_no)
+        writer.add_scalar('round/decisions_used', kept, round_no)
+        writer.add_scalar('round/decisions_dropped', dropped, round_no)
+        writer.add_scalar('round/drift_at_end', drift, round_no)
+        writer.add_scalar('round/total_steps', steps, round_no)
+        writer.flush()
 
         version = submit_param(brain, policy, is_idle=False)
         behaviour.add(version, brain, policy)

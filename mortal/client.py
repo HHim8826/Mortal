@@ -1,12 +1,14 @@
 import prelude
 
 import logging
+import os
 import socket
 import torch
 import numpy as np
 import time
 import gc
 from os import path
+from torch.utils.tensorboard import SummaryWriter
 from model import Brain, head_for
 from player import TrainPlayer
 from common import send_msg, recv_msg
@@ -33,6 +35,18 @@ def main():
     train_player = TrainPlayer()
     param_version = -1
 
+    # The trainee's average against the frozen opponent, session by session.
+    # It is the first number that moves when a policy improves or breaks -- it
+    # caught the v4 degradation hours before the 10,000-step evaluations -- and
+    # until now it existed only as a line in each worker's log. Each worker
+    # writes its own series; a run with several of them reads as one cloud.
+    worker = os.environ.get('MORTAL_WORKER', '0')
+    # The launcher points this at the run being played, so two variants' workers
+    # never write into one series.
+    tb_dir = os.environ.get('MORTAL_TB_DIR') or config['control']['tensorboard_dir']
+    writer = SummaryWriter(path.join(tb_dir, 'selfplay', f'worker{worker}'))
+    session = 0
+
     pts = np.array([90, 45, 0, -135])
     history_window = config['online']['history_window']
     history = []
@@ -55,6 +69,7 @@ def main():
         dqn.load_state_dict(rsp['dqn'])
         logging.info('param has been updated')
 
+        started = time.time()
         rankings, file_list = train_player.train_play(mortal, dqn, device)
         avg_rank = rankings @ np.arange(1, 5) / rankings.sum()
         avg_pt = rankings @ pts / rankings.sum()
@@ -68,6 +83,16 @@ def main():
 
         logging.info(f'trainee rankings: {rankings} ({avg_rank:.6}, {avg_pt:.6}pt)')
         logging.info(f'last {len(history)} sessions: {sum_rankings} ({ma_avg_rank:.6}, {ma_avg_pt:.6}pt)')
+
+        session += 1
+        writer.add_scalar('selfplay/avg_rank', avg_rank, session)
+        writer.add_scalar('selfplay/avg_pt', avg_pt, session)
+        writer.add_scalar('selfplay/avg_rank_ma', ma_avg_rank, session)
+        writer.add_scalar('selfplay/avg_pt_ma', ma_avg_pt, session)
+        writer.add_scalar('selfplay/param_version', param_version, session)
+        writer.add_scalar('selfplay/hanchans_per_second',
+                          rankings.sum() / max(time.time() - started, 1e-9), session)
+        writer.flush()
 
         logs = {}
         for filename in file_list:

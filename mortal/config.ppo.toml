@@ -26,7 +26,9 @@ online = true
 # bad online run can be thrown away by deleting one directory.
 state_file = 'logs/v4o/mortal.pth'
 best_state_file = 'logs/v4o/best.pth'
-tensorboard_dir = 'logs/v4o'
+# The run's own directory is what the launcher points the trainer and the
+# workers at; this is only the fallback for running one by hand.
+tensorboard_dir = 'logs/ppo'
 
 # Overridden per process by MORTAL_DEVICE; this is the trainer's.
 device = 'cuda:0'

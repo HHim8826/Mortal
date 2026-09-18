@@ -114,12 +114,32 @@ start trainer MORTAL_DEVICE=cuda:0 MORTAL_LOADER_RAYON_THREADS=$LOADER_RAYON \
     $PY train_ppo.py --from "$START" --out "$RUN" $FLAGS
 
 for i in $(seq 0 $((WORKERS - 1))); do
-    start "worker$i" MORTAL_DEVICE=cuda:1 MORTAL_WORKER=$i \
+    start "worker$i" MORTAL_DEVICE=cuda:1 MORTAL_WORKER=$i MORTAL_TB_DIR=$RUN/tb \
         RAYON_NUM_THREADS=$WORKER_RAYON $PY client.py
 done
 
+# Every variant under one logdir, so the three read against each other, and
+# bound to localhost: reachable only through the SSH tunnel
+# (ssh -L 6007:localhost:6007). The trainer writes the PPO diagnostics, the
+# workers the self-play average -- which is the number that moves first.
+TB_LOGDIR=/root/Mortal/mortal/logs/ppo
+if ! pgrep -f "[t]ensorboard --logdir $TB_LOGDIR --host" >/dev/null; then
+    pkill -f "[t]ensorboard.*--port 6007" || true
+    sleep 1
+    setsid nohup /root/venv/bin/tensorboard --logdir "$TB_LOGDIR"         --host 127.0.0.1 --port 6007 > /root/tensorboard.log 2>&1 < /dev/null &
+    echo "tensorboard started on 127.0.0.1:6007 over $TB_LOGDIR"
+fi
+
+# Two-hourly copy of the checkpoint, the logs and the events into the private
+# repo, under ppo/<variant>. It refuses to upload if that repo is not private.
+if ! pgrep -f "[b]ackup_ppo_hf.py" >/dev/null; then
+    setsid nohup env MORTAL_RUN=/root/Mortal/mortal/$RUN         MORTAL_CFG_PATH=/root/Mortal/mortal/$CFG         $PY /root/Mortal/ops/vast/backup_ppo_hf.py --loop         > "$RUN/backup.log" 2>&1 < /dev/null &
+    echo "hugging face backup started, every 2 h into ppo/$VARIANT"
+fi
+
 echo
 echo "watch it with:  tail -f $RUN/trainer.log $RUN/worker0.log"
+echo "                and ssh -L 6007:localhost:6007, then http://localhost:6007"
 echo "what to watch:  'ratio 1 within' on every round (the denominator is right),"
 echo "                clipped% (how hard the brake is working), kl to ref (drift),"
 echo "                and the workers' 'last N sessions' average against the start."
