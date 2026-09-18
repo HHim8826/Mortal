@@ -42,11 +42,18 @@ print('PORT=%d' % c['online']['remote']['port'])
 print('CHAMPION=' + c['baseline']['train']['state_file'])
 ")"
 
-# nproc reports the CPUs this container may actually use. The trainer decodes
-# the logs that come back (its loaders, this many threads each) and the workers
-# encode the games they are playing; between them they should fill the box
-# without oversubscribing it.
+# nproc reports the host's CPUs, not the ones this container may use: 256
+# against a cgroup quota of 61 on the box this was written for. Sizing the
+# thread pools from it oversubscribes by four times -- 3 workers x 64 rayon
+# threads on 61 CPUs -- so take the quota when there is one.
 CPUS=$(nproc)
+if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max
+    if [ "$quota" != max ] && [ "$period" -gt 0 ]; then
+        CPUS=$(( quota / period ))
+        [ "$CPUS" -lt 1 ] && CPUS=1
+    fi
+fi
 LOADER_RAYON=${LOADER_RAYON:-$(( CPUS / 4 / 6 ))}
 WORKER_RAYON=${WORKER_RAYON:-$(( CPUS * 3 / 4 / WORKERS ))}
 [ "$LOADER_RAYON" -lt 1 ] && LOADER_RAYON=1
