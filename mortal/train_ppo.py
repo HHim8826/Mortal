@@ -51,6 +51,7 @@ from common import drain, submit_param
 from config import config
 from dataloader import FileDatasetsIter, worker_init_fn
 from model import Brain, PolicyHead, RankCritic
+from rollout import version_in
 
 
 def load_start(file, device):
@@ -119,6 +120,18 @@ class Behaviour:
         the batch: in a smoke run with a publish every five steps, a round
         lost 192 of its 1,088 decisions to its own progress.
         """
+        # A version number names one set of weights for the life of a run. If
+        # one comes back meaning something else, the games already stamped with
+        # it would be priced under weights that never played them -- and the
+        # ratio check could not see it, because both sides would be the new
+        # head. The server keeps its counter across restarts so this should be
+        # impossible; if it happens anyway, it stops here.
+        if version in self.heads and not self.matches(version, policy):
+            raise SystemExit(
+                f'v{version} was published before with different weights. A parameter '
+                'version must name one policy for the whole run: games already carrying '
+                'this number were played by the older one, and pricing them under these '
+                'weights would corrupt every ratio they appear in.')
         self.heads[version] = deepcopy(policy).eval().requires_grad_(False)
         # A frozen trunk is the same trunk in every version, so a snapshot is
         # 47,000 numbers rather than 43 MB, and hundreds of them can be kept.
@@ -250,6 +263,8 @@ def parse_args(argv=None):
                     help='publish every N steps inside a round as well as at its end')
     ap.add_argument('--keep-versions', type=int, default=0,
                     help='published policies kept for pricing; 0 picks by trunk')
+    ap.add_argument('--fresh', action='store_true',
+                    help='start over from --from, overwriting any run in --out')
     ap.add_argument('--train-trunk', action='store_true')
     ap.add_argument('--workers', type=int, default=None)
     ap.add_argument('--file-batch-size', type=int, default=None)
@@ -270,12 +285,38 @@ def main():
                  f'play temperature {state.get("play_temperature")}, '
                  f'trunk {"frozen" if frozen_trunk else "training"}')
 
+    # The anchor is the policy this run departed from, taken before anything is
+    # resumed: a fixed reference means fixed, and rebuilding it from a resumed
+    # policy would quietly re-anchor the run to wherever it had got to.
     reference = deepcopy(policy).eval().requires_grad_(False) if args.kl_coef > 0 else None
     groups = [{'params': list(policy.parameters()) + list(critic.parameters()), 'lr': args.lr}]
     if not frozen_trunk:
         groups.append({'params': list(brain.parameters()), 'lr': args.trunk_lr})
     optimizer = optim.AdamW(groups, weight_decay=0.)
     scaler = torch.amp.GradScaler(device.type)
+
+    # A restart must carry on, not start again. Without this the launcher's
+    # fixed `--from` sent the trainer back to the distilled checkpoint, it
+    # published that to the workers on its first breath, and the next save
+    # overwrote the run's own policy.pth with steps 0.
+    steps = rounds_done = 0
+    carry_on = path.join(args.out, 'policy.pth')
+    if path.exists(carry_on) and not args.fresh:
+        held = torch.load(carry_on, weights_only=True, map_location='cpu')
+        policy.load_state_dict(held['policy'])
+        critic.load_state_dict(held['critic'])
+        if not frozen_trunk and 'mortal' in held:
+            brain.load_state_dict(held['mortal'])
+        if 'optimizer' in held:
+            optimizer.load_state_dict(held['optimizer'])
+        if 'scaler' in held:
+            scaler.load_state_dict(held['scaler'])
+        if reference is not None and held.get('reference'):
+            reference.load_state_dict(held['reference'])
+        steps, rounds_done = held.get('steps', 0), held.get('rounds', 0)
+        logging.info(f'resuming {carry_on}: {rounds_done:,} rounds, {steps:,} steps '
+                     f'(--fresh would start over and overwrite it)')
+        del held
     cross_entropy = nn.CrossEntropyLoss()
     trained = [p for g in groups for p in g['params']]
 
@@ -306,13 +347,16 @@ def main():
             'rounds': round_no,
             'started_from': path.abspath(args.start),
             'args': vars(args),
+            # Everything a restart needs to carry on rather than begin again.
+            'optimizer': optimizer.state_dict(),
+            'scaler': scaler.state_dict(),
+            'reference': reference.state_dict() if reference is not None else None,
         }, out)
         return out
 
     # Beside the run, so `tensorboard --logdir logs/ppo` shows every variant on
     # one chart and the three can be read against each other.
     writer = SummaryWriter(path.join(args.out, 'tb'))
-    steps = 0
     skipped = 0
     unchecked_rounds = 0
     meter = Meter()
@@ -320,8 +364,8 @@ def main():
     # process: most of a round is spent waiting for games, and averaging that
     # in reported 1.3 steps/s for a trainer that was doing 16.
     since = time.time()
-    round_no = 0
-    while not args.rounds or round_no < args.rounds:
+    round_no = rounds_done
+    while not args.rounds or round_no - rounds_done < args.rounds:
         round_no += 1
         dirname = drain()
         file_list = [path.join(dirname, p) for p in sorted(os.listdir(dirname))
@@ -365,7 +409,12 @@ def main():
         unchecked = True
         unchecked_rounds += 1
         dropped = kept = 0
-        in_round = set()
+        # Every version this round's games were played by, taken from their
+        # names before a step is taken. Collecting it as the batches arrive is
+        # too late: the loader shuffles, so a publish partway through the round
+        # can evict a version whose games have not been read yet, and they are
+        # then dropped when they do arrive.
+        in_round = {v for v in map(version_in, file_list) if v is not None}
         round_started_at = steps
         # How far the policy has walked from the one that played this round's
         # games. A round is hundreds of thousands of decisions and a single
@@ -472,9 +521,14 @@ def main():
             steps += 1
 
             with torch.inference_mode():
-                # Schulman's k3: always positive, and far steadier than the
-                # difference of log probabilities it is estimating.
-                odds = (mu_logp - logp)[keep]
+                # Schulman's k3 for KL(mu || pi), the direction that says how
+                # stale the data is, estimated on actions mu drew: with
+                # r = pi(a)/mu(a), it is r - 1 - log r. Taking log r the other
+                # way round is not the other KL either, it is nothing in
+                # particular, and it under-reports: on a case where the true KL
+                # is 0.0713 it returns 0.0187, so a round could sit at three
+                # and a half times --target-kl and never stop.
+                odds = (logp - mu_logp)[keep]
                 drift = 0.9 * drift + 0.1 * float((odds.exp() - 1 - odds).mean())
                 meter.add(
                     policy_loss = policy_loss[keep].mean(),

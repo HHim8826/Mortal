@@ -58,7 +58,25 @@ class State:
     dqn_param: Optional[OrderedDict]
     param_version: int
     idle_param_version: int
+    version_file: str = ''
 S = None
+
+def remember_version(version):
+    """Keep the version counter across restarts of this process.
+
+    It starts at zero otherwise, and a second server then hands out numbers a
+    first one has already used. The games a worker is in the middle of playing
+    outlive the server: they come back stamped with a number that now means
+    different weights, the trainer prices them under those, and every check
+    passes because both sides agree on the wrong thing. Cheap insurance -- one
+    small write per publish, outside the buffer directory, which is emptied.
+    """
+    if not S.version_file:
+        return
+    tmp = S.version_file + '.new'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(str(version))
+    os.replace(tmp, S.version_file)
 
 class Handler(BaseRequestHandler):
     def handle(self):
@@ -128,6 +146,7 @@ class Handler(BaseRequestHandler):
             if msg['is_idle']:
                 S.idle_param_version = S.param_version
             version = S.param_version
+            remember_version(version)
         # The trainer keeps a copy of what it just published under this number,
         # because the games that come back carrying it have to be learned from
         # with the weights that played them.
@@ -187,6 +206,13 @@ def main():
         param_version = 0,
         idle_param_version = 0,
     )
+
+    # Beside the buffer, not in it: the directories below are emptied here.
+    S.version_file = path.join(path.dirname(S.buffer_dir), 'param_version')
+    if path.exists(S.version_file):
+        with open(S.version_file, encoding='utf-8') as f:
+            S.param_version = S.idle_param_version = int(f.read().strip() or 0)
+        logging.info(f'continuing parameter versions from v{S.param_version}')
 
     bind_addr = (config['online']['remote']['host'], config['online']['remote']['port'])
     if path.isdir(S.buffer_dir):

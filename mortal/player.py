@@ -228,20 +228,29 @@ class TrainPlayer:
             stable_mortal.compile()
             stable_dqn.compile()
 
-        self.baseline_engine = MortalEngine(
-            stable_mortal,
-            stable_dqn,
+        self.baseline_engine_args = dict(
             is_oracle = False,
             version = version,
             device = device,
             enable_amp = True,
-            enable_rule_based_agari_guard = True,
             name = 'baseline',
         )
+        self.baseline_parts = (stable_mortal, stable_dqn)
 
         profile = os.environ.get('TRAIN_PLAY_PROFILE', 'default')
         logging.info(f'using profile {profile}')
         cfg = config['train_play'][profile]
+        # The rule-based agari guard replaces the action the policy sampled
+        # when it wants a win that cannot lift it out of fourth in the last
+        # hand. For a policy gradient that is not a small detail: two sampled
+        # actions then lead to the one that was played, so its real probability
+        # is p(alternative) + p(agari), while the trainer -- which only sees
+        # what was played -- uses p(alternative). The two disagree as soon as
+        # the policy moves, and the error goes straight into the ratio.
+        # Off for a run that learns from these games; on everywhere else, which
+        # is what every evaluation so far has measured.
+        self.agari_guard = cfg.get('enable_rule_based_agari_guard', True)
+        self.baseline_engine = self.build_baseline()
         self.chal_version = config['control']['version']
         # Several self-play workers share a box and a config, and each one
         # empties its log directory before every session, so they must not
@@ -267,6 +276,14 @@ class TrainPlayer:
         # -- and share the one copy of the weights on the GPU, which a second
         # worker process would not.
         self.arenas = cfg.get('arenas', 1)
+
+    def build_baseline(self):
+        """The three opponent seats, under the same rule the trainee plays by."""
+        return MortalEngine(
+            *self.baseline_parts,
+            enable_rule_based_agari_guard = self.agari_guard,
+            **self.baseline_engine_args,
+        )
 
     def play_slice(self, engine_chal, first, count, quiet):
         """`count` seeds from `first`, into the session's own directory.
@@ -331,7 +348,7 @@ class TrainPlayer:
             top_p = self.top_p,
             device = device,
             enable_amp = True,
-            enable_rule_based_agari_guard = True,
+            enable_rule_based_agari_guard = self.agari_guard,
             name = 'trainee',
         )
 

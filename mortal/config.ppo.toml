@@ -87,6 +87,17 @@ log_dir = 'challenger/train_play'
 boltzmann_epsilon = 1.0
 boltzmann_temp = 1.0
 top_p = 1.0
+# Off for a policy-gradient run, and only for it. The guard replaces the action
+# the policy sampled when it wants a win that cannot lift it out of fourth in
+# the last hand; two sampled actions then lead to the one that was played, so
+# its real probability is the sum of both, while the trainer -- which sees only
+# what was played -- uses one of them. That gap becomes a wrong importance
+# ratio as soon as the policy moves (a worked case: the true ratio is 1 and the
+# computed one is 2, enough to hit the clip). It fires only at all-last, in
+# fourth, with a win too small to matter, so this changes very little play --
+# but what it does change is now the policy's own decision. Every evaluation
+# keeps the guard on.
+enable_rule_based_agari_guard = false
 repeats = 1
 # Arenas this worker splits its session across, in threads. Measured worse at
 # every setting tried -- 400 games in one arena 2.75 hanchans/s, in two 2.48,
