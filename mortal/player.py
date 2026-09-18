@@ -201,7 +201,14 @@ class TestPlayer:
 class TrainPlayer:
     def __init__(self):
         baseline_cfg = config['baseline']['train']
-        device = torch.device(baseline_cfg['device'])
+        # The opponents play on the worker's own GPU, not on whichever one the
+        # config names. Three of the four seats are the champion, so it is most
+        # of the forward work in a session: with it pinned to one card, workers
+        # handed the other still sent three quarters of their play back to the
+        # first, which sat at 100% while the other did nothing. `MORTAL_DEVICE`
+        # is what the launcher uses to spread them; for a run that keeps every
+        # worker on one card this is the same device it always was.
+        device = torch.device(os.environ.get('MORTAL_DEVICE') or baseline_cfg['device'])
 
         state = torch.load(baseline_cfg['state_file'], weights_only=True, map_location=torch.device('cpu'))
         cfg = state['config']

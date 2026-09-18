@@ -26,7 +26,9 @@ WORKERS=${WORKERS:-3}
 # trainer's card sat at 0% and the container used 36 of its 61 CPUs. The
 # trainer only works in bursts, after a drain, so its card is nearly free the
 # rest of the time. WORKER_GPUS=1 keeps them off it.
-WORKER_GPUS=${WORKER_GPUS:-0,1}
+# The trainer already sits on cuda:0, so the first worker goes to the other
+# card and an odd number of them leaves the busier side away from it.
+WORKER_GPUS=${WORKER_GPUS:-1,0}
 START=${START:-logs/policy/policy-t0.05.pth}
 PY=/root/venv/bin/python
 RUN=logs/ppo/$VARIANT
