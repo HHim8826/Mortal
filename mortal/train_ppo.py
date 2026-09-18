@@ -229,8 +229,10 @@ class Meter:
     def add(self, **kw):
         for key, val in kw.items():
             # Several of these are still attached to the graph; reading one as
-            # a number is a measurement, not a use of it.
-            self.sums[key] = self.sums.get(key, 0.) + float(val.detach())
+            # a number is a measurement, not a use of it. Others arrive as
+            # plain numbers already.
+            self.sums[key] = self.sums.get(key, 0.) + float(
+                val.detach() if torch.is_tensor(val) else val)
         self.n += 1
 
     def take(self):
@@ -359,6 +361,8 @@ def main():
     writer = SummaryWriter(path.join(args.out, 'tb'))
     skipped = 0
     unchecked_rounds = 0
+    last_grad = mean_grad = mean_norm = None
+    agreement = float('nan')
     meter = Meter()
     # The rate is over the last window of steps, not over the life of the
     # process: most of a round is spent waiting for games, and averaging that
@@ -501,6 +505,26 @@ def main():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(trained, args.grad_clip or float('inf'))
+
+            # Is there a direction here, or only noise? Batches differ, but a
+            # real gradient points the same way in all of them, so the cosine
+            # between one batch's policy gradient and the next is positive.
+            # Around zero means the run is a random walk however long it is
+            # left, which is what 12,000 steps that moved the policy 0.001 of
+            # KL and then stopped would look like. `agreement` is that cosine;
+            # `signal` is the norm of the running average against the average
+            # norm, which says how many batches it would take to see through
+            # the noise -- if it settles at s, roughly 1/s^2 of them.
+            with torch.inference_mode():
+                flat = torch.cat([p.grad.reshape(-1) for p in policy.parameters()
+                                  if p.grad is not None]).float()
+                if flat.isfinite().all():
+                    mean_grad = flat if mean_grad is None else 0.99 * mean_grad + 0.01 * flat
+                    mean_norm = float(flat.norm()) if mean_norm is None else (
+                        0.99 * mean_norm + 0.01 * float(flat.norm()))
+                    agreement = float('nan') if last_grad is None else float(
+                        torch.nn.functional.cosine_similarity(flat, last_grad, dim=0))
+                    last_grad = flat.clone()
             # A step the scaler refuses is a step that did not happen, and the
             # only sign of it is the loss scale going down. Left unwatched, a
             # nan in one term of the objective stops the whole run learning
@@ -541,6 +565,8 @@ def main():
                     value = value[keep].mean(),
                     paid = paid[keep].float().mean(),
                     grad_norm = grad_norm,
+                    agreement = agreement,
+                    signal = (float(mean_grad.norm()) / mean_norm) if mean_norm else float('nan'),
                 )
             if steps % args.log_every == 0:
                 m = meter.take()
@@ -555,7 +581,8 @@ def main():
                     f'policy {m["policy_loss"]:+.4f} critic {m["critic_loss"]:.4f} | '
                     f'ratio {m["ratio"]:.4f}, clipped {m["clipped"]:.1%}, '
                     f'kl to mu {m["approx_kl"]:+.5f}, to ref {m["ref_kl"]:.5f} | '
-                    f'entropy {m["entropy"]:.3f}, grad {m["grad_norm"]:.3g}, '
+                    f'entropy {m["entropy"]:.3f}, grad {m["grad_norm"]:.3g} '
+                    f'(agree {m["agreement"]:+.3f}, signal {m["signal"]:.3f}), '
                     f'value {m["value"]:+.3f} vs paid {m["paid"]:+.3f}')
 
             if args.submit_every and steps % args.submit_every == 0:
