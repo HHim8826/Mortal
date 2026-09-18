@@ -215,18 +215,23 @@ def main():
         logging.info(f'continuing parameter versions from v{S.param_version}')
 
     bind_addr = (config['online']['remote']['host'], config['online']['remote']['port'])
-    if path.isdir(S.buffer_dir):
-        shutil.rmtree(S.buffer_dir)
-    if path.isdir(S.drain_dir):
-        shutil.rmtree(S.drain_dir)
-    os.makedirs(S.buffer_dir)
-    os.makedirs(S.drain_dir)
-
     with Server(bind_addr, Handler, bind_and_activate=False) as server:
         server.allow_reuse_address = True
         server.daemon_threads = True
+        # The port first, the directories after. A second server started by
+        # mistake -- a launcher that could not see the running one's pid file,
+        # say -- used to empty the buffer and the drain on its way to failing
+        # to bind, which left the server that was actually serving with a count
+        # that no longer matched the disk. Its next drain would fail an
+        # assertion, take the handler thread with it, and the trainer reading
+        # that dropped connection would go down too. Bind first and the
+        # impostor exits having touched nothing.
         server.server_bind()
         server.server_activate()
+        for d in (S.buffer_dir, S.drain_dir):
+            if path.isdir(d):
+                shutil.rmtree(d)
+            os.makedirs(d)
         host, port = bind_addr
         logging.info(f'listening on {host}:{port}')
         server.serve_forever()
