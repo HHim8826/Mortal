@@ -33,9 +33,14 @@ START=${START:-logs/policy/policy-t0.05.pth}
 PY=/root/venv/bin/python
 RUN=logs/ppo/$VARIANT
 
+# 0.01, not 0.1. Measured on this box: at 0.1 the policy settled at a KL of
+# 0.0011 from its reference by step 750 and was still at 0.0011 after 6,150 --
+# the anchor's pull cancels the gradient's almost immediately, which is a
+# freeze rather than a constraint, and a variant that cannot move teaches
+# nothing about whether moving helps.
 case $VARIANT in
-    kl)         FLAGS="--kl-coef 0.1 --ref-refresh 0" ;;
-    kl-refresh) FLAGS="--kl-coef 0.1 --ref-refresh 10" ;;
+    kl)         FLAGS="--kl-coef 0.01 --ref-refresh 0" ;;
+    kl-refresh) FLAGS="--kl-coef 0.01 --ref-refresh 10" ;;
     plain)      FLAGS="--kl-coef 0" ;;
     *) echo "unknown VARIANT $VARIANT: expected kl, kl-refresh or plain" >&2; exit 1 ;;
 esac
