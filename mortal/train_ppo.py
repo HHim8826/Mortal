@@ -264,7 +264,10 @@ def parse_args(argv=None):
     ap.add_argument('--out', default='logs/ppo/run')
     ap.add_argument('--rounds', type=int, default=0, help='0 runs until stopped')
     ap.add_argument('--batch-size', type=int, default=256)
-    ap.add_argument('--lr', type=float, default=1e-4)
+    ap.add_argument('--lr', type=float, default=3e-4,
+                    help='raised with --accumulate: each step is a far better direction')
+    ap.add_argument('--accumulate', type=int, default=64,
+                    help='batches averaged into one optimizer step')
     ap.add_argument('--trunk-lr', type=float, default=1e-6, help='only with --train-trunk')
     ap.add_argument('--clip', type=float, default=0.2)
     ap.add_argument('--kl-coef', type=float, default=0.1, help='0 turns the anchor off')
@@ -384,9 +387,12 @@ def main():
     # one chart and the three can be read against each other.
     writer = SummaryWriter(path.join(args.out, 'tb'))
     skipped = 0
+    batches_in = 0
     unchecked_rounds = 0
     last_grad = mean_grad = mean_norm = None
-    agreement = float('nan')
+    # Both are measured on the batches that step; between them the meter reads
+    # the last one, which is what they describe.
+    agreement = grad_norm = float('nan')
     meter = Meter()
     # The rate is over the last window of steps, not over the life of the
     # process: most of a round is spent waiting for games, and averaging that
@@ -534,47 +540,54 @@ def main():
                                     'version just published: the ratio check has not run. '
                                     'The workers may be a long way behind.')
 
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = nn.utils.clip_grad_norm_(trained, args.grad_clip or float('inf'))
+            # One step per `--accumulate` batches. The measurement that
+            # asked for this: the cosine between consecutive batches'
+            # gradients averaged +0.008, which puts one batch's signal-to-noise
+            # at about 0.09, so a single batch is very nearly a random
+            # direction -- and Adam walks a full learning rate along whatever
+            # direction it is handed. Averaging N of them divides the random
+            # part by sqrt(N) and leaves the real part alone. At 64 the
+            # prediction is specific: if there is a direction at all, `agree`
+            # -- now the cosine between consecutive *accumulated* gradients --
+            # should rise from 0.008 towards 0.5. If it stays at zero, nothing
+            # here averages down and the objective has no gradient to follow.
+            if batches_in % args.accumulate == 0:
+                optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss / args.accumulate).backward()
+            batches_in += 1
+            stepping = batches_in % args.accumulate == 0
+            if stepping:
+                scaler.unscale_(optimizer)
+                grad_norm = nn.utils.clip_grad_norm_(trained, args.grad_clip or float('inf'))
 
-            # Is there a direction here, or only noise? Batches differ, but a
-            # real gradient points the same way in all of them, so the cosine
-            # between one batch's policy gradient and the next is positive.
-            # Around zero means the run is a random walk however long it is
-            # left, which is what 12,000 steps that moved the policy 0.001 of
-            # KL and then stopped would look like. `agreement` is that cosine;
-            # `signal` is the norm of the running average against the average
-            # norm, which says how many batches it would take to see through
-            # the noise -- if it settles at s, roughly 1/s^2 of them.
-            with torch.inference_mode():
-                flat = torch.cat([p.grad.reshape(-1) for p in policy.parameters()
-                                  if p.grad is not None]).float()
-                if flat.isfinite().all():
-                    mean_grad = flat if mean_grad is None else 0.99 * mean_grad + 0.01 * flat
-                    mean_norm = float(flat.norm()) if mean_norm is None else (
-                        0.99 * mean_norm + 0.01 * float(flat.norm()))
-                    agreement = float('nan') if last_grad is None else float(
-                        torch.nn.functional.cosine_similarity(flat, last_grad, dim=0))
-                    last_grad = flat.clone()
-            # A step the scaler refuses is a step that did not happen, and the
-            # only sign of it is the loss scale going down. Left unwatched, a
-            # nan in one term of the objective stops the whole run learning
-            # while every other number it prints stays perfectly reasonable --
-            # a ratio of exactly 1, a KL of exactly 0, for 1,350 steps.
-            before = scaler.get_scale()
-            scaler.step(optimizer)
-            scaler.update()
-            if scaler.get_scale() < before:
-                skipped += 1
-                if skipped >= 50:
-                    raise SystemExit(
-                        f'{skipped} optimizer steps in a row were skipped: the gradient is '
-                        f'not finite (last norm {float(grad_norm):.4g}). Nothing is being '
-                        'learned; find the term that is producing it.')
-            else:
-                skipped = 0
+                with torch.inference_mode():
+                    flat = torch.cat([p.grad.reshape(-1) for p in policy.parameters()
+                                      if p.grad is not None]).float()
+                    if flat.isfinite().all():
+                        mean_grad = flat if mean_grad is None else 0.99 * mean_grad + 0.01 * flat
+                        mean_norm = float(flat.norm()) if mean_norm is None else (
+                            0.99 * mean_norm + 0.01 * float(flat.norm()))
+                        agreement = float('nan') if last_grad is None else float(
+                            torch.nn.functional.cosine_similarity(flat, last_grad, dim=0))
+                        last_grad = flat.clone()
+                # A step the scaler refuses is a step that did not happen, and
+                # the only sign of it is the loss scale going down. Left
+                # unwatched, a nan in one term of the objective stops the whole
+                # run learning while every other number it prints stays
+                # perfectly reasonable -- a ratio of exactly 1, a KL of exactly
+                # 0, for 1,350 steps.
+                before = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                if scaler.get_scale() < before:
+                    skipped += 1
+                    if skipped >= 50:
+                        raise SystemExit(
+                            f'{skipped} optimizer steps in a row were skipped: the gradient '
+                            f'is not finite (last norm {float(grad_norm):.4g}). Nothing is '
+                            'being learned; find the term that is producing it.')
+                else:
+                    skipped = 0
             steps += 1
 
             with torch.inference_mode():
@@ -599,6 +612,7 @@ def main():
                     value = value[keep].mean(),
                     paid = paid[keep].float().mean(),
                     grad_norm = grad_norm,
+                    updates = float(stepping),
                     agreement = agreement,
                     signal = (float(mean_grad.norm()) / mean_norm) if mean_norm else float('nan'),
                 )
