@@ -95,12 +95,31 @@ class Behaviour:
         self.heads = OrderedDict()
         self.nets = OrderedDict()
 
-    def add(self, version, brain, policy):
+    def add(self, version, brain, policy, protect=()):
+        """Keep this version, and drop the oldest ones that nothing still needs.
+
+        `protect` is what the round being trained on was played by. Publishing
+        inside a round can otherwise evict the very policy whose games are in
+        the batch: in a smoke run with a publish every five steps, a round
+        lost 192 of its 1,088 decisions to its own progress.
+        """
         self.heads[version] = deepcopy(policy).eval().requires_grad_(False)
-        torch.save({'policy': policy.state_dict(), 'mortal': brain.state_dict()},
-                   path.join(self.dir, f'v{version}.pth'))
-        while len(self.heads) > self.keep:
-            old, _ = self.heads.popitem(last=False)
+        # A frozen trunk is the same trunk in every version, so a snapshot is
+        # 47,000 numbers rather than 43 MB, and hundreds of them can be kept.
+        # That matters: a worker plays for ten minutes, and its games are
+        # useless to the trainer if the version that played them has already
+        # been dropped.
+        blob = {'policy': policy.state_dict()}
+        if not self.frozen_trunk:
+            blob['mortal'] = brain.state_dict()
+        torch.save(blob, path.join(self.dir, f'v{version}.pth'))
+        protect = set(protect) | {version}
+        for old in list(self.heads):
+            if len(self.heads) <= self.keep:
+                break
+            if old in protect:
+                continue
+            del self.heads[old]
             self.nets.pop(old, None)
             stale = path.join(self.dir, f'v{old}.pth')
             if path.exists(stale):
@@ -108,6 +127,12 @@ class Behaviour:
 
     def known(self, version):
         return version in self.heads
+
+    def matches(self, version, policy):
+        """Whether the live head is, parameter for parameter, the one published as `version`."""
+        held = self.heads[version].state_dict()
+        live = policy.state_dict()
+        return all(torch.equal(held[k], live[k]) for k in live)
 
     def logits(self, version, phi, obs, masks):
         """The logits the behaviour policy gave these decisions."""
@@ -189,6 +214,13 @@ def parse_args(argv=None):
     ap.add_argument('--ent-coef', type=float, default=1e-3)
     ap.add_argument('--v-coef', type=float, default=0.5)
     ap.add_argument('--grad-clip', type=float, default=1.0)
+    ap.add_argument('--target-kl', type=float, default=0.02,
+                    help='end a round once the policy has moved this far from the '
+                         'weights that played it; 0 never stops early')
+    ap.add_argument('--submit-every', type=int, default=0,
+                    help='publish every N steps inside a round as well as at its end')
+    ap.add_argument('--keep-versions', type=int, default=0,
+                    help='published policies kept for pricing; 0 picks by trunk')
     ap.add_argument('--train-trunk', action='store_true')
     ap.add_argument('--workers', type=int, default=None)
     ap.add_argument('--file-batch-size', type=int, default=None)
@@ -218,8 +250,9 @@ def main():
     cross_entropy = nn.CrossEntropyLoss()
     trained = [p for g in groups for p in g['params']]
 
-    behaviour = Behaviour(args.out, frozen_trunk,
-                          config['online'].get('param_history', 8), device)
+    keep = args.keep_versions or (128 if frozen_trunk
+                                  else config['online'].get('param_history', 8))
+    behaviour = Behaviour(args.out, frozen_trunk, keep, device)
     # The workers play the policy head, so it goes in the slot the Q head
     # usually takes; client.py builds whichever the config names.
     version = submit_param(brain, policy, is_idle=True)
@@ -248,6 +281,7 @@ def main():
         return out
 
     steps = 0
+    unchecked_rounds = 0
     meter = Meter()
     started = time.time()
     round_no = 0
@@ -293,8 +327,27 @@ def main():
         # snapshots or the sampling rule were mismatched, this is where it
         # shows -- loudly, on the first batch, rather than as a policy that
         # quietly learns from the wrong denominator.
+        # Cheap and unconditional: whatever the round's data turns out to
+        # contain, the weights this trainer holds must be exactly the ones it
+        # last handed the server. The ratio check below is the other half --
+        # that the workers sampled them the way this thinks they did -- and it
+        # can only run when the round's games include some the current version
+        # played.
+        if not behaviour.matches(version, policy):
+            raise SystemExit(f'the live policy is not what was published as v{version}; '
+                             'every importance ratio this round would be against the '
+                             'wrong denominator')
         unchecked = True
+        unchecked_rounds += 1
         dropped = kept = 0
+        in_round = set()
+        # How far the policy has walked from the one that played this round's
+        # games. A round is hundreds of thousands of decisions and a single
+        # pass over them is still hundreds of updates, so by the end the data
+        # is answering a policy that no longer exists. The clip bounds each
+        # step; this bounds the round, and throwing the rest of a drain away is
+        # cheaper than learning from it against the wrong policy.
+        drift = 0.
         for batch in batches:
             (obs, actions, masks, _steps_to_done, _kyoku_rewards,
              _player_ranks, final_rank, versions) = batch
@@ -304,6 +357,7 @@ def main():
             final_rank = final_rank.to(dtype=torch.int64, device=device, non_blocking=True)
             versions = versions.to(dtype=torch.int64)
 
+            in_round.update(int(v) for v in versions.unique())
             usable = torch.tensor([behaviour.known(int(v)) for v in versions])
             dropped += int((~usable).sum())
             kept += int(usable.sum())
@@ -341,21 +395,30 @@ def main():
                 loss = per_decision[keep].mean() + args.v_coef * critic_loss
 
             if unchecked:
+                # Only the first batch can be checked this way: after one
+                # optimizer step the live policy is no longer the published
+                # one, and a ratio of 1 would mean nothing.
                 unchecked = False
                 current = (versions == version).to(device) & keep
                 if bool(current.any()):
                     off = (ratio[current] - 1).abs().max().detach()
                     logging.info(f'{int(current.sum())} decisions from v{version} price at '
                                  f'ratio 1 within {float(off):.2e}')
+                    unchecked_rounds = 0
                     if off > 1e-2:
                         raise SystemExit(
                             f'v{version} was published from these weights, yet its own '
                             f'decisions price up to {float(off):.4f} away from a ratio of 1. '
                             'The behaviour policy is not the one that played: check the '
                             'version stamping and what the workers sample.')
-                else:
-                    logging.warning(f'no decisions from the current v{version} in the first '
-                                    'batch; the ratio check did not run')
+                elif unchecked_rounds >= 5:
+                    # The identity check below still passes every round, so the
+                    # bookkeeping is known good; what has not been exercised in
+                    # a while is the other half -- that the workers sample what
+                    # this thinks they sample.
+                    logging.warning(f'{unchecked_rounds} rounds without a decision from the '
+                                    'version just published: the ratio check has not run. '
+                                    'The workers may be a long way behind.')
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -367,6 +430,10 @@ def main():
             steps += 1
 
             with torch.inference_mode():
+                # Schulman's k3: always positive, and far steadier than the
+                # difference of log probabilities it is estimating.
+                odds = (mu_logp - logp)[keep]
+                drift = 0.9 * drift + 0.1 * float((odds.exp() - 1 - odds).mean())
                 meter.add(
                     policy_loss = policy_loss[keep].mean(),
                     critic_loss = critic_loss,
@@ -387,6 +454,15 @@ def main():
                     f'kl to mu {m["approx_kl"]:+.5f}, to ref {m["ref_kl"]:.5f} | '
                     f'entropy {m["entropy"]:.3f}, value {m["value"]:+.3f} '
                     f'vs paid {m["paid"]:+.3f}')
+
+            if args.submit_every and steps % args.submit_every == 0:
+                version = submit_param(brain, policy, is_idle=False)
+                behaviour.add(version, brain, policy, protect=in_round)
+            if args.target_kl and drift > args.target_kl:
+                logging.info(f'round {round_no} stopped at step {steps:,}: the policy has '
+                             f'moved {drift:.4f} from the one that played these games, '
+                             f'past --target-kl {args.target_kl}')
+                break
 
         del batches
         if data.iterator is not None:
