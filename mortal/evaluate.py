@@ -182,23 +182,47 @@ class Spec:
     label: str
     file: str
     part: str       # '' for the trained weights, 'ema' for the average inside
+    temp: float     # 0 plays the argmax; above it, draws from the head
 
     @classmethod
     def parse(cls, text):
+        """`label=file#part@temperature`, everything but the file optional.
+
+        The temperature is here because a policy that is only ever played by
+        its argmax is not the policy a gradient method updates. PPO samples,
+        and a head distilled from a flat teacher can agree with it on every
+        argmax while sampling badly -- the argmax is unchanged by the scale of
+        the logits and the sampling is nothing but that scale. `#policy@1`
+        measures what sampling actually costs, on the same walls as the rest.
+        """
         label, sep, rest = text.partition('=')
         if not sep:
             label, rest = '', text
-        file, _, part = rest.partition('#')
+        # The temperature is split off first, so it can follow either a part
+        # or the file alone: `#policy@1`, `#ema@0.5`, `model.pth@0.05`.
+        head, at, temp = rest.partition('@')
+        file, _, part = head.partition('#')
+        suffix = part + (at + temp)
         if part not in ('', 'ema', 'policy'):
             raise SystemExit(f'{text}: only #ema or #policy can follow a checkpoint')
+        try:
+            temp = float(temp) if temp else 0.
+        except ValueError:
+            raise SystemExit(f'{text}: {temp!r} is not a temperature')
+        if temp < 0:
+            raise SystemExit(f'{text}: a temperature cannot be negative')
         if not path.exists(file):
             raise SystemExit(f'{file}: no such checkpoint')
-        return cls(label or path.splitext(path.basename(file))[0] + (f'#{part}' if part else ''),
-                   file, part)
+        return cls(label or path.splitext(path.basename(file))[0] + (f'#{suffix}' if suffix else ''),
+                   file, part, temp)
 
     @property
     def ident(self):
-        return sha256_of(self.file)[:16] + (f'-{self.part}' if self.part else '')
+        # Sampled play is a different player from the argmax of the same
+        # weights, so it gets its own directory of games rather than being
+        # mixed into theirs.
+        return sha256_of(self.file)[:16] + (f'-{self.part}' if self.part else '') + (
+            f'-t{self.temp:g}' if self.temp else '')
 
 
 def set_dir(root, wall_set, champion):
@@ -319,6 +343,10 @@ def engine_for(spec, device, name):
         enable_amp = True,
         enable_rule_based_agari_guard = True,
         name = name,
+        # Epsilon 1 means "never take the argmax": every decision that reaches
+        # the model is drawn from its own distribution at this temperature.
+        boltzmann_epsilon = 1. if spec.temp else 0.,
+        boltzmann_temp = spec.temp or 1.,
     ), steps
 
 
@@ -334,6 +362,7 @@ def write_meta(model_dir, spec, steps, role):
         'role': role,
         'sha256': sha256_of(spec.file),
         'part': spec.part or 'trained',
+        'temperature': spec.temp or None,
         'steps': steps,
         'labels': sorted(labels),
         'files': sorted(set(meta.get('files', [])) | {path.abspath(spec.file)}),
@@ -501,6 +530,7 @@ def cmd_report(args):
         pt = summarize(w, common, 'pt', args.bootstrap)
         rank = summarize(w, common, 'rank')
         entry = {'ident': spec.ident, 'file': spec.file, 'part': spec.part or 'trained',
+                 'temperature': spec.temp or None,
                  'avg_pt': pt, 'avg_rank': rank, 'rank_rates': dist}
         # Style, over every game this model has on the set: how it gets there.
         if not args.no_style:
