@@ -203,7 +203,7 @@ def entropy_and_kl(logits, ref_logits):
     entropy = -(p * safe_logp).sum(-1)
     if ref_logits is None:
         return entropy, torch.zeros_like(entropy)
-    safe_ref = ref_logits.log_softmax(-1).masked_fill(~legal, 0.)
+    safe_ref = ref_logits.float().log_softmax(-1).masked_fill(~legal, 0.)
     kl = (p * (safe_logp - safe_ref)).sum(-1)
     return entropy, kl
 
@@ -341,12 +341,6 @@ def main():
             # estimate of it, so the per-kyoku GRP return -- and the GRP
             # forward each game would cost -- is not needed.
             skip_rewards = True,
-            # Known gap: the rule-based agari guard can replace what the policy
-            # sampled, and those decisions are then priced at an action the
-            # behaviour policy did not draw. Both sides use the same action, so
-            # the ratio stays consistent and the check above still holds; what
-            # breaks is the importance-sampling identity, for the handful of
-            # decisions a hanchan where a win was on offer.
         )
         loader_kwargs = {}
         if workers > 0:
@@ -358,17 +352,12 @@ def main():
             worker_init_fn = worker_init_fn, **loader_kwargs,
         )
 
-        # Nothing has moved since the last publish, so every decision stamped
-        # with it must price at a ratio of exactly one. If the versions, the
-        # snapshots or the sampling rule were mismatched, this is where it
-        # shows -- loudly, on the first batch, rather than as a policy that
-        # quietly learns from the wrong denominator.
         # Cheap and unconditional: whatever the round's data turns out to
         # contain, the weights this trainer holds must be exactly the ones it
-        # last handed the server. The ratio check below is the other half --
-        # that the workers sampled them the way this thinks they did -- and it
-        # can only run when the round's games include some the current version
-        # played.
+        # last handed the server. The ratio check in the loop is the other
+        # half -- that the workers sampled them the way this thinks they did --
+        # and it can only run when the round's games include some the current
+        # version played.
         if not behaviour.matches(version, policy):
             raise SystemExit(f'the live policy is not what was published as v{version}; '
                              'every importance ratio this round would be against the '
@@ -398,7 +387,9 @@ def main():
             usable = torch.tensor([behaviour.known(int(v)) for v in versions])
             dropped += int((~usable).sum())
             kept += int(usable.sum())
-            if not bool(usable.any()):
+            # Two, not one: the advantage is standardised over the batch, and a
+            # single usable decision gives a standard deviation of nan.
+            if int(usable.sum()) < 2:
                 continue
             keep = usable.to(device)
 
