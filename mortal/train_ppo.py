@@ -183,15 +183,28 @@ def entropy_and_kl(logits, ref_logits):
     actions and the mask has already made the illegal ones -inf, so the sum is
     cheap and carries none of the variance a sampled KL would add to the very
     term that is meant to keep the update small.
+
+    An illegal action is -inf here, and that has to be taken out of the
+    arithmetic rather than out of the result. `torch.where(legal, p * logp, 0)`
+    looks right and is not: the discarded branch still evaluates 0 * -inf =
+    nan, and where's backward carries that nan into the gradient of the branch
+    it did not take. It cost 1,350 steps of a real run -- the policy term's
+    gradient had a norm of 3.7, these two had 47,104 nans between them, the
+    gradient scaler skipped every step, and the run reported a ratio of exactly
+    1 and a KL of exactly 0 while learning nothing at all. The masked
+    log-probabilities are replaced by zeros, where their probability is already
+    zero, so every product is a real number and the sums are over the legal
+    actions either way.
     """
     logp = logits.log_softmax(-1)
+    legal = torch.isfinite(logp)
     p = logp.exp()
-    finite = torch.isfinite(logp)
-    entropy = -torch.where(finite, p * logp, torch.zeros_like(logp)).sum(-1)
+    safe_logp = logp.masked_fill(~legal, 0.)
+    entropy = -(p * safe_logp).sum(-1)
     if ref_logits is None:
         return entropy, torch.zeros_like(entropy)
-    ref_logp = ref_logits.log_softmax(-1)
-    kl = torch.where(finite, p * (logp - ref_logp), torch.zeros_like(logp)).sum(-1)
+    safe_ref = ref_logits.log_softmax(-1).masked_fill(~legal, 0.)
+    kl = (p * (safe_logp - safe_ref)).sum(-1)
     return entropy, kl
 
 
@@ -300,6 +313,7 @@ def main():
     # one chart and the three can be read against each other.
     writer = SummaryWriter(path.join(args.out, 'tb'))
     steps = 0
+    skipped = 0
     unchecked_rounds = 0
     meter = Meter()
     started = time.time()
@@ -442,11 +456,25 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            if args.grad_clip:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(trained, args.grad_clip)
+            scaler.unscale_(optimizer)
+            grad_norm = nn.utils.clip_grad_norm_(trained, args.grad_clip or float('inf'))
+            # A step the scaler refuses is a step that did not happen, and the
+            # only sign of it is the loss scale going down. Left unwatched, a
+            # nan in one term of the objective stops the whole run learning
+            # while every other number it prints stays perfectly reasonable --
+            # a ratio of exactly 1, a KL of exactly 0, for 1,350 steps.
+            before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            if scaler.get_scale() < before:
+                skipped += 1
+                if skipped >= 50:
+                    raise SystemExit(
+                        f'{skipped} optimizer steps in a row were skipped: the gradient is '
+                        f'not finite (last norm {float(grad_norm):.4g}). Nothing is being '
+                        'learned; find the term that is producing it.')
+            else:
+                skipped = 0
             steps += 1
 
             with torch.inference_mode():
@@ -464,6 +492,7 @@ def main():
                     entropy = entropy[keep].mean(),
                     value = value[keep].mean(),
                     paid = paid[keep].float().mean(),
+                    grad_norm = grad_norm,
                 )
             if steps % args.log_every == 0:
                 m = meter.take()
@@ -475,8 +504,8 @@ def main():
                     f'policy {m["policy_loss"]:+.4f} critic {m["critic_loss"]:.4f} | '
                     f'ratio {m["ratio"]:.4f}, clipped {m["clipped"]:.1%}, '
                     f'kl to mu {m["approx_kl"]:+.5f}, to ref {m["ref_kl"]:.5f} | '
-                    f'entropy {m["entropy"]:.3f}, value {m["value"]:+.3f} '
-                    f'vs paid {m["paid"]:+.3f}')
+                    f'entropy {m["entropy"]:.3f}, grad {m["grad_norm"]:.3g}, '
+                    f'value {m["value"]:+.3f} vs paid {m["paid"]:+.3f}')
 
             if args.submit_every and steps % args.submit_every == 0:
                 version = submit_param(brain, policy, is_idle=False)
