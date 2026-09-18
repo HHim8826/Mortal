@@ -1,0 +1,270 @@
+# v4 online training on the 2x RTX 4070 Ti SUPER box: the model plays against a
+# frozen copy of itself and learns from those games instead of from human ones.
+#
+#     /root/launch_online.sh
+#
+# Three kinds of process share the box and this file:
+#
+#   server.py   holds the current parameters and the replay buffer
+#   train.py    MORTAL_DEVICE=cuda:0, trains on what the workers send back
+#   client.py   MORTAL_DEVICE=cuda:1, plays and submits, several of them
+#
+# The loss changes with `online`: the CQL term, which keeps an offline model
+# near the human moves it was shown, is dropped, and what is left regresses Q
+# onto the points the trainee actually scored. That is what lets it pass the
+# players it learned from, and it only works while the games keep coming, so
+# self-play throughput is the thing to watch here, not steps/s alone.
+#
+# DDP is refused in online mode (train.py), so the trainer has one GPU. The
+# other one and most of the CPUs go to the workers.
+
+[control]
+version = 4
+online = true
+
+# Its own run directory: the offline run's checkpoints stay untouched, and a
+# bad online run can be thrown away by deleting one directory.
+state_file = 'logs/v4o/mortal.pth'
+best_state_file = 'logs/v4o/best.pth'
+tensorboard_dir = 'logs/v4o'
+
+# Overridden per process by MORTAL_DEVICE; this is the trainer's.
+device = 'cuda:0'
+enable_cudnn_benchmark = true
+enable_amp = true
+enable_compile = true
+# Not 'reduce-overhead' here, which captures CUDA graphs. A graph's memory
+# lives in a private pool that no other allocation can borrow, and offline's
+# 1024 was split across two GPUs where online's sits whole on one: the first
+# evaluation died with 14.04 GiB in graph pools and 53 MB free, on a 132 MB
+# request. It costs nothing to give up. The trainer waits on the workers for
+# 91% of its time -- self-play is what online is short of, never step speed --
+# so a slower step is a step that still finishes long before the next game does.
+compile_mode = 'default'
+# Over ~5,000 steps as offline, but online steps are ~10x rarer, so this is a
+# much longer window in games played. Kept because the average was ahead of the
+# trained weights in every offline evaluation.
+ema_decay = 0.9998
+
+# One GPU now, so the whole 1024 of the offline global batch is on it. The
+# schedule below was tuned for that batch size.
+batch_size = 1024
+opt_step_every = 1
+
+save_every = 400
+# ~2.8 h of online training. Evaluation is the only honest signal in online RL
+# -- the training loss falls as the trainee gets better at predicting its own
+# points, which says nothing about whether it plays better -- but the trainer
+# plays all 4000 games itself here, with the workers still holding most of the
+# CPUs, so each one costs ~20 minutes against ~9 offline.
+test_every = 10000
+# The workers pick up new parameters this often. Small enough that the games
+# coming back are nearly on-policy, large enough not to spend the run copying
+# 43 MB of weights around.
+submit_every = 400
+
+# using env `TRAIN_PLAY_PROFILE`
+[train_play.default]
+# Games in flight, and the one setting that moved self-play throughput: the
+# arena advances every game it holds in one pass, so a pass costs about the
+# same whether it is carrying 400 games or 3,200, and what it returns per pass
+# scales with how many it holds. Measured on the idle box, one arena against
+# three v4 copies: 400 games 2.75 hanchans/s, 1,600 games 5.55. The cost is
+# staleness -- a session is a round trip, and nothing in it sees a parameter
+# update -- which at ~6 hanchans/s is about nine minutes here.
+games = 3200
+log_dir = 'challenger/train_play'
+# Exploration. The policy head already carries its play temperature -- 0.05
+# was folded into its weights by sharpen_policy.py -- so the sampler must not
+# apply another one: epsilon 1 means every decision is drawn from the head
+# itself, at temperature 1, which is the distribution the trainer optimizes and
+# the one every importance ratio is taken against. Measured on 1,000 dev walls,
+# that draw differs from the argmax 9.1% of the time, about six decisions a
+# game, for -1.13 +- 1.53 pt: 100x the exploration the old run had, at a cost
+# inside the noise.
+boltzmann_epsilon = 1.0
+boltzmann_temp = 1.0
+top_p = 1.0
+repeats = 1
+# Arenas this worker splits its session across, in threads. Measured worse at
+# every setting tried -- 400 games in one arena 2.75 hanchans/s, in two 2.48,
+# in four 1.82 -- because splitting a session is splitting the games in flight,
+# and that is what throughput scales with. Left here at 1 because the knob is
+# what the measurement is recorded against; more *processes* is the way to use
+# more of the box (see WORKERS in launch_online.sh).
+arenas = 1
+
+[test_play]
+# The same 4000 seeds and the same v3 opponent as offline, so avg_rank stays on
+# one scale across the whole project and the online curve continues the
+# offline one rather than starting a new chart.
+games = 4000
+log_dir = 'challenger/test_play'
+
+[dataset]
+# Online reads the drained self-play logs, whose paths the server hands over;
+# these globs are for offline corpora and stay empty.
+parquet_globs = []
+globs = []
+file_index = 'logs/v4o/file_index.pth'
+file_batch_size = 20
+prefetch_factor = 4
+in_order = false
+reserve_ratio = 0.2
+# The trainer must decode gz logs at the rate it consumes them, ~1,000
+# instances/s, which is ~6 cores of v4 encoding. The rest of the box belongs to
+# the workers, who need far more of it.
+num_workers = 6
+# Only the trainee's seat is learned from; the three champions' seats are
+# discarded. train.py sets that filter itself in online mode, so this list,
+# which selects human players out of a corpus, stays empty.
+player_names_files = []
+num_epochs = 1
+enable_augmentation = false
+augmented_first = false
+
+[env]
+gamma = 1
+pts = [3.0, 1.5, 0.0, -4.5]
+
+[resnet]
+conv_channels = 192
+num_blocks = 40
+
+[cql]
+# Unused online: train.py drops the CQL term entirely once `online` is set.
+min_q_weight = 5
+
+[aux]
+next_rank_weight = 0.2
+
+[freeze_bn]
+# The batches now come from the trainee's own play, which shifts as it learns.
+# Letting BatchNorm chase that moves the model under the workers' feet between
+# parameter submissions; frozen statistics keep the two in step.
+mortal = true
+
+[optim]
+eps = 1e-8
+betas = [0.9, 0.999]
+weight_decay = 0.1
+max_grad_norm = 0
+
+[optim.scheduler]
+# Flat at where the offline cosine ended. Online steps are few and each one is
+# expensive in games, so the run improves by playing more, not by moving
+# further per step; a larger rate here mostly undoes what offline learned.
+peak = 1e-5
+final = 1e-5
+warm_up_steps = 200
+max_steps = 1000000
+
+# The opponent. `train` is who the workers play against: a frozen copy of the
+# model, so the trainee has to beat the best version of itself rather than a
+# fixed old bot. Refresh it deliberately (launch_online.sh does not), and never
+# mid-session, or the games in one buffer will have been played against two
+# different opponents.
+[baseline.train]
+device = 'cuda:1'
+enable_compile = false
+# The three opponent seats are the policy this run departs from, frozen. The
+# self-play average against it is the first thing that moves when the policy
+# improves or breaks, hours before a 20,000-game evaluation could say so.
+state_file = 'logs/policy/policy-t0.05.pth'
+head = 'policy'
+
+# `test` stays the v3 baseline for ever: it is the ruler, not an opponent to
+# improve against, and a ruler that changes measures nothing.
+[baseline.test]
+device = 'cuda:0'
+enable_compile = false
+state_file = 'logs/baseline.pth'
+
+[online]
+# The workers build this head and play it; the trainer publishes it in the slot
+# the Q head usually takes. 'dqn' is every run before this one.
+head = 'policy'
+history_window = 50
+# Published parameter sets kept on disk, newest first, as logs/v4o/params/v<n>.pth.
+# The games a worker submits carry the version that played them, and pricing
+# them for a policy gradient means loading those exact weights again. A session
+# is a round trip of about ten minutes, which at ~1.5 steps/s and a publish
+# every 400 steps is three or four versions, so eight covers a worker that
+# falls well behind. Each is ~43 MB.
+param_history = 8
+enable_compile = false
+
+[online.remote]
+host = '127.0.0.1'
+port = 5000
+
+[online.server]
+buffer_dir = 'online/buffer'
+drain_dir = 'online/drain'
+# Games the buffer holds before it tells the workers to stop submitting. Two
+# sessions' worth per worker: enough that the trainer is never idle, small
+# enough that nothing it trains on is many parameter versions old.
+capacity = 19200
+sample_reuse_rate = 0
+sample_reuse_threshold = 0
+# false: the trainer takes whatever has arrived rather than waiting for a full
+# buffer. With several workers submitting at different times, waiting would
+# leave both sides idle in turn.
+force_sequential = false
+
+[test]
+stochastic_latent = false
+
+[1v3]
+seed_key = -1
+games_per_iter = 2000
+iters = 500
+log_dir = 'challenger/1v3'
+
+[1v3.challenger]
+device = 'cuda:0'
+name = 'mortal'
+state_file = 'logs/v4o/best.pth'
+stochastic_latent = false
+enable_compile = false
+enable_amp = true
+enable_rule_based_agari_guard = true
+
+[1v3.champion]
+device = 'cuda:0'
+name = 'baseline'
+state_file = 'logs/baseline.pth'
+stochastic_latent = false
+enable_compile = false
+enable_amp = true
+enable_rule_based_agari_guard = true
+
+[1v3.akochan]
+enabled = false
+dir = '/path/to/akochan'
+tactics = '/path/to/tactics.json'
+
+[grp]
+state_file = 'grp_v2/grp.pth'
+
+[grp.network]
+hidden_size = 64
+num_layers = 2
+
+[grp.control]
+device = 'cuda:0'
+enable_cudnn_benchmark = false
+tensorboard_dir = 'grp_v2/log'
+
+batch_size = 1024
+save_every = 2000
+val_steps = 400
+
+[grp.dataset]
+train_globs = []
+val_globs = []
+file_index = 'grp_v2/log/grp_file/grp_file_index.pth'
+file_batch_size = 100
+
+[grp.optim]
+lr = 1e-5

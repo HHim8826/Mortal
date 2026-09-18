@@ -258,6 +258,33 @@ class PolicyHead(nn.Module):
     def forward(self, phi: Tensor, mask: Tensor) -> Tensor:
         return self.net(phi).masked_fill(~mask, -torch.inf)
 
+def head_for(kind, *, version=4):
+    """The head a run plays with: the dueling Q, or the policy distilled from it.
+
+    Both answer the same call -- logits over the legal actions -- so
+    `MortalEngine` plays either without knowing which it holds, and a config
+    key is enough to decide. The Q head is what every run before the policy
+    used, so it stays the default.
+    """
+    match kind:
+        case 'dqn':
+            return DQN(version=version)
+        case 'policy':
+            return PolicyHead(version=version)
+    raise ValueError(f'unknown head {kind!r}; expected dqn or policy')
+
+def head_state(kind, state):
+    """Where that head's weights sit in a checkpoint."""
+    match kind:
+        case 'dqn':
+            return state['current_dqn']
+        case 'policy':
+            if 'policy' not in state:
+                raise KeyError('this checkpoint has no policy head; '
+                               'train one with train_policy.py')
+            return state['policy']
+    raise ValueError(f'unknown head {kind!r}; expected dqn or policy')
+
 class RankCritic(nn.Module):
     """How the hanchan ends, as the probability of each final placement.
 

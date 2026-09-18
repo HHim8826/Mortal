@@ -10,6 +10,7 @@ from torch.utils.data import IterableDataset
 from model import GRP
 from reward_calculator import RewardCalculator
 from libriichi.dataset import GameplayLoader
+from rollout import version_in
 from config import config
 
 class FileDatasetsIter(IterableDataset):
@@ -29,6 +30,7 @@ class FileDatasetsIter(IterableDataset):
         augmented_first = False,
         final_rank = False,
         skip_rewards = False,
+        param_version = False,
     ):
         super().__init__()
         self.version = version
@@ -52,6 +54,12 @@ class FileDatasetsIter(IterableDataset):
         # Distillation and the critic learn from actions and results, not from
         # the per-kyoku return, and the return costs a GRP forward per game.
         self.skip_rewards = skip_rewards
+        # The parameter version that played the game, read off its file name,
+        # on every instance it produced. A policy gradient divides by the
+        # probability the behaviour policy gave the action, and that policy is
+        # whatever was published when the game was played -- not what the
+        # trainer holds by the time the batch arrives.
+        self.param_version = param_version
         self.iterator = None
 
     def build_iter(self):
@@ -207,6 +215,9 @@ class FileDatasetsIter(IterableDataset):
     def load_entries(self, batch):
         entries = []
         for source, file in self.decode_batch(batch):
+            version = version_in(source) if self.param_version else None
+            if version is None:
+                version = -1
             for game in file:
                 # per move
                 obs = game.take_obs()
@@ -271,6 +282,11 @@ class FileDatasetsIter(IterableDataset):
                         # Appended, so every field train.py unpacks keeps its
                         # place and only what asks for this sees it.
                         entry.append(player_ranks[-1])
+                    if self.param_version:
+                        # -1 for a game whose name does not carry one: an older
+                        # worker, or a log put there by hand. The trainer drops
+                        # those rather than pricing them with the wrong weights.
+                        entry.append(version)
                     entries.append(entry)
         return entries
 

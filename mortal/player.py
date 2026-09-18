@@ -10,7 +10,7 @@ import threading
 from collections import defaultdict
 from glob import glob
 from os import path
-from model import Brain, DQN
+from model import Brain, head_for, head_state
 from engine import MortalEngine
 from libriichi.stat import Stat
 from libriichi.arena import OneVsThree
@@ -29,9 +29,14 @@ class TestPlayer:
         conv_channels = cfg['resnet']['conv_channels']
         num_blocks = cfg['resnet']['num_blocks']
         stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        stable_dqn = DQN(version=version).eval()
+        # The opponent seats play whichever head the run is about: a policy
+        # gradient wants its three champions to be the policy it started from,
+        # not that checkpoint's Q, or the self-play number measures the 0.4%
+        # of decisions where the two disagree as well as the learning.
+        kind = baseline_cfg.get('head', 'dqn')
+        stable_dqn = head_for(kind, version=version).eval()
         stable_mortal.load_state_dict(state['mortal'])
-        stable_dqn.load_state_dict(state['current_dqn'])
+        stable_dqn.load_state_dict(head_state(kind, state))
         if baseline_cfg['enable_compile']:
             stable_mortal.compile()
             stable_dqn.compile()
@@ -204,9 +209,14 @@ class TrainPlayer:
         conv_channels = cfg['resnet']['conv_channels']
         num_blocks = cfg['resnet']['num_blocks']
         stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        stable_dqn = DQN(version=version).eval()
+        # The opponent seats play whichever head the run is about: a policy
+        # gradient wants its three champions to be the policy it started from,
+        # not that checkpoint's Q, or the self-play number measures the 0.4%
+        # of decisions where the two disagree as well as the learning.
+        kind = baseline_cfg.get('head', 'dqn')
+        stable_dqn = head_for(kind, version=version).eval()
         stable_mortal.load_state_dict(state['mortal'])
-        stable_dqn.load_state_dict(state['current_dqn'])
+        stable_dqn.load_state_dict(head_state(kind, state))
         if baseline_cfg['enable_compile']:
             stable_mortal.compile()
             stable_dqn.compile()

@@ -38,6 +38,7 @@ Each script does one job. The table groups them by when you use them.
 | `preflight_online.py` | Checks everything about the switch to online that can be checked without starting it. |
 | `switch_to_online.sh` | Stops offline at its gate, seeds online from `best_ema.pth`, and launches it. Use `--dry-run` first. |
 | `launch_online.sh` | Starts the server, the trainer, and the workers, or whichever of them is down. |
+| `launch_ppo.sh` | Starts a phase-3 policy-gradient run: `VARIANT=kl`, `kl-refresh` or `plain`. |
 | `online_status.sh` | Shows online progress, including the self-play rank against the frozen start. |
 | `watchdog.sh` | Restarts whichever phase is current when it crashes or stops saving. `touch /root/watchdog.off` pauses it. |
 | `watch_tick.sh` | Prints only new alerts and measurements, for calling on a timer. |
@@ -47,6 +48,21 @@ Each script does one job. The table groups them by when you use them.
 
 `ab_checkpoints.py` is not here. `mortal/evaluate.py` replaces it: it plays any
 checkpoints on fixed, named sets of walls and compares them paired.
+
+## A policy-gradient run
+
+`launch_ppo.sh` wants a checkpoint that `train_policy.py` distilled and
+`sharpen_policy.py` sharpened, and `config.ppo.toml` rather than
+`config.online.toml`. Three things differ from the Q-learning run:
+
+- The workers build a policy head, not a Q head (`[online] head = 'policy'`),
+  and sample it raw -- `boltzmann_epsilon = 1`, `boltzmann_temp = 1` -- because
+  the head already carries its play temperature.
+- The three opponent seats are the frozen starting policy, so the self-play
+  average starts at 2.5 by construction and any move in it belongs to this run.
+- Every round begins with a check: decisions played by the version just
+  published must price at an importance ratio of exactly 1. If they do not, the
+  trainer stops rather than learning against the wrong denominator.
 
 ## Checking a change
 

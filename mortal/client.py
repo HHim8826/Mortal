@@ -7,7 +7,7 @@ import numpy as np
 import time
 import gc
 from os import path
-from model import Brain, DQN
+from model import Brain, head_for
 from player import TrainPlayer
 from common import send_msg, recv_msg
 from config import config
@@ -20,7 +20,12 @@ def main():
     conv_channels = config['resnet']['conv_channels']
 
     mortal = Brain(version=version, num_blocks=num_blocks, conv_channels=conv_channels).to(device).eval()
-    dqn = DQN(version=version).to(device)
+    # A policy-gradient run publishes a policy head in the same slot, and the
+    # engine plays it the same way. The trainer decides which; the workers are
+    # told by the config they share with it.
+    head_kind = config['online'].get('head', 'dqn')
+    logging.info(f'playing the {head_kind} head')
+    dqn = head_for(head_kind, version=version).to(device)
     if config['online']['enable_compile']:
         mortal.compile()
         dqn.compile()
