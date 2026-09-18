@@ -21,6 +21,12 @@ cd /root/Mortal/mortal
 CFG=${MORTAL_CFG_PPO:-config.ppo.toml}
 VARIANT=${VARIANT:-kl}
 WORKERS=${WORKERS:-3}
+# Which GPUs the self-play workers use, round-robin. Both, by default, and for
+# a measured reason: five workers on one A4000 pinned it at 100% while the
+# trainer's card sat at 0% and the container used 36 of its 61 CPUs. The
+# trainer only works in bursts, after a drain, so its card is nearly free the
+# rest of the time. WORKER_GPUS=1 keeps them off it.
+WORKER_GPUS=${WORKER_GPUS:-0,1}
 START=${START:-logs/policy/policy-t0.05.pth}
 PY=/root/venv/bin/python
 RUN=logs/ppo/$VARIANT
@@ -75,7 +81,9 @@ LOADER_RAYON=${LOADER_RAYON:-$(( CPUS / 4 / 6 ))}
 WORKER_RAYON=${WORKER_RAYON:-$(( CPUS * 3 / 4 / WORKERS ))}
 [ "$LOADER_RAYON" -lt 1 ] && LOADER_RAYON=1
 [ "$WORKER_RAYON" -lt 1 ] && WORKER_RAYON=1
+IFS=',' read -r -a GPUS <<< "$WORKER_GPUS"
 echo "$CPUS cpus: the trainer's loaders x $LOADER_RAYON threads, $WORKERS workers x $WORKER_RAYON threads"
+echo "workers on gpu(s) $WORKER_GPUS, trainer on gpu 0"
 
 mkdir -p "$RUN" online
 # Frozen on purpose, and frozen at the start rather than at the best: the
@@ -114,7 +122,7 @@ start trainer MORTAL_DEVICE=cuda:0 MORTAL_LOADER_RAYON_THREADS=$LOADER_RAYON \
     $PY train_ppo.py --from "$START" --out "$RUN" $FLAGS
 
 for i in $(seq 0 $((WORKERS - 1))); do
-    start "worker$i" MORTAL_DEVICE=cuda:1 MORTAL_WORKER=$i MORTAL_TB_DIR=$RUN/tb \
+    start "worker$i" MORTAL_DEVICE=cuda:${GPUS[$(( i % ${#GPUS[@]} ))]} MORTAL_WORKER=$i MORTAL_TB_DIR=$RUN/tb \
         RAYON_NUM_THREADS=$WORKER_RAYON $PY client.py
 done
 
