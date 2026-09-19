@@ -43,10 +43,10 @@ from torch.utils.data import DataLoader
 import prelude                                          # noqa: F401
 from config import config
 from dataloader import FileDatasetsIter, worker_init_fn
-from model import Brain, PolicyHead
+from model import Brain, DQN, KyokuValue, PolicyHead
 
 
-def load_policy(file, device):
+def load_policy(file, device, value_from=None):
     state = torch.load(file, weights_only=True, map_location='cpu')
     cfg = state['config']
     brain = Brain(version=4, conv_channels=cfg['resnet']['conv_channels'],
@@ -54,12 +54,28 @@ def load_policy(file, device):
     brain.load_state_dict(state['mortal'])
     head = PolicyHead(version=4).eval()
     head.load_state_dict(state['policy'])
-    return brain.to(device).requires_grad_(False), head.to(device).requires_grad_(False)
+    # The baseline the trainer subtracts: the run's own value head if it has
+    # one, otherwise the teacher's dueling value stream, which is where every
+    # run started.
+    held = state if value_from is None else torch.load(
+        value_from, weights_only=True, map_location='cpu')
+    if 'value' in held:
+        value = KyokuValue().eval()
+        value.load_state_dict(held['value'])
+    else:
+        teacher = DQN(version=4)
+        teacher.load_state_dict(held['current_dqn'])
+        value = KyokuValue.from_dueling(teacher).eval()
+    return (brain.to(device).requires_grad_(False),
+            head.to(device).requires_grad_(False),
+            value.to(device).requires_grad_(False))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--policy', required=True, help='the policy that played these games')
+    ap.add_argument('--value', default=None,
+                    help='a checkpoint holding a trained value head')
     ap.add_argument('--logs', required=True, nargs='+',
                     help='directories or globs of <seed>_<key>_<seat>.json.gz')
     ap.add_argument('--player', default='mortal', help='the seat that sampled')
@@ -72,7 +88,7 @@ def main():
     args = ap.parse_args()
 
     device = torch.device(args.device or config['control']['device'])
-    brain, head = load_policy(args.policy, device)
+    brain, head, value_head = load_policy(args.policy, device, args.value)
 
     files = []
     for pattern in args.logs:
@@ -96,14 +112,16 @@ def main():
                          num_workers=args.workers, pin_memory=True,
                          worker_init_fn=worker_init_fn)
 
-    best_p, took_best, paid = [], [], []
+    best_p, took_best, paid, baseline = [], [], [], []
     with torch.inference_mode():
         for obs, actions, masks, steps_to_done, kyoku_rewards, _ranks, _final in batches:
             obs = obs.to(dtype=torch.float32, device=device, non_blocking=True)
             actions = actions.to(dtype=torch.int64, device=device, non_blocking=True)
             masks = masks.to(dtype=torch.bool, device=device, non_blocking=True)
             with torch.autocast(device.type):
-                logits = head(brain(obs), masks).float()
+                phi = brain(obs)
+                logits = head(phi, masks).float()
+                baseline.append(value_head(phi).float().cpu().numpy())
             p = logits.softmax(-1)
             best = logits.argmax(-1)
             best_p.append(p.gather(-1, best[:, None]).squeeze(-1).cpu().numpy())
@@ -119,6 +137,7 @@ def main():
     best_p = np.concatenate(best_p)
     took_best = np.concatenate(took_best)
     paid = np.concatenate(paid)
+    baseline = np.concatenate(baseline)
     n = len(paid)
     logging.info(f'{n:,} decisions, {1 - took_best.mean():.2%} of them not the argmax')
 
@@ -126,25 +145,35 @@ def main():
     # action is legal there is nothing to choose and nothing to learn.
     edges = np.quantile(best_p, np.linspace(0, 1, args.buckets + 1))
     edges[0], edges[-1] = -np.inf, np.inf
-    print(f'{"P(best)":>16}  {"decisions":>10}  {"deviated":>8}  '
-          f'{"paid | argmax":>13}  {"paid | other":>12}  {"gap":>16}')
-    total, weight = 0., 0.
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        inside = (best_p >= lo) & (best_p < hi)
-        a, b = paid[inside & took_best], paid[inside & ~took_best]
-        if len(a) < 2 or len(b) < 2:
-            continue
-        gap = b.mean() - a.mean()
-        se = np.sqrt(a.var(ddof=1) / len(a) + b.var(ddof=1) / len(b))
-        total += gap / se ** 2
-        weight += 1 / se ** 2
-        print(f'{lo:>7.3f}-{hi:<8.3f} {inside.sum():>10,}  {len(b) / inside.sum():>7.1%}  '
-              f'{a.mean():>+13.4f}  {b.mean():>+12.4f}  {gap:>+9.4f} ±{se:.4f}')
-    if weight:
-        gap, se = total / weight, weight ** -0.5
-        print(f'\npooled within buckets: {gap:+.4f} ± {se:.4f} ({gap / se:+.1f} se)')
-        print('negative means the sampled alternative paid less than the argmax, '
-              'which is the signal a policy gradient needs')
+
+    # The return itself, and the advantage the trainer actually multiplies into
+    # the gradient. If the first has a gap and the second does not, the
+    # baseline is eating the signal -- which is the question worth asking,
+    # because the implementation that reports this working subtracts no
+    # baseline at all.
+    for name, quantity in (('paid', paid), ('paid - V(s)', paid - baseline)):
+        print()
+        print(name)
+        print(f'{"P(best)":>16}  {"decisions":>10}  {"deviated":>8}  '
+              f'{"argmax":>10}  {"other":>10}  {"gap":>18}')
+        total, weight = 0., 0.
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            inside = (best_p >= lo) & (best_p < hi)
+            a, b = quantity[inside & took_best], quantity[inside & ~took_best]
+            if len(a) < 2 or len(b) < 2:
+                continue
+            gap = b.mean() - a.mean()
+            se = np.sqrt(a.var(ddof=1) / len(a) + b.var(ddof=1) / len(b))
+            total += gap / se ** 2
+            weight += 1 / se ** 2
+            print(f'{lo:>7.3f}-{hi:<8.3f} {inside.sum():>10,}  {len(b) / inside.sum():>7.1%}  '
+                  f'{a.mean():>+10.4f}  {b.mean():>+10.4f}  {gap:>+10.4f} +-{se:.4f}')
+        if weight:
+            gap, se = total / weight, weight ** -0.5
+            print(f'pooled within buckets: {gap:+.4f} +- {se:.4f} ({gap / se:+.1f} se)')
+    print()
+    print('negative means the sampled alternative was worth less than the argmax, '
+          'which is the signal a policy gradient needs')
 
 
 if __name__ == '__main__':
