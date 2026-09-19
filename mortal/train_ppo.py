@@ -564,7 +564,15 @@ def main():
             stepping = batches_in % args.accumulate == 0
             if stepping:
                 scaler.unscale_(optimizer)
-                grad_norm = nn.utils.clip_grad_norm_(trained, args.grad_clip or float('inf'))
+                # Each parameter group on its own. Clipping everything by one
+                # norm lets the largest group decide the step size for the
+                # rest: with the trunk training its 10.9M parameters carried a
+                # norm of 3 to 4 against a clip of 1, so every step was scaled
+                # down by that much and the trunk's gradient was quietly
+                # setting the policy head's learning rate.
+                norms = [nn.utils.clip_grad_norm_(g['params'], args.grad_clip or float('inf'))
+                         for g in groups]
+                grad_norm = torch.stack([n.detach() for n in norms]).max()
 
                 with torch.inference_mode():
                     flat = torch.cat([p.grad.reshape(-1) for p in policy.parameters()
