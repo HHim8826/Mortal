@@ -31,7 +31,9 @@ WORKERS=${WORKERS:-3}
 WORKER_GPUS=${WORKER_GPUS:-1,0}
 START=${START:-logs/policy/policy-t0.05.pth}
 PY=/root/venv/bin/python
-RUN=logs/ppo/$VARIANT
+# SUFFIX keeps a second run of the same variant apart from the first, so one
+# knob can be changed without overwriting what it is being compared against.
+RUN=logs/ppo/$VARIANT${SUFFIX:-}
 
 # 0.01, not 0.1. Measured on this box: at 0.1 the policy settled at a KL of
 # 0.0011 from its reference by step 750 and was still at 0.0011 after 6,150 --
@@ -53,6 +55,13 @@ case $VARIANT in
     sharp)      FLAGS="--kl-coef 0 --ent-coef 0" ;;
     *) echo "unknown VARIANT $VARIANT: expected kl, kl-refresh or plain" >&2; exit 1 ;;
 esac
+
+# The learning rate is a knob rather than a variant: the arithmetic says the
+# policy moves about 0.12 of a logit in 1,500 updates at 3e-4, which changes
+# the entropy by 0.005 and nothing measurable in strength. Raising it scales
+# signal and noise alike, so the trajectory's quality is unchanged and it
+# simply arrives sooner.
+[ -n "${LR:-}" ] && FLAGS="$FLAGS --lr $LR"
 
 if [ ! -e "$START" ]; then
     echo "no $START to start from: run train_policy.py, then sharpen_policy.py" >&2
