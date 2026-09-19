@@ -8,9 +8,15 @@ Phase 3 established that online PPO is not broken here, it is slow: the
 advantage favours the argmax by 9.1 se, the gradient's consistent direction is
 exactly that, and raising the learning rate thirty-fold made each update four
 times more effective -- and still left 17,000 updates, some forty hours of
-self-play, between here and recovering the 0.023 of rank that sampling costs.
-Every update has to squeeze a direction out of sixteen thousand decisions
-whose returns are mostly luck.
+self-play, between here and closing the gap that sampling opens. Every update
+has to squeeze a direction out of sixteen thousand decisions whose returns are
+mostly luck.
+
+That gap is also smaller than the phase assumed. This docstring used to put it
+at 0.023 of rank; that number was contaminated from the online560-offline520
+comparison and nothing ever measured it. What phase 2 measured is that
+sampling at T=0.05 costs -1.13 +- 1.53 pt against the same policy's argmax,
+which is about 0.011 of rank and is not distinguishable from zero.
 
 Advantage weighted regression does not have that problem. It is behaviour
 cloning where each human action is weighted by exp(A / beta): every one of the

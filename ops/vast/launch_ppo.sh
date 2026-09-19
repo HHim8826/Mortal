@@ -46,12 +46,17 @@ case $VARIANT in
     plain)      FLAGS="--kl-coef 0" ;;
     # A positive control, not a candidate. The policy is played by sampling at
     # the temperature folded into its head, and phase 2 measured what that
-    # costs against its own argmax: +0.023 of rank, 1.1 pt. That is the largest
-    # certain gain in front of this run, and the entropy bonus is what stops it
-    # being taken -- so with the bonus off and nothing anchoring, a working
-    # pipeline should sharpen the policy and walk the self-play average from
-    # 2.52 towards 2.50. If it cannot do that, the problem is not a
-    # hyperparameter.
+    # costs against its own argmax: -1.13 +- 1.53 pt, about 0.011 of rank,
+    # which is not distinguishable from zero. This comment used to read
+    # "+0.023 of rank, 1.1 pt. That is the largest certain gain in front of
+    # this run", and neither half held: the 0.023 came from the
+    # online560-offline520 comparison, a different pair of models, and the
+    # measurement it was pinned to sits inside its own error bar. It is still
+    # the cleanest positive control available -- the entropy bonus is what
+    # stops the policy sharpening, so with the bonus off and nothing
+    # anchoring, a working pipeline should sharpen and walk the self-play
+    # average from 2.52 towards 2.50. If it cannot do that, the problem is not
+    # a hyperparameter.
     sharp)      FLAGS="--kl-coef 0 --ent-coef 0" ;;
     *) echo "unknown VARIANT $VARIANT: expected kl, kl-refresh or plain" >&2; exit 1 ;;
 esac

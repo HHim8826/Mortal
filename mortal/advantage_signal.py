@@ -6,8 +6,15 @@
 Phase 3 trained three configurations of PPO for 600,000 self-play games and
 none of them changed the policy's strength. The positive control says where to
 look: with the entropy bonus off and nothing anchoring, the policy did not
-sharpen, although sharpening is worth +0.023 of rank by direct measurement.
-A policy gradient sharpens only if the advantage it sees favours the argmax.
+sharpen. A policy gradient sharpens only if the advantage it sees favours the
+argmax.
+
+An earlier version of this docstring said sharpening was worth +0.023 of rank
+"by direct measurement". It was not: that number came from the
+online560-offline520 comparison, which is a different pair of models. Phase 2
+measured sampling at T=0.05 at -1.13 +- 1.53 pt against argmax -- not
+distinguishable from zero. The question below is worth asking either way, and
+its answer turned out to be yes.
 
 So ask the data directly, with no training involved. Every decision in a
 self-play log was either the policy's own best action or one of the
