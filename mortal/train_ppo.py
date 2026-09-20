@@ -269,6 +269,81 @@ class Reference:
             self.brain.load_state_dict(held['mortal'])
 
 
+def resume_optimizer(optimizer, held):
+    """Restore the moments, including into an optimizer that has grown.
+
+    A checkpoint written before `KyokuValue` joined the first parameter group
+    holds four tensors where there are now six, and `load_state_dict` refuses
+    the whole thing -- so a run that was resumable stopped being resumable,
+    and `--fresh` throws the training away rather than fixing it. The
+    parameters that were there are still there, in the same order, with the
+    new head appended, so their moments carry over by position and the new
+    head starts from nothing the way it would have anyway.
+
+    Only growth at the end of a group is migrated. Anything else means the
+    parameters were reordered rather than added to, and guessing which moment
+    belongs to which tensor is worse than refusing.
+    """
+    want = optimizer.state_dict()
+    sizes = [len(g['params']) for g in held['param_groups']]
+    wants = [len(g['params']) for g in want['param_groups']]
+    if sizes == wants:
+        optimizer.load_state_dict(held)
+        return 'optimizer restored'
+    if len(sizes) > len(wants) or any(a > b for a, b in zip(sizes, wants)):
+        raise SystemExit(
+            f'this checkpoint has parameter groups of {sizes} and this run has {wants}. '
+            'Parameters were removed or reordered, not added, so the saved moments '
+            'cannot be matched to them: resume from a matching build, or start over '
+            'with --fresh.')
+    merged = {'state': {}, 'param_groups': []}
+    for old, new in zip(held['param_groups'], want['param_groups']):
+        for was, now in zip(old['params'], new['params']):
+            if was in held['state']:
+                merged['state'][now] = held['state'][was]
+        group = dict(old)
+        group['params'] = new['params']
+        merged['param_groups'].append(group)
+    merged['param_groups'].extend(want['param_groups'][len(held['param_groups']):])
+    optimizer.load_state_dict(merged)
+    grown = [b - a for a, b in zip(sizes + [0] * (len(wants) - len(sizes)), wants)]
+    return f'optimizer migrated, {sum(grown)} new tensors starting fresh'
+
+
+def pending_grads(trained, batches_in, accumulate, frozen_trunk):
+    """The half-built gradient a save has to carry, or None on a boundary.
+
+    A save on a step boundary has nothing part-built to keep, and writing
+    43 MB of zeros to say so would be the expensive way to say nothing.
+    """
+    if batches_in % accumulate == 0:
+        return None
+    return {
+        'batches_in': batches_in,
+        'frozen_trunk': frozen_trunk,
+        'grads': [None if p.grad is None else p.grad.detach().cpu() for p in trained],
+    }
+
+
+def restore_pending(trained, partial, frozen_trunk, device):
+    """Put that gradient back, and say how far into the accumulation it was.
+
+    None when there is nothing to restore, or when what was saved was
+    accumulated over parameters this run does not have -- a trunk that is
+    frozen now and was not then, say. Dropping it then costs one accumulation
+    and keeps the moments honest; loading it would put the trunk's gradient
+    on the head.
+    """
+    if not partial:
+        return None
+    if (partial['frozen_trunk'] != frozen_trunk
+            or len(partial['grads']) != len(trained)):
+        return None
+    for param, grad in zip(trained, partial['grads']):
+        param.grad = None if grad is None else grad.to(device)
+    return partial['batches_in']
+
+
 def log_prob_of(logits, actions):
     return logits.log_softmax(-1).gather(-1, actions[:, None]).squeeze(-1)
 
@@ -400,7 +475,8 @@ def main():
     # fixed `--from` sent the trainer back to the distilled checkpoint, it
     # published that to the workers on its first breath, and the next save
     # overwrote the run's own policy.pth with steps 0.
-    steps = rounds_done = 0
+    trained = [p for g in groups for p in g['params']]
+    steps = rounds_done = batches_in = 0
     carry_on = path.join(args.out, 'policy.pth')
     if path.exists(carry_on) and not args.fresh:
         held = torch.load(carry_on, weights_only=True, map_location='cpu')
@@ -411,7 +487,7 @@ def main():
         if not frozen_trunk and 'mortal' in held:
             brain.load_state_dict(held['mortal'])
         if 'optimizer' in held:
-            optimizer.load_state_dict(held['optimizer'])
+            logging.info(resume_optimizer(optimizer, held['optimizer']))
         if 'scaler' in held:
             scaler.load_state_dict(held['scaler'])
         if reference is not None and held.get('reference'):
@@ -419,11 +495,30 @@ def main():
         steps, rounds_done = held.get('steps', 0), held.get('rounds', 0)
         logging.info(f'resuming {carry_on}: {rounds_done:,} rounds, {steps:,} steps '
                      f'(--fresh would start over and overwrite it)')
+        # An optimizer step happens once per --accumulate batches, and a save
+        # can land anywhere in between. The optimizer and the scaler carry no
+        # `.grad`, so without this the part-built gradient was dropped: the
+        # batches were read, `steps` counted them, the games were spent, and
+        # the update they were adding up to never happened. With the default
+        # 64 a checkpoint could drop 63 of them, and a run taken in segments
+        # shorter than 64 batches could climb through rounds and steps
+        # without ever once stepping. A crash is not needed; finishing
+        # normally did it.
+        partial = held.get('accumulated')
+        carried = restore_pending(trained, partial, frozen_trunk, device)
+        if carried is not None:
+            batches_in = carried
+            logging.info(f'carrying on {batches_in % args.accumulate} batches into '
+                         'an accumulation that had not stepped yet')
+        elif partial:
+            logging.warning(
+                'this checkpoint stopped part way through an accumulation, and the '
+                'parameters it was accumulating over are not the ones this run has: '
+                'dropping that gradient and starting the next one clean.')
         del held
     cross_entropy = nn.CrossEntropyLoss()
     huber = nn.SmoothL1Loss()
     gamma = config['env']['gamma']
-    trained = [p for g in groups for p in g['params']]
 
     keep = args.keep_versions or (128 if frozen_trunk
                                   else config['online'].get('param_history', 8))
@@ -457,6 +552,8 @@ def main():
             'optimizer': optimizer.state_dict(),
             'scaler': scaler.state_dict(),
             'reference': reference.state_dict() if reference is not None else None,
+            'accumulated': pending_grads(trained, batches_in, args.accumulate,
+                                         frozen_trunk),
         }, out)
         return out
 
@@ -464,7 +561,6 @@ def main():
     # one chart and the three can be read against each other.
     writer = SummaryWriter(path.join(args.out, 'tb'))
     skipped = 0
-    batches_in = 0
     unchecked_rounds = 0
     last_grad = mean_grad = mean_norm = None
     # Both are measured on the batches that step; between them the meter reads
