@@ -170,6 +170,33 @@ def behaviour_of(actions, masks, log, seat, sampler):
     return probs, np.array(kinds)
 
 
+def aligned_metas(actions, masks, log, seat):
+    """The `meta` belonging to each instance, or None where there is none.
+
+    `behaviour_of` says what the probability of the action taken was;
+    this says what the whole distribution over that decision's legal actions
+    was, which is what picking a counterfactual to force needs. Same cursor,
+    same rule -- the alignment between a log's events and the instances
+    libriichi decodes from it is subtle enough that it should be written down
+    once, and `test_rollout` checks the two agree on which instances have one.
+    """
+    metas = metas_of(read_log(log), seat)
+    out = []
+    used = 0
+    for action, mask in zip(actions, masks):
+        meta = metas[used] if used < len(metas) else None
+        if meta is not None and meta['mask_bits'] == mask_bits_of(mask):
+            used += 1
+            legal = int(np.count_nonzero(mask))
+            # A length that does not match the mask means the pairing has
+            # slipped, and a distribution read off it would be wrong rather
+            # than missing.
+            out.append(meta if len(meta['q_values']) == legal else None)
+        else:
+            out.append(None)
+    return out
+
+
 def version_in(file):
     """The parameter version a replay file's name carries, or None.
 
