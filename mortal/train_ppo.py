@@ -321,23 +321,39 @@ def pending_grads(trained, batches_in, accumulate, frozen_trunk):
     return {
         'batches_in': batches_in,
         'frozen_trunk': frozen_trunk,
+        # What this gradient was divided by. Every batch in it was scaled by
+        # 1/accumulate on the way in, so it only adds up with batches scaled
+        # by the same number, and `batches_in` only says where the boundary
+        # is against the same window.
+        'accumulate': accumulate,
         'grads': [None if p.grad is None else p.grad.detach().cpu() for p in trained],
     }
 
 
-def restore_pending(trained, partial, frozen_trunk, device):
+def restore_pending(trained, partial, frozen_trunk, accumulate, device):
     """Put that gradient back, and say how far into the accumulation it was.
 
-    None when there is nothing to restore, or when what was saved was
-    accumulated over parameters this run does not have -- a trunk that is
-    frozen now and was not then, say. Dropping it then costs one accumulation
-    and keeps the moments honest; loading it would put the trunk's gradient
-    on the head.
+    None when there is nothing to restore, or when what was saved does not
+    add up with what this run is about to add to it:
+
+    - accumulated over parameters this run does not have, a trunk that is
+      frozen now and was not then. Loading it would put the trunk's gradient
+      on the head.
+    - divided by a different `--accumulate`. Every batch in the saved
+      gradient was scaled by one over the old number and every batch to come
+      by one over the new, so adding them weights the two halves differently
+      -- with 2 then 4 the update can point somewhere neither half did. And
+      `batches_in` is read against the new window, so 32 batches saved under
+      64 and resumed under 32 land exactly on a boundary and are zeroed on
+      the next batch, having been reported as carried.
+
+    Dropping it costs one accumulation and keeps the arithmetic honest.
     """
     if not partial:
         return None
     if (partial['frozen_trunk'] != frozen_trunk
-            or len(partial['grads']) != len(trained)):
+            or len(partial['grads']) != len(trained)
+            or partial.get('accumulate') != accumulate):
         return None
     for param, grad in zip(trained, partial['grads']):
         param.grad = None if grad is None else grad.to(device)
@@ -505,16 +521,19 @@ def main():
         # without ever once stepping. A crash is not needed; finishing
         # normally did it.
         partial = held.get('accumulated')
-        carried = restore_pending(trained, partial, frozen_trunk, device)
+        carried = restore_pending(trained, partial, frozen_trunk, args.accumulate,
+                                  device)
         if carried is not None:
             batches_in = carried
             logging.info(f'carrying on {batches_in % args.accumulate} batches into '
                          'an accumulation that had not stepped yet')
         elif partial:
             logging.warning(
-                'this checkpoint stopped part way through an accumulation, and the '
-                'parameters it was accumulating over are not the ones this run has: '
-                'dropping that gradient and starting the next one clean.')
+                'this checkpoint stopped part way through an accumulation that does '
+                f'not add up with this run -- it was over {len(partial["grads"])} '
+                f'tensors divided by {partial.get("accumulate")}, and this run has '
+                f'{len(trained)} divided by {args.accumulate}. Dropping that gradient '
+                'and starting the next one clean.')
         del held
     cross_entropy = nn.CrossEntropyLoss()
     huber = nn.SmoothL1Loss()
@@ -553,7 +572,7 @@ def main():
             'scaler': scaler.state_dict(),
             'reference': reference.state_dict() if reference is not None else None,
             'accumulated': pending_grads(trained, batches_in, args.accumulate,
-                                         frozen_trunk),
+                                         frozen_trunk),  # noqa: E501
         }, out)
         return out
 
