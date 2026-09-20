@@ -237,19 +237,26 @@ def assign_rules(names, rules, witness_every, rng):
     Each wall draws its own permutation instead, which balances the rules
     across the seats by construction. Witnesses are drawn at random for the
     same reason: every tenth file is seat 0 or seat 2 and never the other two.
+
+    The rule counter runs across the walls rather than restarting at each
+    one. A wall holds four hanchans, so restarting it meant a fifth rule was
+    never reached at all: asking for all five ran a whole evaluation that
+    measured four of them and said nothing about the fifth.
     """
     walls = defaultdict(list)
     for name in names:
         walls[name.rsplit('_', 1)[0]].append(name)
     assigned, witnesses = {}, set()
+    slot = 0
     for wall in sorted(walls):
         members = sorted(walls[wall])
-        for slot, which in enumerate(rng.permutation(len(members))):
+        for which in rng.permutation(len(members)):
             name = members[which]
             if witness_every and rng.random() < 1 / witness_every:
                 witnesses.add(name)
             else:
                 assigned[name] = rules[slot % len(rules)]
+            slot += 1
     return assigned, witnesses
 
 def play(challenger, champion, seed_start, seed_count, log_dir):
@@ -510,12 +517,16 @@ def main():
                 continue
             targets[name] = target
             forcer.arm(target['cheap'], target['full'], target['forced'], name)
-        # What was interfered with, whatever becomes of the measurement. A
-        # target that is dropped later was still forked, so its two arms
-        # differ by design: counting it as a hanchan nothing was done to
-        # would report the intervention as contamination, and enough of them
-        # would stop the run with a message about floating point.
-        armed = set(targets)
+        # Armed is not the same as interfered with, and the difference is
+        # exactly the evidence this run is looking for. A target that fired
+        # and was dropped afterwards did have its action replaced, so its two
+        # arms differ by design and counting it as a hanchan nothing was done
+        # to would report the intervention as contamination. A target that
+        # never fired had nothing replaced -- it is an untouched replay, and
+        # if it came out different that is another game's fork reaching it
+        # through the batch they share, which is the one thing the witnesses
+        # exist to catch. `forcer.fired` is what tells them apart, so it is
+        # read after the fork has been played.
 
         play(forcer, champion, (first, args.key), args.seeds, fork_dir)
         mismatched_before = len(mismatched)
@@ -536,6 +547,7 @@ def main():
                 mismatched.append(name)
                 del targets[name]
 
+        interfered = set(forcer.fired)
         missed = [n for n in targets if n not in forcer.fired]
         for name in missed:
             # Where did it go wrong? A line that had already left the baseline
@@ -551,7 +563,9 @@ def main():
                                 [(version, base_dir, fork_dir, name,
                                   targets.get(name)) for name in names]):
             if 'witness' in got:
-                if name in armed:
+                if name in interfered:
+                    # Forked, then the measurement was thrown away. Not a
+                    # witness either way.
                     rejected += 1
                     continue
                 # Nothing was forked here, so it is a witness: if it moved,
