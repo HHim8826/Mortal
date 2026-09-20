@@ -200,6 +200,72 @@ class Behaviour:
         return head(brain(obs), masks)
 
 
+class Reference:
+    """The policy this run is anchored to, kept complete enough to stay still.
+
+    A KL penalty measures the distance to a *fixed* policy. What used to be
+    kept was the head alone, and it was handed the live trunk's features. With
+    a frozen trunk that is exactly right and nearly free. With `--train-trunk`
+    it is not the same function any more: the head's weights sit still while
+    its input moves under it every step, so the reference drifts along behind
+    the policy and the anchor measures the distance from the policy to itself.
+    `no_grad()` freezes what a function does to its inputs, not the inputs.
+
+    So the trunk comes too when the trunk can move, and the cheap path is
+    taken only when it cannot -- where the reference's features are the live
+    ones to the bit and recomputing them would buy nothing.
+    """
+
+    def __init__(self, brain, policy, frozen_trunk):
+        self.frozen_trunk = frozen_trunk
+        self.policy = deepcopy(policy).eval().requires_grad_(False)
+        # eval() and a deepcopy together are what hold the BatchNorm buffers
+        # still: the trunk this run starts from is already in eval mode, so
+        # its running statistics are the distilled ones and nothing here
+        # updates them, but a reference that shared the live module would
+        # follow any future change to that.
+        self.brain = None if frozen_trunk else deepcopy(brain).eval().requires_grad_(False)
+
+    def logits(self, phi, obs, masks):
+        """The reference's logits for these decisions.
+
+        `phi` is the live trunk's output, which is the reference's own only
+        while the trunk is frozen.
+        """
+        if self.brain is not None:
+            phi = self.brain(obs)
+        return self.policy(phi, masks)
+
+    def refresh(self, brain, policy):
+        """Re-anchor to where the policy is now, all of it."""
+        self.policy = deepcopy(policy).eval().requires_grad_(False)
+        if not self.frozen_trunk:
+            self.brain = deepcopy(brain).eval().requires_grad_(False)
+
+    def state_dict(self):
+        held = {'policy': self.policy.state_dict()}
+        if self.brain is not None:
+            held['mortal'] = self.brain.state_dict()
+        return held
+
+    def load_state_dict(self, held):
+        # A checkpoint written before the trunk was kept holds the head's
+        # parameters at the top level. Those runs were all frozen-trunk, so
+        # the head alone is the whole reference and restoring it is right;
+        # what must not happen is a silent miss that re-anchors the run.
+        if 'policy' not in held:
+            self.policy.load_state_dict(held)
+            return
+        self.policy.load_state_dict(held['policy'])
+        if self.brain is not None:
+            if 'mortal' not in held:
+                raise SystemExit(
+                    'this checkpoint carries a reference head but no reference trunk, '
+                    'and --train-trunk needs both: resuming would anchor the run to a '
+                    'policy that never existed. Start over with --fresh, or resume frozen.')
+            self.brain.load_state_dict(held['mortal'])
+
+
 def log_prob_of(logits, actions):
     return logits.log_softmax(-1).gather(-1, actions[:, None]).squeeze(-1)
 
@@ -315,9 +381,11 @@ def main():
     # travelled from where it started is the measurement, not a side effect of
     # the penalty: with `--kl-coef 0` the reference used to be dropped and the
     # run reported a distance of exactly zero for ever, which is the one number
-    # the no-anchor variant exists to produce. It costs one linear forward, and
-    # `kl_coef` of zero still contributes no gradient.
-    reference = deepcopy(policy).eval().requires_grad_(False)
+    # the no-anchor variant exists to produce. On a frozen trunk it costs one
+    # linear forward; with `--train-trunk` it keeps a trunk of its own and
+    # costs a second trunk forward, which is what a fixed reference is worth.
+    # `kl_coef` of zero still contributes no gradient either way.
+    reference = Reference(brain, policy, frozen_trunk)
     groups = [{'params': list(policy.parameters()) + list(critic.parameters())
                          + list(value_head.parameters()), 'lr': args.lr}]
     if not frozen_trunk:
@@ -497,7 +565,7 @@ def main():
                         rows = (versions == v).to(device) & keep
                         mu_logits = behaviour.logits(v, phi[rows], obs[rows], masks[rows])
                         mu_logp[rows] = log_prob_of(mu_logits.float(), actions[rows])
-                    ref_logits = reference(phi, masks)
+                    ref_logits = reference.logits(phi, obs, masks)
 
                 logp = log_prob_of(logits.float(), actions)
                 ratio = (logp - mu_logp).exp()
@@ -665,7 +733,7 @@ def main():
                             'decisions whose parameters are no longer held')
 
         if args.ref_refresh and args.kl_coef > 0 and round_no % args.ref_refresh == 0:
-            reference = deepcopy(policy).eval().requires_grad_(False)
+            reference.refresh(brain, policy)
             logging.info(f'reference refreshed to the policy after round {round_no}')
 
         writer.add_scalar('round/games', len(file_list), round_no)
