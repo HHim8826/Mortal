@@ -39,6 +39,7 @@ import gzip
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 from collections import defaultdict
@@ -51,6 +52,7 @@ import prelude                                          # noqa: F401
 import rollout as ro
 from config import config
 from engine import MortalEngine
+from dataloader import digest64
 from model import Brain, GRP, PolicyHead
 from reward_calculator import RewardCalculator
 
@@ -61,8 +63,12 @@ CHALLENGER = 'trainee'
 # the two must not be added up or compared without saying which is which.
 from evaluate import PTS
 
-def load_policy(file, device):
-    """The policy under test, as the trunk and head an engine plays."""
+def load_policy(file):
+    """The policy under test, as the trunk and head an engine plays.
+
+    Left on the CPU. Moving it to the GPU initialises CUDA, and the worker
+    pool is forked before that happens on purpose -- see `start_workers`.
+    """
     state = torch.load(file, weights_only=True, map_location='cpu')
     if 'policy' not in state:
         raise SystemExit(f'{file} has no policy head; train one with train_policy.py')
@@ -73,8 +79,7 @@ def load_policy(file, device):
     brain.load_state_dict(state['mortal'])
     head = PolicyHead(version=version).eval()
     head.load_state_dict(state['policy'])
-    return (brain.to(device).requires_grad_(False),
-            head.to(device).requires_grad_(False), version,
+    return (brain.requires_grad_(False), head.requires_grad_(False), version,
             state.get('play_temperature'))
 
 def cheap_of(obs):
@@ -137,6 +142,115 @@ class Forcer:
                 self.fired[tag] = dict(was=int(actions[i]), forced=action)
                 actions[i] = action
         return actions, q_out, mask_out, is_greedy
+
+# Decoding a log is most of this program. The arena plays 2,000 hanchans a
+# block in about ten minutes on eight of twelve cores; reading them back --
+# three decodes a hanchan, a GRP forward for each arm, and a JSON parse of
+# every event twice over -- took nearly half an hour on one. It is per-log
+# work with nothing shared, so it goes to a pool. These two are what the pool
+# runs, and the loader and the reward calculator they use are built in the
+# parent before the fork, so every worker inherits one rather than paying to
+# build its own.
+_LOADER = None
+_REWARD = None
+
+def start_workers(jobs):
+    """The pool, forked before this process has anything worth inheriting.
+
+    Twice before, not once. A child of a process with a live CUDA context
+    must never touch CUDA, and the simplest way to be sure is for the context
+    not to exist yet -- so this is called before the weights move to the GPU.
+    And `fork` from a process that already has threads can deadlock the child
+    on a lock no surviving thread will release, which torch gives it as soon
+    as it does any real work, so this is called before that too. The children
+    build their own decoder on first use rather than inheriting one.
+    """
+    if jobs < 2:
+        return None
+    return multiprocessing.get_context('fork').Pool(jobs)
+
+def _state(version):
+    """This worker's decoder and GRP, built once and kept."""
+    global _LOADER, _REWARD
+    if _LOADER is None:
+        # One thread each. Ten workers all reaching for twelve cores is
+        # slower than ten workers taking one apiece.
+        torch.set_num_threads(1)
+        from libriichi.dataset import GameplayLoader
+        _LOADER = GameplayLoader(version=version, oracle=False)
+        grp = GRP(**config['grp']['network'])
+        grp.load_state_dict(torch.load(config['grp']['state_file'],
+                                       weights_only=True, map_location='cpu')['model'])
+        _REWARD = RewardCalculator(grp, config['env']['pts'])
+    return _LOADER, _REWARD
+
+def _pick_job(job):
+    """One log, read and searched for a decision worth forking."""
+    version, base_dir, name, seed, pick, rule = job
+    loader, _ = _state(version)
+    log = read(base_dir, name)
+    seat = seat_of(log)
+    target = pick_target(log, seat, decoded(loader, log, seat),
+                         np.random.default_rng(seed), pick, rule)
+    if target is not None:
+        target['seat'] = seat
+    return name, target
+
+def _measure_job(job):
+    """One hanchan's two arms, compared. A target of None is a witness."""
+    version, base_dir, fork_dir, name, target = job
+    one, other = read(base_dir, name), read(fork_dir, name)
+    if target is None:
+        return name, dict(witness=same_play(one, other))
+    loader, reward = _state(version)
+    seat, k = target['seat'], target['kyoku']
+    base = outcomes(seat, decoded(loader, one, seat), reward)
+    fork = outcomes(seat, decoded(loader, other, seat), reward)
+    return name, dict(
+        forked_at=first_divergence(one, other),
+        kyoku_base=float(base['kyoku_delta'][k]),
+        kyoku_fork=(float(fork['kyoku_delta'][k])
+                    if k < len(fork['kyoku_delta']) else float('nan')),
+        score_base=base['score'], score_fork=fork['score'],
+        scores_base=base['scores'], scores_fork=fork['scores'],
+        pt_base=base['pt'], pt_fork=fork['pt'],
+        rank_base=base['rank'], rank_fork=fork['rank'],
+    )
+
+def spread(pool, fn, jobs):
+    """`fn` over `jobs`, in the pool if there is one."""
+    if pool is None:
+        return [fn(job) for job in jobs]
+    return pool.map(fn, jobs, chunksize=8)
+
+def assign_rules(names, rules, witness_every, rng):
+    """Which rule each hanchan gets, and which are left alone as witnesses.
+
+    One wall is played four times with the challenger in each seat, and the
+    arena names them a, b, c, d in that order. Handing the rules out by
+    position therefore gave every rule its own starting seat for the whole
+    run -- argmax always seat 0, worst always seat 3 -- and no number of
+    blocks would shake that loose. Seats get different hands, a different
+    turn order and a different side of a tie, so a difference between the
+    rules would have been partly a difference between seats.
+
+    Each wall draws its own permutation instead, which balances the rules
+    across the seats by construction. Witnesses are drawn at random for the
+    same reason: every tenth file is seat 0 or seat 2 and never the other two.
+    """
+    walls = defaultdict(list)
+    for name in names:
+        walls[name.rsplit('_', 1)[0]].append(name)
+    assigned, witnesses = {}, set()
+    for wall in sorted(walls):
+        members = sorted(walls[wall])
+        for slot, which in enumerate(rng.permutation(len(members))):
+            name = members[which]
+            if witness_every and rng.random() < 1 / witness_every:
+                witnesses.add(name)
+            else:
+                assigned[name] = rules[slot % len(rules)]
+    return assigned, witnesses
 
 def play(challenger, champion, seed_start, seed_count, log_dir):
     """One block of seeds, four hanchans each, into a directory of its own."""
@@ -330,13 +444,23 @@ def main():
                          'over the hanchans of a block so every rule meets the same '
                          'states. argmax replaces the best action with itself and must '
                          'come out at exactly zero')
+    ap.add_argument('--jobs', type=int, default=0,
+                    help='processes to read the logs back with. 0 picks two fewer '
+                         'than the machine has, 1 keeps it in this process')
     ap.add_argument('--keep-logs', action='store_true',
                     help='leave each block behind instead of overwriting it')
     args = ap.parse_args()
 
+    # First, before this process has a CUDA context or a thread pool for a
+    # child to inherit and deadlock on.
+    jobs = args.jobs or max(1, (os.cpu_count() or 2) - 2)
+    pool = start_workers(jobs)
+
     device = torch.device(args.device or config['control']['device'])
-    brain, head, version, temperature = load_policy(args.policy, device)
-    logging.info(f'{args.policy}: v{version}, play temperature {temperature}')
+    brain, head, version, temperature = load_policy(args.policy)
+    logging.info(f'{args.policy}: v{version}, play temperature {temperature}, '
+                 f'logs read back across {jobs} processes')
+    brain, head = brain.to(device), head.to(device)
 
     def engine(name):
         # Argmax, the guard off, amp on: the settings the policy-gradient
@@ -347,12 +471,6 @@ def main():
                             name=name, boltzmann_epsilon=0.)
 
     champion = engine('champion')
-    from libriichi.dataset import GameplayLoader
-    loader = GameplayLoader(version=version, oracle=False)
-    grp = GRP(**config['grp']['network'])
-    grp.load_state_dict(torch.load(config['grp']['state_file'], weights_only=True,
-                                   map_location='cpu')['model'])
-    reward_calc = RewardCalculator(grp, config['env']['pts'])
 
     os.makedirs(args.out, exist_ok=True)
     rules = args.force.split(',')
@@ -360,8 +478,8 @@ def main():
         if rule not in RULES:
             raise SystemExit(f'unknown --force rule {rule!r}: expected {", ".join(RULES)}')
     logging.info(f'picking decisions {args.pick}ly, forcing {"/".join(rules)}')
-    rng = np.random.default_rng(args.rng)
     rows, identical, changed, witnesses, mismatched = [], 0, 0, [], []
+    rejected = 0
 
     for block in range(args.blocks):
         first = args.seed_start + block * args.seeds
@@ -377,21 +495,27 @@ def main():
         # thousand was 40 GB and the run was killed for it. The target is a
         # hash and a handful of numbers, and the logs are still on disk.
         forcer = Forcer(engine(CHALLENGER))
+        assigned = {}
+        if args.per_hanchan >= 1:
+            assigned, _ = assign_rules(names, rules, args.witness_every,
+                                       np.random.default_rng([args.rng, block, 1]))
+        # `digest64` is signed, for the tensor it usually ends up in; a seed
+        # has to be non-negative.
+        wanted = [(version, base_dir, name,
+                   [args.rng, block, digest64(name) % (1 << 63)], args.pick, rule)
+                  for name, rule in sorted(assigned.items())]
         targets = {}
-        for n, name in enumerate(names):
-            if args.per_hanchan < 1:
-                break
-            if args.witness_every and n % args.witness_every == 0:
-                continue
-            log = read(base_dir, name)
-            seat = seat_of(log)
-            target = pick_target(log, seat, decoded(loader, log, seat), rng,
-                                 args.pick, rules[n % len(rules)])
+        for name, target in spread(pool, _pick_job, wanted):
             if target is None:
                 continue
-            target['seat'] = seat
             targets[name] = target
             forcer.arm(target['cheap'], target['full'], target['forced'], name)
+        # What was interfered with, whatever becomes of the measurement. A
+        # target that is dropped later was still forked, so its two arms
+        # differ by design: counting it as a hanchan nothing was done to
+        # would report the intervention as contamination, and enough of them
+        # would stop the run with a message about floating point.
+        armed = set(targets)
 
         play(forcer, champion, (first, args.key), args.seeds, fork_dir)
         mismatched_before = len(mismatched)
@@ -423,48 +547,39 @@ def main():
                             f'event {where} (target was decision {targets[name]["index"]})')
             del targets[name]
 
-        for name in names:
-            log_b, log_f = read(base_dir, name), read(fork_dir, name)
-            if name not in targets:
+        for name, got in spread(pool, _measure_job,
+                                [(version, base_dir, fork_dir, name,
+                                  targets.get(name)) for name in names]):
+            if 'witness' in got:
+                if name in armed:
+                    rejected += 1
+                    continue
                 # Nothing was forked here, so it is a witness: if it moved,
                 # the two arms are not comparable and nor is anything else in
                 # the block.
-                if same_play(log_b, log_f):
+                if got['witness']:
                     identical += 1
                 else:
                     changed += 1
                     witnesses.append(name)
                 continue
-            forked_at = first_divergence(log_b, log_f)
-            if forked_at is None:
+            if got['forked_at'] is None:
                 # The action was replaced and the game came out identical --
                 # a deviation that changed nothing is a real outcome, not an
                 # error, but it should be visible rather than assumed.
                 logging.debug(f'{name}: forced action left the log unchanged')
             t = targets[name]
-            seat = t['seat']
-            out_b = outcomes(seat, decoded(loader, log_b, seat), reward_calc)
-            out_f = outcomes(seat, decoded(loader, log_f, seat), reward_calc)
-            k = t['kyoku']
             rows.append(dict(
                 block=block, log=name,
                 **{x: t[x] for x in ('index', 'kyoku', 'seat', 'rule', 'argmax',
                                      'forced', 'forced_rank', 'legal', 'p_argmax',
                                      'p_forced', 'p_deviate', 'deviations_expected',
                                      'decisions')},
-                was=forcer.fired[name]['was'], forked_at=forked_at,
-                kyoku_base=float(out_b['kyoku_delta'][k]),
-                kyoku_fork=(float(out_f['kyoku_delta'][k])
-                            if k < len(out_f['kyoku_delta']) else float('nan')),
-                score_base=out_b['score'], score_fork=out_f['score'],
-                scores_base=out_b['scores'], scores_fork=out_f['scores'],
-                pt_base=out_b['pt'], pt_fork=out_f['pt'],
-                rank_base=out_b['rank'], rank_fork=out_f['rank'],
-            ))
+                was=forcer.fired[name]['was'], **got))
         logging.info(f'block {block}: {len(targets)} forked, {identical:,} untouched '
-                     f'hanchans identical, {changed:,} not, {forcer.collisions} '
-                     'fingerprint collisions')
-        save(rows, identical, changed, len(mismatched), args)
+                     f'hanchans identical, {changed:,} not, {rejected} forked but '
+                     f'dropped, {forcer.collisions} fingerprint collisions')
+        save(rows, identical, changed, len(mismatched), rejected, args)
         if new_mismatches := len(mismatched) - mismatched_before:
             logging.warning(f'block {block}: dropped {new_mismatches} targets whose '
                             f'logits belong to another decision ({len(mismatched)} so far)')
@@ -479,9 +594,9 @@ def main():
                 'often enough that the drop rate is no longer incidental: play without '
                 '--amp, or put fewer games in one arena.')
 
-    report(rows, identical, changed, len(mismatched), args)
+    report(rows, identical, changed, len(mismatched), rejected, args)
 
-def save(rows, identical, changed, mismatched, args):
+def save(rows, identical, changed, mismatched, rejected, args):
     """Everything measured so far, rewritten after every block.
 
     A block is a quarter of an hour of play and the blocks after it can still
@@ -490,13 +605,15 @@ def save(rows, identical, changed, mismatched, args):
     out = path.join(args.out, 'deviations.json')
     with open(out, 'w', encoding='utf-8') as f:
         json.dump(dict(args=vars(args), identical=identical, changed=changed,
-                       mismatched=mismatched, rows=rows), f, indent=1)
+                       mismatched=mismatched, rejected=rejected, rows=rows), f, indent=1)
     return out
 
-def report(rows, identical, changed, mismatched, args):
-    out = save(rows, identical, changed, mismatched, args)
+def report(rows, identical, changed, mismatched, rejected, args):
+    out = save(rows, identical, changed, mismatched, rejected, args)
     print()
-    print(f'untouched hanchans: {identical:,} identical, {changed:,} not')
+    print(f'untouched hanchans: {identical:,} identical, {changed:,} not'
+          + (f'; {rejected} more were forked and then dropped, which is not the same '
+             'thing and is not counted here' if rejected else ''))
     if mismatched:
         print(f'targets dropped for borrowed logits: {mismatched:,}')
     if not rows:
@@ -504,6 +621,9 @@ def report(rows, identical, changed, mismatched, args):
         print(f'\nwritten to {out}')
         return
 
+    by_rule = {}
+    for row in rows:
+        by_rule.setdefault(row.get('rule', 'sampled'), []).append(row)
     kyoku = np.array([r['kyoku_fork'] - r['kyoku_base'] for r in rows])
     pts = np.array([r['pt_fork'] - r['pt_base'] for r in rows])
     score = np.array([r['score_fork'] - r['score_base'] for r in rows])
@@ -519,9 +639,6 @@ def report(rows, identical, changed, mismatched, args):
     print(f'{len(rows):,} forced deviations, one per hanchan, each against the same wall '
           'played by the same policy taking its argmax')
 
-    by_rule = {}
-    for row in rows:
-        by_rule.setdefault(row.get('rule', 'sampled'), []).append(row)
     if len(by_rule) > 1:
         print()
         print("the kyoku's GRP delta, by which action was put in the argmax's place")
@@ -550,17 +667,28 @@ def report(rows, identical, changed, mismatched, args):
     print()
     print(f'a hanchan has {decisions.mean():.0f} decisions with a choice in it, of which '
           f'{per_game.mean():.2f} would deviate')
-    # Per hanchan, not per average hanchan: each game's own deviation count
-    # times its own measured cost. Multiplying the two averages instead would
-    # assume a game's deviation rate says nothing about what its deviations
-    # cost, which nothing here establishes -- and with one deviation per game
-    # it can come out the wrong sign entirely.
-    whole = per_game * pts
-    print(f'so sampling end to end, if deviations did not interact: '
-          f'{whole.mean():+.2f} +- {whole.std(ddof=1) / np.sqrt(len(whole)):.2f} pt')
-    print('phase 2 measured that at -1.13 +- 1.53 pt. They are different experiments -- '
-          'that one sampled every decision, this one forces a single deviation onto an '
-          'argmax line -- so they should agree in sign and order, not exactly')
+    # Only one configuration estimates what sampling costs: the decision has
+    # to be drawn in proportion to how likely a deviation was there, and the
+    # action has to be the one sampling would have drawn. Under `--pick
+    # uniform` the target came from a different distribution, and under any
+    # other rule the action did; multiplying by the deviation count then
+    # answers no question at all, and on synthetic rows it comes out the
+    # wrong sign. So it is not printed.
+    if args.pick == 'deviation' and set(by_rule) == {'sampled'}:
+        # Per hanchan, not per average hanchan: each game's own deviation
+        # count times its own measured cost. Multiplying the two averages
+        # would assume a game's deviation rate says nothing about what its
+        # deviations cost, which nothing here establishes.
+        whole = per_game * pts
+        print(f'so sampling end to end, if deviations did not interact: '
+              f'{whole.mean():+.2f} +- {whole.std(ddof=1) / np.sqrt(len(whole)):.2f} pt')
+        print('phase 2 measured that at -1.13 +- 1.53 pt. They are different experiments '
+              '-- that one sampled every decision, this one forces a single deviation '
+              'onto an argmax line -- so they should agree in sign and order, not exactly')
+    else:
+        print('what that costs end to end is not estimated here: it needs the decision '
+              'drawn by how likely a deviation was and the action drawn as sampling '
+              'would have drawn it, which is --pick deviation --force sampled')
     print(f'\nwritten to {out}')
 
 if __name__ == '__main__':
