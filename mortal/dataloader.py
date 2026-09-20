@@ -13,6 +13,18 @@ from libriichi.dataset import GameplayLoader
 from rollout import version_in
 from config import config
 
+def digest64(key):
+    """A stable signed 64-bit name for a string.
+
+    Not `hash()`: PYTHONHASHSEED is randomised per process and the loader runs
+    in several worker processes, so the same game would carry a different
+    number depending on which worker happened to decode it. Clusters grouped
+    by that would be silently wrong rather than obviously missing, which is
+    the worse of the two failures. sha1 is not used here for any security
+    property, only because it is the digest already in this file.
+    """
+    return int.from_bytes(hashlib.sha1(key.encode()).digest()[:8], 'little', signed=True)
+
 class FileDatasetsIter(IterableDataset):
     def __init__(
         self,
@@ -31,6 +43,7 @@ class FileDatasetsIter(IterableDataset):
         final_rank = False,
         skip_rewards = False,
         param_version = False,
+        decision_ids = False,
     ):
         super().__init__()
         self.version = version
@@ -60,6 +73,15 @@ class FileDatasetsIter(IterableDataset):
         # whatever was published when the game was played -- not what the
         # trainer holds by the time the batch arrives.
         self.param_version = param_version
+        # Which trajectory, which kyoku, and where in the trajectory each
+        # decision came from. Without these a batch is a bag of decisions and
+        # several things cannot be done at all: the ~30 decisions of a kyoku
+        # share one GRP delta, so a standard error that treats them as
+        # independent is wrong and there is nothing to resample by; a held-out
+        # split that scatters one hanchan across train and validation has
+        # already leaked; and any return that walks forward -- TD(lambda),
+        # GAE -- needs the order the shuffle threw away.
+        self.decision_ids = decision_ids
         self.iterator = None
 
     def build_iter(self):
@@ -218,6 +240,7 @@ class FileDatasetsIter(IterableDataset):
             version = version_in(source) if self.param_version else None
             if version is None:
                 version = -1
+            game_key = self.where(source) if self.decision_ids else None
             for game in file:
                 # per move
                 obs = game.take_obs()
@@ -232,6 +255,9 @@ class FileDatasetsIter(IterableDataset):
                 # per game
                 grp = game.take_grp()
                 player_id = game.take_player_id()
+                # One file holds one log and up to four seats of it, so the
+                # trajectory is the pair, not the file.
+                game_id = digest64(f'{game_key}#{player_id}') if self.decision_ids else 0
 
                 game_size = len(obs)
                 if game_size == 0:
@@ -287,6 +313,9 @@ class FileDatasetsIter(IterableDataset):
                         # worker, or a log put there by hand. The trainer drops
                         # those rather than pricing them with the wrong weights.
                         entry.append(version)
+                    if self.decision_ids:
+                        # Last, for the reason the two above are appended.
+                        entry += [game_id, int(at_kyoku[i]), i]
                     entries.append(entry)
         return entries
 
