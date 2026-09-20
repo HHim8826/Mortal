@@ -239,14 +239,25 @@ def pick_target(log, seat, game, rng):
     )
 
 def outcomes(seat, game, reward_calc):
-    """What the hanchan paid this seat, per kyoku and at the end."""
+    """What the hanchan paid this seat, per kyoku and at the end.
+
+    The placement comes from the engine, not from counting who scored more.
+    Two seats can finish level and the engine still ranks them, by where they
+    started; counting strictly-greater scores calls them both the higher
+    place. That is a whole 45 pt on the Tenhou scale, it lands on one arm of
+    a pair and not the other, and it does not cancel in the difference. It is
+    also the ranking `calc_delta_pt` is already being handed on the line
+    above, so taking it from anywhere else was two answers to one question.
+    """
     grp = game.take_grp()
-    deltas = reward_calc.calc_delta_pt(seat, grp.take_feature(), grp.take_rank_by_player())
+    rank_by_player = grp.take_rank_by_player()
+    deltas = reward_calc.calc_delta_pt(seat, grp.take_feature(), rank_by_player)
     final = np.asarray(grp.take_final_scores())
-    rank = int((final > final[seat]).sum())
+    rank = int(rank_by_player[seat])
     return dict(
         kyoku_delta=np.asarray(deltas, dtype=np.float64),
         score=float(final[seat]),
+        scores=[float(x) for x in final],
         rank=rank,
         pt=float(PTS[rank]),
     )
@@ -300,7 +311,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     rng = np.random.default_rng(args.rng)
-    rows, identical, changed, witnesses = [], 0, 0, []
+    rows, identical, changed, witnesses, mismatched = [], 0, 0, [], []
 
     for block in range(args.blocks):
         first = args.seed_start + block * args.seeds
@@ -309,40 +320,59 @@ def main():
         fork_dir = path.join(args.out, f'{tag}-fork')
 
         names = play(engine(CHALLENGER), champion, (first, args.key), args.seeds, base_dir)
-        base = {}
-        for name in names:
-            log = read(base_dir, name)
-            seat = seat_of(log)
-            base[name] = (log, seat, decoded(loader, log, seat))
 
+        # One log at a time, and nothing decoded kept afterwards. A v4
+        # observation is 1012x34 floats and a hanchan holds a few hundred of
+        # them, so a decoded game is tens of megabytes; holding a block of a
+        # thousand was 40 GB and the run was killed for it. The target is a
+        # hash and a handful of numbers, and the logs are still on disk.
         forcer = Forcer(engine(CHALLENGER))
         targets = {}
-        for n, (name, (log, seat, game)) in enumerate(base.items()):
+        for n, name in enumerate(names):
             if args.per_hanchan < 1:
-                continue
+                break
             if args.witness_every and n % args.witness_every == 0:
                 continue
-            target = pick_target(log, seat, game, rng)
+            log = read(base_dir, name)
+            seat = seat_of(log)
+            target = pick_target(log, seat, decoded(loader, log, seat), rng)
             if target is None:
                 continue
+            target['seat'] = seat
             targets[name] = target
             forcer.arm(target['cheap'], target['full'], target['forced'], name)
 
         play(forcer, champion, (first, args.key), args.seeds, fork_dir)
+        # The alignment between a log's events and the instances decoded from
+        # it walks a cursor, and a declined call leaves no event to move it:
+        # a pass and a later pon can carry the same legal-action mask, and the
+        # pass then takes the pon's logits. A target picked from the wrong
+        # distribution names the wrong argmax, and firing only proves the
+        # state was found, not that the numbers attached to it belong to it.
+        # The baseline takes its argmax, so the two must agree.
+        for name in list(targets):
+            fired = forcer.fired.get(name)
+            if fired is not None and fired['was'] != targets[name]['argmax']:
+                logging.warning(
+                    f'{name}: the metadata says the argmax here is '
+                    f'{targets[name]["argmax"]} and the policy played {fired["was"]}, '
+                    'so this decision was paired with the logits of another one')
+                mismatched.append(name)
+                del targets[name]
+
         missed = [n for n in targets if n not in forcer.fired]
         for name in missed:
             # Where did it go wrong? A line that had already left the baseline
             # before its own target is the batch reaching between games; one
             # that never left is something else, and the two want different
             # fixes.
-            where = first_divergence(base[name][0], read(fork_dir, name))
+            where = first_divergence(read(base_dir, name), read(fork_dir, name))
             logging.warning(f'{name}: armed state never came round, first divergence at '
                             f'event {where} (target was decision {targets[name]["index"]})')
             del targets[name]
 
         for name in names:
-            log_b, seat, game_b = base[name]
-            log_f = read(fork_dir, name)
+            log_b, log_f = read(base_dir, name), read(fork_dir, name)
             if name not in targets:
                 # Nothing was forked here, so it is a witness: if it moved,
                 # the two arms are not comparable and nor is anything else in
@@ -359,26 +389,32 @@ def main():
                 # a deviation that changed nothing is a real outcome, not an
                 # error, but it should be visible rather than assumed.
                 logging.debug(f'{name}: forced action left the log unchanged')
-            out_b = outcomes(seat, game_b, reward_calc)
-            out_f = outcomes(seat, decoded(loader, log_f, seat), reward_calc)
             t = targets[name]
+            seat = t['seat']
+            out_b = outcomes(seat, decoded(loader, log_b, seat), reward_calc)
+            out_f = outcomes(seat, decoded(loader, log_f, seat), reward_calc)
             k = t['kyoku']
             rows.append(dict(
                 block=block, log=name,
-                **{x: t[x] for x in ('index', 'kyoku', 'argmax', 'forced', 'p_argmax',
-                                     'p_forced', 'p_deviate', 'deviations_expected',
-                                     'decisions')},
+                **{x: t[x] for x in ('index', 'kyoku', 'seat', 'argmax', 'forced',
+                                     'p_argmax', 'p_forced', 'p_deviate',
+                                     'deviations_expected', 'decisions')},
                 was=forcer.fired[name]['was'], forked_at=forked_at,
                 kyoku_base=float(out_b['kyoku_delta'][k]),
                 kyoku_fork=(float(out_f['kyoku_delta'][k])
                             if k < len(out_f['kyoku_delta']) else float('nan')),
                 score_base=out_b['score'], score_fork=out_f['score'],
+                scores_base=out_b['scores'], scores_fork=out_f['scores'],
                 pt_base=out_b['pt'], pt_fork=out_f['pt'],
                 rank_base=out_b['rank'], rank_fork=out_f['rank'],
             ))
         logging.info(f'block {block}: {len(targets)} forked, {identical:,} untouched '
                      f'hanchans identical, {changed:,} not, {forcer.collisions} '
                      'fingerprint collisions')
+        save(rows, identical, changed, len(mismatched), args)
+        if mismatched:
+            logging.warning(f'block {block}: dropped {len(mismatched)} targets whose '
+                            'logits belong to another decision')
         if missed:
             logging.warning(f'block {block}: dropped {len(missed)} of '
                             f'{len(missed) + len(targets)} targets that never came round')
@@ -390,16 +426,26 @@ def main():
                 'often enough that the drop rate is no longer incidental: play without '
                 '--amp, or put fewer games in one arena.')
 
-    report(rows, identical, changed, args)
+    report(rows, identical, changed, len(mismatched), args)
 
-def report(rows, identical, changed, args):
+def save(rows, identical, changed, mismatched, args):
+    """Everything measured so far, rewritten after every block.
+
+    A block is a quarter of an hour of play and the blocks after it can still
+    fail; what has already been measured should survive that.
+    """
     out = path.join(args.out, 'deviations.json')
     with open(out, 'w', encoding='utf-8') as f:
-        json.dump(dict(args=vars(args), identical=identical, changed=changed, rows=rows),
-                  f, indent=1)
+        json.dump(dict(args=vars(args), identical=identical, changed=changed,
+                       mismatched=mismatched, rows=rows), f, indent=1)
+    return out
 
+def report(rows, identical, changed, mismatched, args):
+    out = save(rows, identical, changed, mismatched, args)
     print()
     print(f'untouched hanchans: {identical:,} identical, {changed:,} not')
+    if mismatched:
+        print(f'targets dropped for borrowed logits: {mismatched:,}')
     if not rows:
         print('nothing was forked, so there is nothing else to report')
         print(f'\nwritten to {out}')
@@ -428,10 +474,14 @@ def report(rows, identical, changed, args):
     print()
     print(f'a hanchan has {decisions.mean():.0f} decisions with a choice in it, of which '
           f'{per_game.mean():.2f} would deviate')
-    total = per_game.mean() * pts.mean()
-    se = per_game.mean() * pts.std(ddof=1) / np.sqrt(len(pts))
+    # Per hanchan, not per average hanchan: each game's own deviation count
+    # times its own measured cost. Multiplying the two averages instead would
+    # assume a game's deviation rate says nothing about what its deviations
+    # cost, which nothing here establishes -- and with one deviation per game
+    # it can come out the wrong sign entirely.
+    whole = per_game * pts
     print(f'so sampling end to end, if deviations did not interact: '
-          f'{total:+.2f} +- {se:.2f} pt')
+          f'{whole.mean():+.2f} +- {whole.std(ddof=1) / np.sqrt(len(whole)):.2f} pt')
     print('phase 2 measured that at -1.13 +- 1.53 pt. They are different experiments -- '
           'that one sampled every decision, this one forces a single deviation onto an '
           'argmax line -- so they should agree in sign and order, not exactly')

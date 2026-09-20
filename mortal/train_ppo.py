@@ -251,18 +251,21 @@ class Reference:
     def load_state_dict(self, held):
         # A checkpoint written before the trunk was kept holds the head's
         # parameters at the top level. Those runs were all frozen-trunk, so
-        # the head alone is the whole reference and restoring it is right;
-        # what must not happen is a silent miss that re-anchors the run.
-        if 'policy' not in held:
-            self.policy.load_state_dict(held)
-            return
-        self.policy.load_state_dict(held['policy'])
+        # the head alone is the whole reference and restoring it is right.
+        flat = 'policy' not in held
+        # Either shape can be missing the trunk, and the flat one used to slip
+        # past this by returning early. A refreshed --train-trunk run saved the
+        # head it had re-anchored to and not the trunk that went with it, so
+        # restoring the head onto the trunk this run happens to start from
+        # builds an actor that was never the reference: measured at 1.66 of a
+        # logit away from the policy that was actually anchored to.
+        if self.brain is not None and 'mortal' not in held:
+            raise SystemExit(
+                'this checkpoint carries a reference head but no reference trunk, '
+                'and --train-trunk needs both: resuming would anchor the run to a '
+                'policy that never existed. Start over with --fresh, or resume frozen.')
+        self.policy.load_state_dict(held if flat else held['policy'])
         if self.brain is not None:
-            if 'mortal' not in held:
-                raise SystemExit(
-                    'this checkpoint carries a reference head but no reference trunk, '
-                    'and --train-trunk needs both: resuming would anchor the run to a '
-                    'policy that never existed. Start over with --fresh, or resume frozen.')
             self.brain.load_state_dict(held['mortal'])
 
 
