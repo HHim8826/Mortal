@@ -63,6 +63,24 @@ CHALLENGER = 'trainee'
 # the two must not be added up or compared without saying which is which.
 from evaluate import PTS
 
+# The last slot of the action space is pass, and it is legal in exactly the
+# states where someone else's tile is on offer -- a call: chi, pon, kan, ron,
+# or declining all of them. Nothing else can pass, so this is the exact test
+# for "is this a call decision", and a count of legal actions is not: a
+# late hand with two discards left also has few options, and is a different
+# kind of decision entirely.
+PASS = 45
+WHERE = ('all', 'calls', 'discards', 'narrow')
+
+def where_ok(only, ids):
+    """Whether a decision belongs to the slice being measured."""
+    match only:
+        case 'all':      return True
+        case 'calls':    return PASS in ids
+        case 'discards': return PASS not in ids
+        case 'narrow':   return len(ids) <= 5
+        case _:          raise ValueError(f'unknown slice {only!r}')
+
 def load_policy(file):
     """The policy under test, as the trunk and head an engine plays.
 
@@ -191,12 +209,12 @@ def _state(version):
 
 def _pick_job(job):
     """One log, read and searched for a decision worth forking."""
-    version, base_dir, name, seed, pick, rule = job
+    version, base_dir, name, seed, pick, rule, only = job
     loader, _ = _state(version)
     log = read(base_dir, name)
     seat = seat_of(log)
     target = pick_target(log, seat, decoded(loader, log, seat),
-                         np.random.default_rng(seed), pick, rule)
+                         np.random.default_rng(seed), pick, rule, only)
     if target is not None:
         target['seat'] = seat
     return name, target
@@ -330,7 +348,7 @@ def decoded(loader, log, seat):
 # against.
 RULES = ('sampled', 'argmax', 'rank2', 'median', 'worst')
 
-def pick_target(log, seat, game, rng, pick='deviation', rule='sampled'):
+def pick_target(log, seat, game, rng, pick='deviation', rule='sampled', only='all'):
     """One decision to fork, and what to play there instead.
 
     `pick` is how the decision is drawn. `deviation` weights it by
@@ -364,11 +382,17 @@ def pick_target(log, seat, game, rng, pick='deviation', rule='sampled'):
     if not rows:
         return None
 
-    weights = (np.array([r[4] for r in rows]) if pick == 'deviation'
-               else np.ones(len(rows)))
+    # `rows` stays the whole hanchan, because `decisions` and
+    # `deviations_expected` describe the hanchan and are what the end-to-end
+    # extrapolation divides by. The slice only narrows what may be drawn.
+    here = [r for r in rows if where_ok(only, r[1])]
+    if not here:
+        return None
+    weights = (np.array([r[4] for r in here]) if pick == 'deviation'
+               else np.ones(len(here)))
     if not weights.sum():
         return None
-    i, ids, p, best, off = rows[rng.choice(len(rows), p=weights / weights.sum())]
+    i, ids, p, best, off = here[rng.choice(len(here), p=weights / weights.sum())]
     order = np.argsort(-p, kind='stable')
     match rule:
         case 'sampled':
@@ -396,8 +420,13 @@ def pick_target(log, seat, game, rng, pick='deviation', rule='sampled'):
         # it was chosen from. `median` and `worst` are the same action in a
         # two-way choice, and this is what says so afterwards.
         forced_rank=int(np.flatnonzero(order == alt)[0]), legal=len(ids),
+        # Exactly what kind of decision this was, rather than inferred from
+        # the number of options afterwards: 506 states with five options or
+        # fewer in the rank sweep were 58% calls and 41% narrow discards.
+        pass_legal=bool(PASS in ids),
         p_argmax=float(p[best]), p_forced=float(p[alt]), p_deviate=float(off),
         deviations_expected=float(sum(r[4] for r in rows)), decisions=len(rows),
+        candidates=len(here),
         cheap=cheap_of(obs[i]), full=full_of(obs[i], masks[i]),
     )
 
@@ -462,6 +491,11 @@ def main():
                          'over the hanchans of a block so every rule meets the same '
                          'states. argmax replaces the best action with itself and must '
                          'come out at exactly zero')
+    ap.add_argument('--only', default='all', choices=WHERE,
+                    help='which decisions may be drawn. calls are the states where '
+                         'pass is legal, so a tile is on offer from another seat; narrow '
+                         'is five legal actions or fewer, which is a mixture of those '
+                         'and of late hands with little left to discard')
     ap.add_argument('--jobs', type=int, default=0,
                     help='processes to read the logs back with. 0 picks two fewer '
                          'than the machine has, 1 keeps it in this process')
@@ -495,7 +529,9 @@ def main():
     for rule in rules:
         if rule not in RULES:
             raise SystemExit(f'unknown --force rule {rule!r}: expected {", ".join(RULES)}')
-    logging.info(f'picking decisions {args.pick}ly, forcing {"/".join(rules)}')
+    logging.info(f'picking decisions {args.pick}ly from '
+                 f'{"every decision" if args.only == "all" else args.only}, '
+                 f'forcing {"/".join(rules)}')
     rows, identical, changed, witnesses, mismatched = [], 0, 0, [], []
     rejected = 0
 
@@ -520,7 +556,8 @@ def main():
         # `digest64` is signed, for the tensor it usually ends up in; a seed
         # has to be non-negative.
         wanted = [(version, base_dir, name,
-                   [args.rng, block, digest64(name) % (1 << 63)], args.pick, rule)
+                   [args.rng, block, digest64(name) % (1 << 63)], args.pick, rule,
+                   args.only)
                   for name, rule in sorted(assigned.items())]
         targets = {}
         for name, target in spread(pool, _pick_job, wanted):
@@ -597,9 +634,9 @@ def main():
             rows.append(dict(
                 block=block, log=name,
                 **{x: t[x] for x in ('index', 'kyoku', 'seat', 'rule', 'argmax',
-                                     'forced', 'forced_rank', 'legal', 'p_argmax',
-                                     'p_forced', 'p_deviate', 'deviations_expected',
-                                     'decisions')},
+                                     'forced', 'forced_rank', 'legal', 'pass_legal',
+                                     'p_argmax', 'p_forced', 'p_deviate',
+                                     'deviations_expected', 'decisions', 'candidates')},
                 was=forcer.fired[name]['was'], **got))
         logging.info(f'block {block}: {len(targets)} forked, {identical:,} untouched '
                      f'hanchans identical, {changed:,} not, {rejected} forked but '
