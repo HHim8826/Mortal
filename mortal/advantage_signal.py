@@ -78,6 +78,74 @@ def load_policy(file, device, value_from=None):
             value.to(device).requires_grad_(False))
 
 
+def pooled(quantity, best_p, took_best, edges, rows=None):
+    """The inverse-variance pooled gap across the buckets, on these rows."""
+    if rows is not None:
+        quantity, best_p, took_best = quantity[rows], best_p[rows], took_best[rows]
+    total, weight = 0., 0.
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        inside = (best_p >= lo) & (best_p < hi)
+        a, b = quantity[inside & took_best], quantity[inside & ~took_best]
+        if len(a) < 2 or len(b) < 2:
+            continue
+        var = a.var(ddof=1) / len(a) + b.var(ddof=1) / len(b)
+        if not var > 0:
+            continue
+        total += (b.mean() - a.mean()) / var
+        weight += 1 / var
+    return total / weight if weight else np.nan
+
+
+def groups_of(label):
+    """The rows belonging to each cluster, as a list to draw from."""
+    order = np.argsort(label, kind='stable')
+    starts = np.searchsorted(label[order], np.arange(label.max() + 1))
+    return [order[a:b] for a, b in zip(starts, np.append(starts[1:], len(order)))]
+
+
+def bootstrap(quantity, label, best_p, took_best, edges, draws=400, seed=0):
+    """The same estimator over resamples of whole clusters.
+
+    Resampling decisions says a kyoku's thirty decisions are thirty pieces of
+    evidence about its one outcome. Resampling kyoku says they are one, which
+    is what they are.
+    """
+    groups = groups_of(label)
+    rng = np.random.default_rng(seed)
+    out = np.empty(draws)
+    for d in range(draws):
+        pick = rng.integers(0, len(groups), len(groups))
+        out[d] = pooled(quantity, best_p, took_best, edges,
+                        np.concatenate([groups[i] for i in pick]))
+    return out
+
+
+def split(quantity, label):
+    """The variance inside a cluster and between clusters, as components.
+
+    Not the mean squares. The mean square between carries a cluster-size
+    multiple of the between variance *plus* the within variance, so reading
+    it as "how much is between" says half of pure noise is clustered. The
+    one-way random-effects estimator takes the within part back out.
+
+    `paid` must come back with nothing inside: gamma is 1 and every decision
+    in a kyoku is paid the same GRP delta. Anything else means the labels are
+    not the clusters they claim to be.
+    """
+    counts = np.bincount(label)
+    counts = counts[counts > 0]
+    _, inverse = np.unique(label, return_inverse=True)
+    means = np.bincount(inverse, weights=quantity) / counts
+    n, k = len(quantity), len(counts)
+    within = float(((quantity - means[inverse]) ** 2).sum() / max(n - k, 1))
+    msb = float((counts * (means - quantity.mean()) ** 2).sum() / max(k - 1, 1))
+    # The cluster size the mean square between is scaled by, which is the
+    # plain mean only when every cluster is the same size.
+    m0 = (n - (counts ** 2).sum() / n) / max(k - 1, 1) if k > 1 else float(n)
+    between = max(0., (msb - within) / m0) if m0 > 0 else 0.
+    return within, between, n / k
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--policy', required=True, help='the policy that played these games')
@@ -89,6 +157,7 @@ def main():
     ap.add_argument('--games', type=int, default=4000)
     ap.add_argument('--batch-size', type=int, default=256)
     ap.add_argument('--buckets', type=int, default=5)
+    ap.add_argument('--draws', type=int, default=400, help='cluster bootstrap replicates')
     ap.add_argument('--workers', type=int, default=2)
     ap.add_argument('--file-batch-size', type=int, default=4)
     ap.add_argument('--device', default=None)
@@ -113,15 +182,16 @@ def main():
     data = FileDatasetsIter(
         version=4, file_list=files, pts=list(config['env']['pts']),
         player_names=[args.player], file_batch_size=args.file_batch_size,
-        num_epochs=1, final_rank=True,
+        num_epochs=1, final_rank=True, decision_ids=True,
     )
     batches = DataLoader(dataset=data, batch_size=args.batch_size, drop_last=False,
                          num_workers=args.workers, pin_memory=True,
                          worker_init_fn=worker_init_fn)
 
-    best_p, took_best, paid, baseline = [], [], [], []
+    best_p, took_best, paid, baseline, cluster = [], [], [], [], []
     with torch.inference_mode():
-        for obs, actions, masks, steps_to_done, kyoku_rewards, _ranks, _final in batches:
+        for (obs, actions, masks, steps_to_done, kyoku_rewards, _ranks, _final,
+             game_id, kyoku_id, _index) in batches:
             obs = obs.to(dtype=torch.float32, device=device, non_blocking=True)
             actions = actions.to(dtype=torch.int64, device=device, non_blocking=True)
             masks = masks.to(dtype=torch.bool, device=device, non_blocking=True)
@@ -137,6 +207,10 @@ def main():
             # has run under, so it is the kyoku's own GRP delta.
             paid.append((kyoku_rewards.double() *
                          config['env']['gamma'] ** steps_to_done.double()).numpy())
+            # The kyoku a decision belongs to. Every decision in one shares a
+            # GRP delta, which is what makes them one observation rather than
+            # thirty.
+            cluster.append(np.stack((game_id.numpy(), kyoku_id.numpy()), axis=1))
     del batches
     if data.iterator is not None:
         data.iterator.close()
@@ -145,6 +219,12 @@ def main():
     took_best = np.concatenate(took_best)
     paid = np.concatenate(paid)
     baseline = np.concatenate(baseline)
+    cluster = np.concatenate(cluster)
+    # Contiguous labels to resample by: the kyoku, which is what shares a GRP
+    # delta, and the trajectory it sits in, which is the wider unit a
+    # robustness check uses.
+    _, by_kyoku = np.unique(cluster, axis=0, return_inverse=True)
+    _, by_game = np.unique(cluster[:, 0], return_inverse=True)
     n = len(paid)
     logging.info(f'{n:,} decisions, {1 - took_best.mean():.2%} of them not the argmax')
 
@@ -176,11 +256,31 @@ def main():
             print(f'{lo:>7.3f}-{hi:<8.3f} {inside.sum():>10,}  {len(b) / inside.sum():>7.1%}  '
                   f'{a.mean():>+10.4f}  {b.mean():>+10.4f}  {gap:>+10.4f} +-{se:.4f}')
         if weight:
-            gap, se = total / weight, weight ** -0.5
-            print(f'pooled within buckets: {gap:+.4f} +- {se:.4f} ({gap / se:+.1f} se)')
+            gap, flat = total / weight, weight ** -0.5
+            print(f'{"pooled, decisions iid":>21}: {gap:+.4f} +- {flat:.4f} '
+                  f'({gap / flat:+.1f} se) -- which they are not')
+            for unit, label in (('kyoku', by_kyoku), ('game', by_game)):
+                draws = bootstrap(quantity, label, best_p, took_best, edges, args.draws)
+                se = float(np.nanstd(draws, ddof=1))
+                lo, hi = np.nanpercentile(draws, [2.5, 97.5])
+                print(f'{"resampling " + unit + "s":>21}: {gap:+.4f} +- {se:.4f} '
+                      f'({gap / se:+.1f} se) [{lo:+.4f}, {hi:+.4f}], '
+                      f'{se / flat:.1f}x the error above')
+
+        within, between, m = split(quantity, by_kyoku)
+        total = within + between
+        share = within / total if total else float('nan')
+        deff = 1 + (m - 1) * (1 - share)
+        print(f'{"variance":>21}: {within:.4f} inside a kyoku, {between:.4f} between them '
+              f'({100 * share:.1f}% inside, {m:.1f} decisions each)')
+        print(f'{"so a batch of 256":>21}: carries {256 / deff:.0f} independent samples')
+
     print()
     print('negative means the sampled alternative was worth less than the argmax, '
           'which is the signal a policy gradient needs')
+    print('`paid` must be exactly flat inside a kyoku -- gamma is 1 and every decision in '
+          'one is paid the same GRP delta -- so anything but 0.0000 there means the '
+          'clusters are wrong and nothing else here can be trusted')
 
 
 if __name__ == '__main__':
