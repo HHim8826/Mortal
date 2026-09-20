@@ -177,7 +177,12 @@ def _state(version):
         # slower than ten workers taking one apiece.
         torch.set_num_threads(1)
         from libriichi.dataset import GameplayLoader
-        _LOADER = GameplayLoader(version=version, oracle=False)
+        # The challenger and nobody else. A log holds four seats and the
+        # loader encoded every observation of all of them so that three
+        # could be thrown away: 105 MiB of arrays per log where 26 was
+        # wanted, in every worker at once.
+        _LOADER = GameplayLoader(version=version, oracle=False,
+                                 player_names=[CHALLENGER])
         grp = GRP(**config['grp']['network'])
         grp.load_state_dict(torch.load(config['grp']['state_file'],
                                        weights_only=True, map_location='cpu')['model'])
@@ -202,10 +207,11 @@ def _measure_job(job):
     one, other = read(base_dir, name), read(fork_dir, name)
     if target is None:
         return name, dict(witness=same_play(one, other))
-    loader, reward = _state(version)
+    _, reward = _state(version)
+    from libriichi.dataset import Grp
     seat, k = target['seat'], target['kyoku']
-    base = outcomes(seat, decoded(loader, one, seat), reward)
-    fork = outcomes(seat, decoded(loader, other, seat), reward)
+    base = outcomes(seat, Grp.load_log(one), reward)
+    fork = outcomes(seat, Grp.load_log(other), reward)
     return name, dict(
         forked_at=first_divergence(one, other),
         kyoku_base=float(base['kyoku_delta'][k]),
@@ -395,8 +401,14 @@ def pick_target(log, seat, game, rng, pick='deviation', rule='sampled'):
         cheap=cheap_of(obs[i]), full=full_of(obs[i], masks[i]),
     )
 
-def outcomes(seat, game, reward_calc):
+def outcomes(seat, grp, reward_calc):
     """What the hanchan paid this seat, per kyoku and at the end.
+
+    Takes the GRP record rather than a decoded game, because that is all it
+    reads and the difference is most of this program. Decoding replays the
+    hanchan and encodes a 1012x34 observation for every decision in it, none
+    of which is used here; `Grp.load_log` builds the same record without
+    any of that. Measured on a real log, same dict out, 63 times faster.
 
     The placement comes from the engine, not from counting who scored more.
     Two seats can finish level and the engine still ranks them, by where they
@@ -406,7 +418,6 @@ def outcomes(seat, game, reward_calc):
     also the ranking `calc_delta_pt` is already being handed on the line
     above, so taking it from anywhere else was two answers to one question.
     """
-    grp = game.take_grp()
     rank_by_player = grp.take_rank_by_player()
     deltas = reward_calc.calc_delta_pt(seat, grp.take_feature(), rank_by_player)
     final = np.asarray(grp.take_final_scores())
