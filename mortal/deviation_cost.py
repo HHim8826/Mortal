@@ -195,8 +195,23 @@ def decoded(loader, log, seat):
     games = loader.load_logs([log])[0]
     return next(g for g in games if g.take_player_id() == seat)
 
-def pick_target(log, seat, game, rng):
-    """One decision to fork, drawn where deviations actually happen.
+# Which action to put in the argmax's place. `sampled` is what sampling
+# would really have drawn, and answers what deviating costs. The rest are
+# places in the policy's own ordering, and answer a different question: is
+# that ordering right? `argmax` replaces the best action with itself, so it
+# must come out at exactly zero -- the null this whole apparatus is checked
+# against.
+RULES = ('sampled', 'argmax', 'rank2', 'median', 'worst')
+
+def pick_target(log, seat, game, rng, pick='deviation', rule='sampled'):
+    """One decision to fork, and what to play there instead.
+
+    `pick` is how the decision is drawn. `deviation` weights it by
+    `1 - p(argmax)`, so the measurement lands where deviations really happen
+    and says what sampling costs. `uniform` draws evenly over every decision
+    with a choice in it, which is what comparing rules needs: the rules are
+    only comparable if they are answered on the same states, and weighting by
+    how unsure the policy is would hand each rule a different population.
 
     None for a hanchan the policy was never given a real choice in.
     """
@@ -216,23 +231,44 @@ def pick_target(log, seat, game, rng):
         p /= p.sum()
         best = int(p.argmax())
         off = 1. - p[best]
-        if off <= 1e-9:
+        if pick == 'deviation' and off <= 1e-9:
             continue
         rows.append((i, ids, p, best, off))
     if not rows:
         return None
 
-    weights = np.array([r[4] for r in rows])
+    weights = (np.array([r[4] for r in rows]) if pick == 'deviation'
+               else np.ones(len(rows)))
+    if not weights.sum():
+        return None
     i, ids, p, best, off = rows[rng.choice(len(rows), p=weights / weights.sum())]
-    # The replacement, drawn from the policy's own distribution with its best
-    # action taken out: exactly the draw that produces a deviation.
-    rest = p.copy()
-    rest[best] = 0.
-    rest /= rest.sum()
-    alt = int(rng.choice(len(ids), p=rest))
+    order = np.argsort(-p, kind='stable')
+    match rule:
+        case 'sampled':
+            # What sampling would really have drawn: the policy's own
+            # distribution with its best action taken out.
+            rest = p.copy()
+            rest[best] = 0.
+            if not rest.sum():
+                return None
+            alt = int(rng.choice(len(ids), p=rest / rest.sum()))
+        case 'argmax':
+            alt = int(order[0])
+        case 'rank2':
+            alt = int(order[1])
+        case 'median':
+            alt = int(order[len(order) // 2])
+        case 'worst':
+            alt = int(order[-1])
+        case _:
+            raise ValueError(f'unknown rule {rule!r}')
     return dict(
-        index=int(i), kyoku=int(at_kyoku[i]),
+        index=int(i), kyoku=int(at_kyoku[i]), rule=rule,
         argmax=int(ids[best]), forced=int(ids[alt]),
+        # Where the forced action sits in the policy's ordering, and how many
+        # it was chosen from. `median` and `worst` are the same action in a
+        # two-way choice, and this is what says so afterwards.
+        forced_rank=int(np.flatnonzero(order == alt)[0]), legal=len(ids),
         p_argmax=float(p[best]), p_forced=float(p[alt]), p_deviate=float(off),
         deviations_expected=float(sum(r[4] for r in rows)), decisions=len(rows),
         cheap=cheap_of(obs[i]), full=full_of(obs[i], masks[i]),
@@ -285,6 +321,15 @@ def main():
     ap.add_argument('--amp', action='store_true',
                     help='play in half precision, as the workers do. Off by default '
                          'here: see the note on Forcer')
+    ap.add_argument('--pick', default='deviation', choices=('deviation', 'uniform'),
+                    help='how the decision to fork is drawn. deviation weights it by '
+                         '1 - p(argmax) and measures what sampling costs; uniform draws '
+                         'evenly and is what comparing --force rules needs')
+    ap.add_argument('--force', default='sampled',
+                    help='comma separated rules from ' + ','.join(RULES) + ', cycled '
+                         'over the hanchans of a block so every rule meets the same '
+                         'states. argmax replaces the best action with itself and must '
+                         'come out at exactly zero')
     ap.add_argument('--keep-logs', action='store_true',
                     help='leave each block behind instead of overwriting it')
     args = ap.parse_args()
@@ -310,6 +355,11 @@ def main():
     reward_calc = RewardCalculator(grp, config['env']['pts'])
 
     os.makedirs(args.out, exist_ok=True)
+    rules = args.force.split(',')
+    for rule in rules:
+        if rule not in RULES:
+            raise SystemExit(f'unknown --force rule {rule!r}: expected {", ".join(RULES)}')
+    logging.info(f'picking decisions {args.pick}ly, forcing {"/".join(rules)}')
     rng = np.random.default_rng(args.rng)
     rows, identical, changed, witnesses, mismatched = [], 0, 0, [], []
 
@@ -335,7 +385,8 @@ def main():
                 continue
             log = read(base_dir, name)
             seat = seat_of(log)
-            target = pick_target(log, seat, decoded(loader, log, seat), rng)
+            target = pick_target(log, seat, decoded(loader, log, seat), rng,
+                                 args.pick, rules[n % len(rules)])
             if target is None:
                 continue
             target['seat'] = seat
@@ -397,9 +448,10 @@ def main():
             k = t['kyoku']
             rows.append(dict(
                 block=block, log=name,
-                **{x: t[x] for x in ('index', 'kyoku', 'seat', 'argmax', 'forced',
-                                     'p_argmax', 'p_forced', 'p_deviate',
-                                     'deviations_expected', 'decisions')},
+                **{x: t[x] for x in ('index', 'kyoku', 'seat', 'rule', 'argmax',
+                                     'forced', 'forced_rank', 'legal', 'p_argmax',
+                                     'p_forced', 'p_deviate', 'deviations_expected',
+                                     'decisions')},
                 was=forcer.fired[name]['was'], forked_at=forked_at,
                 kyoku_base=float(out_b['kyoku_delta'][k]),
                 kyoku_fork=(float(out_f['kyoku_delta'][k])
@@ -466,8 +518,31 @@ def report(rows, identical, changed, mismatched, args):
 
     print(f'{len(rows):,} forced deviations, one per hanchan, each against the same wall '
           'played by the same policy taking its argmax')
+
+    by_rule = {}
+    for row in rows:
+        by_rule.setdefault(row.get('rule', 'sampled'), []).append(row)
+    if len(by_rule) > 1:
+        print()
+        print("the kyoku's GRP delta, by which action was put in the argmax's place")
+        print(f'{"":>10}  {"decisions":>9}  {"rank":>5}  {"p(forced)":>9}  {"effect":>20}')
+        for rule in RULES:
+            here = by_rule.get(rule)
+            if not here:
+                continue
+            x = np.array([r['kyoku_fork'] - r['kyoku_base'] for r in here], float)
+            x = x[np.isfinite(x)]
+            se = x.std(ddof=1) / np.sqrt(len(x)) if len(x) > 1 else float('nan')
+            where = np.mean([r['forced_rank'] for r in here])
+            chance = np.mean([r['p_forced'] for r in here])
+            print(f'{rule:>10}  {len(here):>9,}  {where:>5.1f}  {chance:>9.3f}  '
+                  f'{x.mean():>+9.4f} +- {se:.4f}')
+        if 'argmax' in by_rule:
+            print('argmax replaces the best action with itself, so anything but a row of '
+                  'zeros there means the apparatus is measuring something it should not')
+
     print()
-    print('what the one deviation changed')
+    print('what the one deviation changed, over every rule together')
     line("the kyoku's GRP delta", kyoku[np.isfinite(kyoku)])
     line('the hanchan, in pt', pts)
     line('the hanchan, in placement', rank)
