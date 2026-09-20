@@ -343,6 +343,7 @@ def main():
             forcer.arm(target['cheap'], target['full'], target['forced'], name)
 
         play(forcer, champion, (first, args.key), args.seeds, fork_dir)
+        mismatched_before = len(mismatched)
         # The alignment between a log's events and the instances decoded from
         # it walks a cursor, and a declined call leaves no event to move it:
         # a pass and a later pon can carry the same legal-action mask, and the
@@ -412,9 +413,9 @@ def main():
                      f'hanchans identical, {changed:,} not, {forcer.collisions} '
                      'fingerprint collisions')
         save(rows, identical, changed, len(mismatched), args)
-        if mismatched:
-            logging.warning(f'block {block}: dropped {len(mismatched)} targets whose '
-                            'logits belong to another decision')
+        if new_mismatches := len(mismatched) - mismatched_before:
+            logging.warning(f'block {block}: dropped {new_mismatches} targets whose '
+                            f'logits belong to another decision ({len(mismatched)} so far)')
         if missed:
             logging.warning(f'block {block}: dropped {len(missed)} of '
                             f'{len(missed) + len(targets)} targets that never came round')
