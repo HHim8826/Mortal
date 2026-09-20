@@ -175,7 +175,20 @@ def main():
 
     stats, started = {}, time.time()
     for step in range(1, args.steps + 1):
-        obs, actions, masks, steps_to_done, kyoku_rewards, _ranks, _final = next(loader)
+        try:
+            obs, actions, masks, steps_to_done, kyoku_rewards, _ranks, _final = next(loader)
+        except StopIteration:
+            # The loader stops when a whole pass over the corpus gave nothing.
+            # Reaching it on the first step means the data never had anything
+            # for this run; later, that the corpus is smaller than --steps
+            # asked for, which is worth saying rather than ending on a bare
+            # StopIteration.
+            raise SystemExit(
+                f'the corpus ran out at step {step:,} of {args.steps:,}. '
+                'If nothing was trained on at all, the row groups decoded but the '
+                'player filter kept none of them: check '
+                "config['dataset']['player_names_files'] against the names in these "
+                'logs, and the decode warnings above.')
         obs = obs.to(dtype=torch.float32, device=device, non_blocking=True)
         actions = actions.to(dtype=torch.int64, device=device, non_blocking=True)
         masks = masks.to(dtype=torch.bool, device=device, non_blocking=True)

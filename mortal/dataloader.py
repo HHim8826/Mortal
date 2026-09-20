@@ -94,8 +94,30 @@ class FileDatasetsIter(IterableDataset):
 
         for _ in range(self.num_epochs):
             yield from self.load_files(self.augmented_first)
+            produced = self.produced
             if self.enable_augmentation:
                 yield from self.load_files(not self.augmented_first)
+                produced += self.produced
+            if not produced:
+                # A pass that produced nothing will produce nothing again: the
+                # same files, the same filter, the same decoder. The online
+                # trainers ask for a million epochs, which turns a
+                # configuration mistake -- a player filter matching no one, a
+                # shard that decodes to nothing -- into a run that reads the
+                # corpus a million times and never takes a step, with no
+                # error and no checkpoint. This is the gap aa3da2b closed for
+                # tenpai training, in the other loop.
+                #
+                # A worker handed an empty slice arrives here too, which is
+                # how it should end: `worker_init_fn` divides the file list by
+                # ceiling, so with fewer files than workers the last ones get
+                # nothing and have nothing to wait for.
+                logging.warning(
+                    f'{len(self.file_list):,} files gave no usable samples; stopping '
+                    'rather than reading them again. If this is the whole dataset '
+                    'rather than one empty worker, check the player filter and the '
+                    'decode warnings above.')
+                return
 
     def load_files(self, augmented):
         # shuffle the file list for each epoch
@@ -109,8 +131,13 @@ class FileDatasetsIter(IterableDataset):
             augmented = augmented,
         )
         self.buffer = []
+        # Counted per pass rather than per item: an epoch that yields nothing
+        # has to be noticed, and paying for that once a batch rather than once
+        # a decision keeps it off the loader's hot path.
 
+        self.produced = 0
         for entries in self.decoded_ahead(self.iter_batches()):
+            self.produced += len(entries)
             old_buffer_size = len(self.buffer)
             self.buffer.extend(entries)
             buffer_size = len(self.buffer)
