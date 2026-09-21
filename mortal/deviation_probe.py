@@ -104,18 +104,29 @@ def ridge(x, y, alpha, free=2):
     return np.linalg.solve(x.T @ x + np.diag(pen), x.T @ y)
 
 
-def fit_and_predict(train, test, data, rank, alpha):
+def prepare(train, test, data, rank):
+    """The part of a fold that does not depend on how hard it is regularised.
+
+    The basis comes from the training fold only -- fitting it on everything
+    would let the test rows shape their own features -- and it costs an SVD
+    of the whole fold, so it is built once and every alpha reuses it.
+    """
     phi = data['phi']
     gap = np.log(np.maximum(data['p_forced'], 1e-12)) - np.log(data['p_argmax'])
     mean, sd = phi[train].mean(0), phi[train].std(0) + 1e-6
-    # The basis comes from the training fold only; fitting it on everything
-    # would let the test rows shape their own features.
-    u, s, vt = np.linalg.svd((phi[train] - mean) / sd, full_matrices=False)
-    basis = vt[:rank].T
+    basis = np.linalg.svd((phi[train] - mean) / sd, full_matrices=False)[2][:rank].T
     build = lambda m: design(phi[m], data['argmax'][m], data['forced'][m], gap[m],
                              basis, mean, sd, rank)
-    beta = ridge(build(train), data['label'][train], alpha)
-    return build(test) @ beta
+    xtr, xte = build(train), build(test)
+    # And the normal equations, which do not depend on alpha either.
+    return xtr.T @ xtr, xtr.T @ data['label'][train], xte
+
+
+def fit_and_predict(prepared, alpha, free=2):
+    gram, rhs, xte = prepared
+    pen = np.full(gram.shape[0], alpha)
+    pen[:free] = 0.
+    return xte @ np.linalg.solve(gram + np.diag(pen), rhs)
 
 
 def value_of_following(pred, label, thresholds=(0., .02, .05, .1)):
@@ -146,7 +157,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('features', nargs='+')
     ap.add_argument('--rank', type=int, default=DEFAULT_RANK)
-    ap.add_argument('--alpha', type=float, nargs='+', default=[30., 100., 300., 1000., 3000.])
+    ap.add_argument('--alpha', type=float, nargs='+', default=[1e3, 1e4, 1e5, 1e6, 1e7, 1e8])
     ap.add_argument('--folds', type=int, default=5)
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
@@ -163,24 +174,30 @@ def main():
     rng = np.random.default_rng(args.seed)
     parts = folds(data['block'], args.folds, rng)
 
-    print(f'\n=== out of sample, {len(parts)} folds split by block ===')
-    print(f"{'alpha':>8} {'R^2 vs mean':>12} {'R^2 vs logit gap':>17} {'corr':>7}")
+    # The one number the policy already exposes, fitted the same way, is what
+    # the probe has to beat. Infinite regularisation turns the probe into
+    # exactly this, so it is the benchmark and the floor at once -- which is
+    # why the alpha grid has to run high enough to approach it.
+    base = np.zeros(n)
+    for test in parts:
+        x = np.column_stack([np.ones((~test).sum()), gap[~test]])
+        b = np.linalg.lstsq(x, y[~test], rcond=None)[0]
+        base[test] = np.column_stack([np.ones(test.sum()), gap[test]]) @ b
+    bench = 1 - ((y - base) ** 2).sum() / ((y - y.mean()) ** 2).sum()
+    print(f'\nthe logit gap alone, out of sample: R^2 {bench:+.5f}')
+
+    print(f'\n=== out of sample, {len(parts)} folds split by block, rank {args.rank} ===')
+    print(f"{'alpha':>10} {'R^2 vs mean':>12} {'R^2 vs logit gap':>17} {'corr':>7}")
+    ready = [prepare(~test, test, data, args.rank) for test in parts]
     best, best_pred = None, None
     for alpha in args.alpha:
         pred = np.zeros(n)
-        for test in parts:
-            pred[test] = fit_and_predict(~test, test, data, args.rank, alpha)
-        # The two things worth beating: predicting the mean, and predicting
-        # from the one number the policy already exposes.
-        base = np.zeros(n)
-        for test in parts:
-            x = np.column_stack([np.ones((~test).sum()), gap[~test]])
-            b = np.linalg.lstsq(x, y[~test], rcond=None)[0]
-            base[test] = np.column_stack([np.ones(test.sum()), gap[test]]) @ b
+        for test, got in zip(parts, ready):
+            pred[test] = fit_and_predict(got, alpha)
         r2 = 1 - ((y - pred) ** 2).sum() / ((y - y.mean()) ** 2).sum()
         r2b = 1 - ((y - pred) ** 2).sum() / ((y - base) ** 2).sum()
         c = np.corrcoef(pred, y)[0, 1]
-        print(f'{alpha:>8.0f} {r2:>12.5f} {r2b:>17.5f} {c:>7.4f}')
+        print(f'{alpha:>10.0f} {r2:>12.5f} {r2b:>17.5f} {c:>7.4f}')
         if best is None or r2 > best[1]:
             best, best_pred = (alpha, r2), pred.copy()
 
