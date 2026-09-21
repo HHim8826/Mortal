@@ -44,6 +44,7 @@ class FileDatasetsIter(IterableDataset):
         skip_rewards = False,
         param_version = False,
         decision_ids = False,
+        wall_ids = False,
     ):
         super().__init__()
         self.version = version
@@ -82,6 +83,14 @@ class FileDatasetsIter(IterableDataset):
         # already leaked; and any return that walks forward -- TD(lambda),
         # GAE -- needs the order the shuffle threw away.
         self.decision_ids = decision_ids
+        # The hanchan a decision came from, without the seat. `decision_ids`
+        # names a trajectory, which is the (game, player) pair, and that is
+        # what a policy gradient needs -- but it is the wrong thing to
+        # cluster a standard error by. Four seats share one deal, so treating
+        # them as four groups counts 1,359 hanchans as 5,436 independent
+        # draws. Appended last, after the decision ids, so nothing that
+        # unpacks those by position has to change.
+        self.wall_ids = wall_ids
         self.iterator = None
 
     def build_iter(self):
@@ -285,6 +294,7 @@ class FileDatasetsIter(IterableDataset):
                 # One file holds one log and up to four seats of it, so the
                 # trajectory is the pair, not the file.
                 game_id = digest64(f'{game_key}#{player_id}') if self.decision_ids else 0
+                wall_id = digest64(f'{game_key}') if self.wall_ids else 0
 
                 game_size = len(obs)
                 if game_size == 0:
@@ -343,6 +353,9 @@ class FileDatasetsIter(IterableDataset):
                     if self.decision_ids:
                         # Last, for the reason the two above are appended.
                         entry += [game_id, int(at_kyoku[i]), i]
+                    if self.wall_ids:
+                        # After those, so decision ids keep their positions.
+                        entry.append(wall_id)
                     entries.append(entry)
         return entries
 

@@ -113,7 +113,10 @@ def score(loaded, file_list, device, version, batches, file_batch):
         # games at once and take the machine down. `make_holdout` writes
         # small groups and this stays small to match.
         file_batch_size=file_batch,
-        reserve_ratio=0., parquet=True, player_names=[], decision_ids=True,
+        # The wall, not the trajectory. `decision_ids` names (game, seat),
+        # and the four seats of one hanchan share its deal, so clustering on
+        # that counts one hanchan as four independent groups.
+        reserve_ratio=0., parquet=True, player_names=[], wall_ids=True,
         num_epochs=1, enable_augmentation=False, augmented_first=False)
     loader = DataLoader(
         dataset=data, batch_size=config['control']['batch_size'],
@@ -128,7 +131,7 @@ def score(loaded, file_list, device, version, batches, file_batch):
             if batches and i >= batches:
                 break
             obs, actions, masks, steps_to_done, kyoku_rewards, ranks = batch[:6]
-            games = batch[6]
+            games = batch[6]      # the wall, one per hanchan
             obs = obs.to(dtype=torch.float32, device=device)
             actions = actions.to(dtype=torch.int64, device=device)
             masks = masks.to(dtype=torch.bool, device=device)

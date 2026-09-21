@@ -37,7 +37,7 @@ class TestPlayer:
         stable_dqn = head_for(kind, version=version).eval()
         stable_mortal.load_state_dict(state['mortal'])
         stable_dqn.load_state_dict(head_state(kind, state))
-        if baseline_cfg['enable_compile']:
+        if baseline_cfg.get('enable_compile', False):
             stable_mortal.compile()
             stable_dqn.compile()
 
@@ -55,6 +55,14 @@ class TestPlayer:
         self.log_dir = path.abspath(config['test_play']['log_dir'])
         self.rank = rank
         self.world_size = world_size
+        # The walls a test play deals. Fixed, because a run's numbers are only
+        # a series if every point is the same games -- but fixed across a whole
+        # project is also how selecting the best of many evaluations becomes
+        # selection against one wall set. A comparison that wants fresh walls
+        # sets these; both arms still share them, which is where the pairing
+        # comes from.
+        self.seed_base = 10000
+        self.seed_key = 0x2000
 
     def test_play(self, seed_count, mortal, dqn, device):
         self.clear()
@@ -74,7 +82,7 @@ class TestPlayer:
             shutil.rmtree(self.track_dir(track))
 
     def seeds(self, seed_count):
-        """This rank's contiguous slice of [10000, 10000 + seed_count).
+        """This rank's contiguous slice of [seed_base, seed_base + seed_count).
 
         The slices tile the range exactly, so every world size plays the same
         games and the numbers stay comparable across runs.
@@ -82,7 +90,7 @@ class TestPlayer:
         per_rank = seed_count // self.world_size
         first = self.rank * per_rank
         last = seed_count if self.rank == self.world_size - 1 else first + per_rank
-        return 10000 + first, last - first
+        return self.seed_base + first, last - first
 
     def play(self, seed_count, mortal, dqn, device, track=None):
         self.play_all(seed_count, [(mortal, dqn, track)], device)
@@ -152,7 +160,7 @@ class TestPlayer:
             env.py_vs_py(
                 challenger = engine_chal,
                 champion = self.baseline_engine,
-                seed_start = (first, 0x2000),
+                seed_start = (first, self.seed_key),
                 seed_count = count,
             )
 
@@ -224,7 +232,7 @@ class TrainPlayer:
         stable_dqn = head_for(kind, version=version).eval()
         stable_mortal.load_state_dict(state['mortal'])
         stable_dqn.load_state_dict(head_state(kind, state))
-        if baseline_cfg['enable_compile']:
+        if baseline_cfg.get('enable_compile', False):
             stable_mortal.compile()
             stable_dqn.compile()
 

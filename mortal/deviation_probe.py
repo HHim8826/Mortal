@@ -19,10 +19,14 @@ on part of the data and asked, on the part it has never seen, which
 deviations it thinks are improvements. Following that advice means playing
 the forced action at those decisions and the argmax everywhere else, and the
 value of doing so is just the mean of the measured causal advantages over
-the decisions it picked -- an unbiased estimate, because the picking used no
-information from the labels being averaged. A probe that has found real
-headroom comes out positive. A probe that is fitting noise comes out at
-zero, which is what the current policy already gets.
+the decisions it picked. For one fixed setting that average is unbiased --
+no row's prediction ever saw its own label. Choosing the setting is a
+separate matter: reading every alpha's out-of-sample score and reporting
+the best one has read the labels being averaged, and is optimistic by
+however wide the scan was. So every alpha's gain is printed and none is
+called the answer. A probe that has found real headroom is positive down
+the column; one that is fitting noise sits at zero, which is what the
+current policy already gets.
 
     python deviation_probe.py /root/eval/deviation/*/features.npz
 """
@@ -151,9 +155,16 @@ def full_probe(data, parts, alphas):
     direction that carries "this action is better than the head thinks" is a
     high-variance one. In the dual form the rank cap disappears: the design
     is [state | state x action pair] over all 1024 dimensions, and its Gram
-    matrix is the states' Gram times one plus their action overlap. What the
-    logit gap already explains is taken out first, so what is left for the
-    kernel is exactly what the head misses.
+    matrix is the states' Gram times one plus their action overlap.
+
+    The intercept and the logit gap stay unpenalised, exactly as in the
+    primal version, and that is not the same thing as fitting them first and
+    handing the kernel the leftovers -- the trunk features and the logit gap
+    come from the same trunk and are not orthogonal, so a two-step fit
+    solves a different problem. Since there are only two free columns the
+    exact joint solution is cheap: with `A = K + alpha I`, stationarity in
+    the free block gives `(X' A^-1 X) b = X' A^-1 y`, a 2x2 system, and the
+    dual weights are then `A^-1 (y - X b)`.
     """
     phi, y = data['phi'], data['label']
     gap = np.log(np.maximum(data['p_forced'], 1e-12)) - np.log(data['p_argmax'])
@@ -165,15 +176,18 @@ def full_probe(data, parts, alphas):
         mean, sd = phi[train].mean(0), phi[train].std(0) + 1e-6
         z = ((phi - mean) / sd).astype(np.float64)
         x = np.column_stack([np.ones(n), gap])
-        b = np.linalg.lstsq(x[train], y[train], rcond=None)[0]
-        base, resid = x @ b, y - x @ b
         ktr = (z[train] @ z[train].T) * (1 + overlap(am[train], fo[train],
                                                      am[train], fo[train]))
         kte = (z[test] @ z[train].T) * (1 + overlap(am[train], fo[train],
                                                     am[test], fo[test]))
+        xtr, ytr = x[train], y[train].astype(np.float64)
         for alpha in alphas:
-            c = np.linalg.solve(ktr + alpha * np.eye(len(ktr)), resid[train])
-            out[alpha][test] = base[test] + kte @ c
+            a = ktr + alpha * np.eye(len(ktr))
+            solved = np.linalg.solve(a, np.column_stack([xtr, ytr]))
+            ainv_x, ainv_y = solved[:, :xtr.shape[1]], solved[:, -1]
+            beta = np.linalg.solve(xtr.T @ ainv_x, xtr.T @ ainv_y)
+            c = ainv_y - ainv_x @ beta
+            out[alpha][test] = x[test] @ beta + kte @ c
         del ktr, kte, z
     return out
 
@@ -260,12 +274,26 @@ def main():
         if best is None or r2 > best[1]:
             best, best_pred = (alpha, r2), pred.copy()
 
-    print(f'\n=== what following the best probe (alpha={best[0]:.0f}) would have been worth ===')
-    print(f'{"threshold":>10} {"switched":>9} {"share":>7} '
+    print()
+    print('=== what following the probe would have been worth, at every alpha ===')
+    print("For one fixed alpha the average is unbiased: no row's prediction ever saw")
+    print('its own label. Picking the best row of this table is not -- that choice')
+    print('reads the labels being averaged, and is optimistic by however wide the')
+    print('scan was. So no row here is "the" answer: a probe that found real headroom')
+    print('is positive down the column, not in one cell of it.')
+    print(f'{"alpha":>10} {"threshold":>10} {"switched":>9} {"share":>7} '
           f'{"gain per decision, GRP":>27}')
-    for t, k, share, per, se in value_of_following(best_pred, y):
-        flag = '' if se == 0 else f'  ({per / se:+.1f} se)'
-        print(f'{t:>10.2f} {k:>9,} {share:>6.1f}% {per:>+16.5f} +-{se:.5f}{flag}')
+    for alpha in args.alpha:
+        if every is not None:
+            pred = every[alpha]
+        else:
+            pred = np.zeros(n)
+            for test, got in zip(parts, ready):
+                pred[test] = fit_and_predict(got, alpha)
+        for t, k, share, per, se in value_of_following(pred, y):
+            flag = '' if se == 0 else f'  ({per / se:+.1f} se)'
+            print(f'{alpha:>10.0f} {t:>10.2f} {k:>9,} {share:>6.1f}% '
+                  f'{per:>+16.5f} +-{se:.5f}{flag}')
 
     print('\nfor comparison, the same selection rule on the labels themselves '
           '-- the ceiling no probe can pass')

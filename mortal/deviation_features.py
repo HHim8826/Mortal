@@ -58,13 +58,15 @@ def _feature_job(job):
     log = read(base_dir, name)
     seat = seat_of(log)
     target = pick_target(log, seat, decoded(loader, log, seat),
-                         np.random.default_rng(seed), pick, rule, only)
+                         np.random.default_rng(seed), pick, rule, only,
+                         want_state=True)
     if target is None:
         return name, None, None, None
-    game = decoded(loader, log, seat)
-    i = target['index']
-    obs = np.asarray(game.take_obs()[i], dtype=np.float32)
-    mask = np.asarray(game.take_masks()[i], dtype=bool)
+    # The state comes back with the target. Decoding the log a second time
+    # to fetch it cost as much again as the pick did -- a full native
+    # encode of every observation in the hanchan, to keep one of them.
+    obs = np.asarray(target.pop('obs'), dtype=np.float32)
+    mask = np.asarray(target.pop('mask'), dtype=bool)
     target['seat'] = seat
     return name, target, obs, mask
 

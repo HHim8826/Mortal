@@ -247,7 +247,7 @@ def spread(pool, fn, jobs):
         return [fn(job) for job in jobs]
     return pool.map(fn, jobs, chunksize=8)
 
-def assign_rules(names, rules, witness_every, rng):
+def assign_rules(names, rules, witness_every, rng, slot=0):
     """Which rule each hanchan gets, and which are left alone as witnesses.
 
     One wall is played four times with the challenger in each seat, and the
@@ -266,12 +266,18 @@ def assign_rules(names, rules, witness_every, rng):
     one. A wall holds four hanchans, so restarting it meant a fifth rule was
     never reached at all: asking for all five ran a whole evaluation that
     measured four of them and said nothing about the fifth.
+
+    It has to run across the blocks too, which is why `slot` comes in and
+    goes back out. Moving the reset from each wall to each call fixed the
+    four-hanchan wall and left the same hole one loop out: `main` calls this
+    once a block, so `--seeds 1 --blocks 100` is a hundred blocks of four
+    slots each and the fifth rule is still never reached, however many
+    blocks are run.
     """
     walls = defaultdict(list)
     for name in names:
         walls[name.rsplit('_', 1)[0]].append(name)
     assigned, witnesses = {}, set()
-    slot = 0
     for wall in sorted(walls):
         members = sorted(walls[wall])
         for which in rng.permutation(len(members)):
@@ -281,7 +287,7 @@ def assign_rules(names, rules, witness_every, rng):
             else:
                 assigned[name] = rules[slot % len(rules)]
             slot += 1
-    return assigned, witnesses
+    return assigned, witnesses, slot
 
 def play(challenger, champion, seed_start, seed_count, log_dir):
     """One block of seeds, four hanchans each, into a directory of its own."""
@@ -348,7 +354,8 @@ def decoded(loader, log, seat):
 # against.
 RULES = ('sampled', 'argmax', 'rank2', 'median', 'worst')
 
-def pick_target(log, seat, game, rng, pick='deviation', rule='sampled', only='all'):
+def pick_target(log, seat, game, rng, pick='deviation', rule='sampled', only='all',
+                want_state=False):
     """One decision to fork, and what to play there instead.
 
     `pick` is how the decision is drawn. `deviation` weights it by
@@ -428,6 +435,13 @@ def pick_target(log, seat, game, rng, pick='deviation', rule='sampled', only='al
         deviations_expected=float(sum(r[4] for r in rows)), decisions=len(rows),
         candidates=len(here),
         cheap=cheap_of(obs[i]), full=full_of(obs[i], masks[i]),
+        # `take_obs` moves the arrays out of the game, so a caller that
+        # wants the chosen state back cannot decode again cheaply -- it
+        # would pay a second full native encode of the whole hanchan, which
+        # measured 1.23 s against 0.51 s. Off by default: the measuring run
+        # sends targets through a worker pool and a v4 observation is
+        # 1012x34, which is not worth pickling when nothing reads it.
+        **(dict(obs=obs[i], mask=masks[i]) if want_state else {}),
     )
 
 def outcomes(seat, grp, reward_calc):
@@ -534,6 +548,7 @@ def main():
                  f'forcing {"/".join(rules)}')
     rows, identical, changed, witnesses, mismatched = [], 0, 0, [], []
     rejected = 0
+    slot = 0
 
     for block in range(args.blocks):
         first = args.seed_start + block * args.seeds
@@ -551,8 +566,13 @@ def main():
         forcer = Forcer(engine(CHALLENGER))
         assigned = {}
         if args.per_hanchan >= 1:
-            assigned, _ = assign_rules(names, rules, args.witness_every,
-                                       np.random.default_rng([args.rng, block, 1]))
+            # `slot` carries over: a block holds `seeds` walls of four
+            # hanchans, so with one wall a block and five rules, restarting
+            # it here would leave the fifth unassigned no matter how many
+            # blocks run.
+            assigned, _, slot = assign_rules(names, rules, args.witness_every,
+                                             np.random.default_rng([args.rng, block, 1]),
+                                             slot)
         # `digest64` is signed, for the tensor it usually ends up in; a seed
         # has to be non-negative.
         wanted = [(version, base_dir, name,
@@ -736,7 +756,15 @@ def report(rows, identical, changed, mismatched, rejected, args):
     # other rule the action did; multiplying by the deviation count then
     # answers no question at all, and on synthetic rows it comes out the
     # wrong sign. So it is not printed.
-    if args.pick == 'deviation' and set(by_rule) == {'sampled'}:
+    # `only` has to be in this test as much as `pick` and `rule` do. The
+    # extrapolation multiplies a measured per-deviation cost by the whole
+    # hanchan's deviation mass, and a sliced run has only measured one kind
+    # of decision: draw from calls alone and the discards contribute their
+    # mass to the multiplier while contributing nothing to the estimate, so
+    # the product is not the cost of sampling end to end and is not
+    # identified from this data at all.
+    sliced = getattr(args, 'only', 'all') != 'all'
+    if args.pick == 'deviation' and set(by_rule) == {'sampled'} and not sliced:
         # Per hanchan, not per average hanchan: each game's own deviation
         # count times its own measured cost. Multiplying the two averages
         # would assume a game's deviation rate says nothing about what its
@@ -747,6 +775,11 @@ def report(rows, identical, changed, mismatched, rejected, args):
         print('phase 2 measured that at -1.13 +- 1.53 pt. They are different experiments '
               '-- that one sampled every decision, this one forces a single deviation '
               'onto an argmax line -- so they should agree in sign and order, not exactly')
+    elif sliced:
+        print(f'what sampling costs end to end is not estimated here and is not '
+              f'identified by this run: only {args.only} decisions were drawn from, '
+              f'so the decisions outside that slice carry deviation mass this data '
+              f'says nothing about')
     else:
         print('what that costs end to end is not estimated here: it needs the decision '
               'drawn by how likely a deviation was and the action drawn as sampling '
