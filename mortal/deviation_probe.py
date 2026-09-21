@@ -129,6 +129,55 @@ def fit_and_predict(prepared, alpha, free=2):
     return xte @ np.linalg.solve(gram + np.diag(pen), rhs)
 
 
+def overlap(a_tr, f_tr, a_te, f_te):
+    """How much two decisions' action pairs have in common.
+
+    The interaction block puts `+z` in the forced action's slot and `-z` in
+    the argmax's, so the inner product between two rows of it is the states'
+    inner product times this: +1 for each end that agrees, -1 for each end
+    that agrees with the other's opposite. Writing it out means the kernel
+    never has to build the 47,104 columns it stands for.
+    """
+    return ((f_te[:, None] == f_tr[None, :]).astype(np.int8)
+            + (a_te[:, None] == a_tr[None, :])
+            - (f_te[:, None] == a_tr[None, :])
+            - (a_te[:, None] == f_tr[None, :]))
+
+
+def full_probe(data, parts, alphas):
+    """The same probe with every trunk dimension, not the leading few.
+
+    Principal components are ordered by variance, and nothing says the
+    direction that carries "this action is better than the head thinks" is a
+    high-variance one. In the dual form the rank cap disappears: the design
+    is [state | state x action pair] over all 1024 dimensions, and its Gram
+    matrix is the states' Gram times one plus their action overlap. What the
+    logit gap already explains is taken out first, so what is left for the
+    kernel is exactly what the head misses.
+    """
+    phi, y = data['phi'], data['label']
+    gap = np.log(np.maximum(data['p_forced'], 1e-12)) - np.log(data['p_argmax'])
+    am, fo = data['argmax'], data['forced']
+    n = len(y)
+    out = {a: np.zeros(n) for a in alphas}
+    for test in parts:
+        train = ~test
+        mean, sd = phi[train].mean(0), phi[train].std(0) + 1e-6
+        z = ((phi - mean) / sd).astype(np.float64)
+        x = np.column_stack([np.ones(n), gap])
+        b = np.linalg.lstsq(x[train], y[train], rcond=None)[0]
+        base, resid = x @ b, y - x @ b
+        ktr = (z[train] @ z[train].T) * (1 + overlap(am[train], fo[train],
+                                                     am[train], fo[train]))
+        kte = (z[test] @ z[train].T) * (1 + overlap(am[train], fo[train],
+                                                    am[test], fo[test]))
+        for alpha in alphas:
+            c = np.linalg.solve(ktr + alpha * np.eye(len(ktr)), resid[train])
+            out[alpha][test] = base[test] + kte @ c
+        del ktr, kte, z
+    return out
+
+
 def value_of_following(pred, label, thresholds=(0., .02, .05, .1)):
     """What playing the probe's suggestions would have been worth per decision.
 
@@ -160,6 +209,11 @@ def main():
     ap.add_argument('--alpha', type=float, nargs='+', default=[1e3, 1e4, 1e5, 1e6, 1e7, 1e8])
     ap.add_argument('--folds', type=int, default=5)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--full', action='store_true',
+                    help='every trunk dimension, in the dual form, instead of the '
+                         'leading --rank principal components. Components are ordered '
+                         'by variance and the direction that matters need not be a '
+                         'high-variance one, so this is the version with no such gap')
     args = ap.parse_args()
 
     data = load(args.features)
@@ -186,14 +240,19 @@ def main():
     bench = 1 - ((y - base) ** 2).sum() / ((y - y.mean()) ** 2).sum()
     print(f'\nthe logit gap alone, out of sample: R^2 {bench:+.5f}')
 
-    print(f'\n=== out of sample, {len(parts)} folds split by block, rank {args.rank} ===')
+    where = 'every dimension' if args.full else f'rank {args.rank}'
+    print(f'\n=== out of sample, {len(parts)} folds split by block, {where} ===')
     print(f"{'alpha':>10} {'R^2 vs mean':>12} {'R^2 vs logit gap':>17} {'corr':>7}")
-    ready = [prepare(~test, test, data, args.rank) for test in parts]
+    every = full_probe(data, parts, args.alpha) if args.full else None
+    ready = None if args.full else [prepare(~t, t, data, args.rank) for t in parts]
     best, best_pred = None, None
     for alpha in args.alpha:
-        pred = np.zeros(n)
-        for test, got in zip(parts, ready):
-            pred[test] = fit_and_predict(got, alpha)
+        if every is not None:
+            pred = every[alpha]
+        else:
+            pred = np.zeros(n)
+            for test, got in zip(parts, ready):
+                pred[test] = fit_and_predict(got, alpha)
         r2 = 1 - ((y - pred) ** 2).sum() / ((y - y.mean()) ** 2).sum()
         r2b = 1 - ((y - pred) ** 2).sum() / ((y - base) ** 2).sum()
         c = np.corrcoef(pred, y)[0, 1]
