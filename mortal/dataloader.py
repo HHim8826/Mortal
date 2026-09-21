@@ -276,7 +276,7 @@ class FileDatasetsIter(IterableDataset):
             version = version_in(source) if self.param_version else None
             if version is None:
                 version = -1
-            game_key = self.where(source) if self.decision_ids else None
+            game_key = self.where(source) if (self.decision_ids or self.wall_ids) else None
             for game in file:
                 # per move
                 obs = game.take_obs()

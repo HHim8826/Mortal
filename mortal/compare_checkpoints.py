@@ -165,11 +165,15 @@ def main():
           f'({abs(diff / se) if se else 0:.1f} se)')
 
     print()
-    print('the winner\'s curse, in pt, on walls nothing was selected against:')
+    print('recorded best against this run, in pt. The recorded figure is the maximum')
+    print('over a run\'s evaluations on one fixed wall set, so it is inflated by some')
+    print('amount; this one is a single evaluation on fresh walls, so it carries its')
+    print('own sampling error, about 1.33 pt at 4,000 games and less here. The')
+    print('difference is both together and is not an estimate of the selection bias:')
     for name in ('a', 'b'):
         base, stat, avg_pt, best = stats[name]
         print(f'  {base:<24} recorded {best["avg_pt"]:+.3f}, here {avg_pt:+.3f}, '
-              f'inflation {best["avg_pt"] - avg_pt:+.3f} pt')
+              f'difference {best["avg_pt"] - avg_pt:+.3f} pt')
 
 
 if __name__ == '__main__':
