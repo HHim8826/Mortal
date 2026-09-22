@@ -95,6 +95,40 @@ arenas = 1
 # offline one rather than starting a new chart.
 games = 4000
 log_dir = 'challenger/test_play'
+# Selection. Off, a checkpoint is kept when its absolute score beats every
+# score before it, which is a rolling maximum over one fixed wall set: 16
+# evaluations offline and 7 online, every one of them the argmax of its own
+# noise at se 1.33 pt. On, a candidate has to beat the reigning champion over
+# the same walls, paired, and the walls move on every evaluation so no model
+# passes twice on the same luck. Measured 2026-09-22: the 600k checkpoint was
+# 0.0178 of rank worse than the 560k one and the rolling maximum could not see
+# it, so the run trained 40,000 steps into a decline.
+gate = true
+# How far ahead a candidate has to be, in standard errors, to take the title.
+#
+# 0 -- "just win" -- is the wrong default, which a simulation said and intuition
+# did not. A candidate that is slightly worse still wins the coin flip about
+# half the time, so against a truth that is declining the champion follows it
+# down one accepted tie at a time. Over eight evaluations of the 0.0178 decline
+# at 1,000 walls each, margin 0 keeps a checkpoint 0.0138 off the peak, margin
+# 0.5 keeps 0.0091, and margin 1.0 keeps 0.0045. The cost on the other side is
+# small: against the 0.0125 gain the online phase really made, margin 0 keeps
+# -0.0113 of it and margin 1.0 keeps -0.0084.
+gate_margin = 1.0
+# Consecutive evaluations without a new champion before the run stops itself.
+# 0 never stops.
+#
+# Worth knowing before turning it on: at these settings one evaluation's worth
+# of real progress is about 0.07 se, so a stopping rule cannot distinguish "not
+# improving" from "improving too slowly to see". Patience 4 at margin 1.0 ends
+# a declining run after 4.9 evaluations instead of 8 and keeps a checkpoint
+# 0.0025 off the peak rather than 0.0045 -- but it also ends an *improving* run
+# early, keeping -0.0043 of the gain rather than -0.0084. Leave it at 0 for a
+# run expected to improve; set it for one being asked whether it still can.
+#
+# The real lever is neither knob. One evaluation here is 1,000 walls; the same
+# comparison at 8,000 has half the noise. Evaluate rarely and large.
+gate_patience = 0
 
 [dataset]
 # Online reads the drained self-play logs, whose paths the server hands over;

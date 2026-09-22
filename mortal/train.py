@@ -1,3 +1,36 @@
+def gate_says_replace(diff, se, margin=1.):
+    """Whether a candidate has earned the champion's place, paired on one wall set.
+
+    `diff` is the candidate's average rank minus the champion's over the same
+    walls, so negative is the candidate ahead, and `se` is its standard error
+    over walls. A measurement that did not happen -- no walls came back, so the
+    error is zero or None, or the difference is nan -- keeps the incumbent,
+    because the default has to be the model that has already been paid for.
+
+    `margin` is in standard errors, and **1 is the default, not 0**, which a
+    simulation said and intuition did not. Asking only that the candidate be
+    ahead sounds conservative, but a candidate that is slightly worse still
+    wins the coin flip about half the time, so against a truth that is
+    declining the champion follows it down one accepted tie at a time. Over
+    eight evaluations of the measured 0.0178 decline at 1,000 walls each,
+    margin 0 keeps a checkpoint 0.0138 off the peak, margin 0.5 keeps 0.0091,
+    and margin 1.0 keeps 0.0045. The cost on the other side is small: against
+    the 0.0125 gain the online phase really made, margin 0 keeps -0.0113 of it
+    and margin 1.0 keeps -0.0084.
+
+    What this replaces is a rolling maximum over absolute scores on one fixed
+    wall set. That rule is not only noisy; it hides its own failure. The
+    incumbent's recorded score is the lucky draw that crowned it, so "no new
+    record" reads the same whether the model is improving too slowly to see,
+    standing still, or getting worse. The 600k checkpoint never broke the 560k
+    record -- and the run read that as no change and trained 40,000 steps
+    further into a decline.
+    """
+    if se is None or not se > 0:
+        return False
+    return diff < -margin * se
+
+
 def train():
     import prelude
 
@@ -38,6 +71,14 @@ def train():
     test_every = config['control']['test_every']
     submit_every = config['control']['submit_every']
     test_games = config['test_play']['games']
+    # Selection. Off, a checkpoint is kept when its absolute score beats every
+    # score before it -- a rolling maximum over one fixed wall set, which is
+    # the argmax of its own noise. On, it has to beat the reigning champion
+    # over the same walls, paired, and the walls move every evaluation.
+    gate = config['test_play'].get('gate', False)
+    gate_margin = config['test_play'].get('gate_margin', 1.)
+    # Consecutive gate failures before the run gives up. 0 never gives up.
+    gate_patience = config['test_play'].get('gate_patience', 0)
     min_q_weight = config['cql']['min_q_weight']
     next_rank_weight = config['aux']['next_rank_weight']
     assert save_every % opt_step_every == 0
@@ -111,6 +152,9 @@ def train():
         rank = ddp.rank,
         world_size = ddp.world_size,
     )
+    # Where the wall numbering starts. Gated, every evaluation takes the next
+    # block and no wall is ever played twice.
+    seed_origin = test_player.seed_base
     best_perf = {
         'avg_rank': 4.,
         'avg_pt': -135.,
@@ -175,6 +219,14 @@ def train():
     ema_decay = config['control'].get('ema_decay', 0)
     ema_models = ()
     best_perf_ema = {'avg_rank': 4., 'avg_pt': -135.}
+    # Online exits after every evaluation and is respawned by `main`, so a
+    # counter kept in a plain local would reset to zero every time and the
+    # patience below would never reach two. A dict for the same reason
+    # `best_perf` is one: the evaluation runs in a nested function and mutates
+    # it in place rather than rebinding it.
+    gate_state = {'fails': 0}
+    if path.exists(state_file):
+        gate_state['fails'] = state.get('gate_fails', 0)
     if ema_decay > 0:
         mortal_ema = copy.deepcopy(mortal).requires_grad_(False)
         dqn_ema = copy.deepcopy(dqn).requires_grad_(False)
@@ -250,6 +302,7 @@ def train():
             'steps': steps,
             'timestamp': datetime.now().timestamp(),
             'best_perf': best_perf,
+            'gate_fails': gate_state['fails'],
             'config': config,
         }
         if ema_models:
@@ -529,13 +582,21 @@ def train():
                     # Each rank plays its own slice of the same seeds on its own
                     # GPU. Rank 0 clears the last round's games first, and all
                     # read the finished set back once the slowest rank is done.
+                    # Who the average is played against. Gated, it is the
+                    # reigning champion: measured against the last evaluation
+                    # instead, a policy can walk away from where it started one
+                    # harmless-looking step at a time and every step passes.
+                    # Ungated, the last evaluation is what makes the
+                    # `rank_since_last` line mean what it says.
                     prev_steps = None
-                    if ema_models and path.exists(prev_ema_file):
-                        was = torch.load(prev_ema_file, weights_only=True, map_location=device)
-                        mortal_prev.load_state_dict(was['mortal'])
-                        dqn_prev.load_state_dict(was['current_dqn'])
-                        prev_steps = was['steps']
-                        del was
+                    if ema_models:
+                        rival_file = best_ema_file if gate else prev_ema_file
+                        if path.exists(rival_file):
+                            was = torch.load(rival_file, weights_only=True, map_location=device)
+                            mortal_prev.load_state_dict(was['mortal'])
+                            dqn_prev.load_state_dict(was['current_dqn'])
+                            prev_steps = was['steps']
+                            del was
                     ddp.barrier()
                     if ddp.is_main:
                         test_player.clear()
@@ -558,6 +619,17 @@ def train():
                     # it is holding is worth less than the measurement.
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
+                    if gate:
+                        # The next block of walls, never one played before.
+                        # Pairing takes the deal's luck out of the comparison;
+                        # moving the set takes out what is left, which is a
+                        # model that happens to suit these particular walls
+                        # passing the gate over and over on that alone.
+                        test_player.seed_base = (seed_origin
+                                                 + steps // test_every * (test_games // 4))
+                        logging.info(f'walls [{test_player.seed_base:,}, '
+                                     f'{test_player.seed_base + test_games // 4:,}) '
+                                     f'at key {test_player.seed_key:#x}')
                     # All of them at once: one arena alone leaves most of the
                     # box idle, and they are independent games. See play_all.
                     test_player.play_all(test_games // 4, jobs, device)
@@ -621,10 +693,13 @@ def train():
                     if ema_models:
                         stat_ema = test_player.collect('ema')
                         avg_pt_ema = stat_ema.avg_pt([90, 45, 0, -135])
-                        better_ema = avg_pt_ema >= best_perf_ema['avg_pt'] and stat_ema.avg_rank <= best_perf_ema['avg_rank']
-                        if better_ema:
-                            best_perf_ema['avg_pt'] = avg_pt_ema
-                            best_perf_ema['avg_rank'] = stat_ema.avg_rank
+                        if not gate:
+                            # The rolling maximum. Kept so a run can be
+                            # reproduced as it was; the gate below replaces it.
+                            better_ema = avg_pt_ema >= best_perf_ema['avg_pt'] and stat_ema.avg_rank <= best_perf_ema['avg_rank']
+                            if better_ema:
+                                best_perf_ema['avg_pt'] = avg_pt_ema
+                                best_perf_ema['avg_rank'] = stat_ema.avg_rank
                         writer.add_scalar('test_play_ema/avg_ranking', stat_ema.avg_rank, steps)
                         writer.add_scalar('test_play_ema/avg_pt', avg_pt_ema, steps)
                         writer.add_scalars('test_play_ema/ranking', {
@@ -644,8 +719,52 @@ def train():
                                 gain, gain_se, _, walls = test_player.paired('ema', against='prev')
                                 writer.add_scalar('test_play_ema/rank_since_last', gain, steps)
                                 logging.info(
-                                    f'progress since step {prev_steps:,}, over the same '
+                                    f'{"against the champion at" if gate else "progress since"} '
+                                    f'step {prev_steps:,}, over the same '
                                     f'{walls:,} walls: rank {gain:+.4f} +- {gain_se:.4f}')
+                            if gate:
+                                if prev_steps is None:
+                                    # Nothing to beat yet: the first average
+                                    # evaluated becomes the one to beat.
+                                    better_ema = True
+                                    logging.info('gate: no champion yet, this one takes the title')
+                                else:
+                                    better_ema = gate_says_replace(gain, gain_se, gate_margin)
+                                    if not gain_se > 0:
+                                        where = (f'nothing was measured over {walls:,} '
+                                                 'walls, so the champion keeps the title')
+                                    else:
+                                        where = (f'the candidate is {abs(gain / gain_se):.1f} se '
+                                                 f'{"ahead" if gain < 0 else "behind"} over '
+                                                 f'{walls:,} walls, and it has to be ahead by '
+                                                 f'{gate_margin:.1f}')
+                                    logging.info(
+                                        f'gate: {"replacing" if better_ema else "keeping"} the '
+                                        f'champion from step {prev_steps:,} -- {where}')
+                                    # What a decline looks like while it is
+                                    # happening: the 600k checkpoint called 3.6
+                                    # points more often than the 560k one it
+                                    # replaced and lost 1.5 points of firsts
+                                    # for it. Absolute rates of both sides, so
+                                    # the shape is on the chart before the
+                                    # damage is in the weights.
+                                    stat_champ = test_player.collect('prev')
+                                    for tag, mine, theirs in (
+                                        ('fuuro', stat_ema.fuuro_rate, stat_champ.fuuro_rate),
+                                        ('riichi', stat_ema.riichi_rate, stat_champ.riichi_rate),
+                                        ('agari', stat_ema.agari_rate, stat_champ.agari_rate),
+                                        ('houjuu', stat_ema.houjuu_rate, stat_champ.houjuu_rate),
+                                        ('rank_1', stat_ema.rank_1_rate, stat_champ.rank_1_rate),
+                                        ('rank_4', stat_ema.rank_4_rate, stat_champ.rank_4_rate),
+                                    ):
+                                        writer.add_scalars(f'gate/{tag}', {
+                                            'candidate': mine,
+                                            'champion': theirs,
+                                        }, steps)
+                                gate_state['fails'] = 0 if better_ema else gate_state['fails'] + 1
+                                if better_ema:
+                                    best_perf_ema['avg_pt'] = avg_pt_ema
+                                    best_perf_ema['avg_rank'] = stat_ema.avg_rank
                             torch.save({
                                 'mortal': mortal_ema.state_dict(),
                                 'current_dqn': dqn_ema.state_dict(),
@@ -674,8 +793,34 @@ def train():
                             'current_dqn': dqn_ema.state_dict(),
                             'best_perf': best_perf_ema,
                         }, best_ema_file)
-                        logging.info(f'a new ema record: rank {best_perf_ema["avg_rank"]:.4}, '
-                                     f'pt {best_perf_ema["avg_pt"]:.4}, saving to {best_ema_file}')
+                        logging.info(
+                            (f'the champion is now step {steps:,}: rank '
+                             if gate else 'a new ema record: rank ')
+                            + f'{best_perf_ema["avg_rank"]:.4}, '
+                            f'pt {best_perf_ema["avg_pt"]:.4}, saving to {best_ema_file}')
+                    if gate and gate_patience and gate_state['fails'] >= gate_patience:
+                        # Nothing has beaten the champion for this many
+                        # evaluations in a row. `main` respawns the child on a
+                        # zero exit and stops on anything else, so this is how
+                        # a run ends itself rather than spending the rest of
+                        # the box on a policy that has stopped earning it.
+                        #
+                        # Simulated at 1,000 walls an evaluation, margin 1.0,
+                        # over eight evaluations: against a truth declining by
+                        # 0.0178 of rank this stops after 4.9 evaluations and
+                        # keeps a checkpoint 0.0025 off the peak, where never
+                        # stopping runs all eight and keeps one 0.0045 off.
+                        # The cost is on the other side -- against a truth
+                        # *improving* by 0.0125 it also stops early and keeps
+                        # -0.0043 of it against -0.0084 -- because at these
+                        # settings one evaluation's worth of real progress is
+                        # about 0.07 se and no rule can see it. Leave this at
+                        # 0 for a run that is expected to improve, and set it
+                        # for one that is being asked whether it still can.
+                        logging.info(
+                            f'gate: {gate_state["fails"]} evaluations without a new '
+                            f'champion, stopping. The champion is in {best_ema_file}.')
+                        sys.exit(3)
                     if online:
                         # BUG: This is a bug with unknown reason. When training
                         # in online mode, the process will get stuck here. This
