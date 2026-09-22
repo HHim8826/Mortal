@@ -167,6 +167,31 @@ min_q_weight = 5
 [aux]
 next_rank_weight = 0.2
 
+[freeze]
+# How many of the trunk's residual blocks self-play is allowed to move,
+# counted from the output end. 0 trains the whole trunk, which is what every
+# run so far did and what the offline configs still do (they have no [freeze]
+# section, so they take the 0).
+#
+# Why this exists. The online objective is a Monte-Carlo regression of Q onto
+# the kyoku just played: `q_target = gamma ** steps_to_done * kyoku_rewards`
+# with gamma = 1, so every decision in a kyoku gets the same target, and Q is
+# only ever fitted on actions that were actually taken. Nothing in it maintains
+# a value for an action the policy has stopped taking -- CQL is dropped online
+# and there is no bootstrap -- and the only thing keeping those actions in the
+# data at all is `boltzmann_epsilon`, which is 0.005. So the policy can
+# contract onto what it already does and cannot discover that something it
+# gave up was good. Measured over 520k -> 600k it did exactly that: houjuu rate
+# -2.04pp and agari rate -1.09pp, monotonically, along one axis.
+#
+# Freezing the early trunk leaves the features learned from 1.6M human games
+# where they are and lets self-play move only the part that reads them.
+#
+# 4 of 40 is a starting point, not a measured optimum. Nothing here says what
+# the right number is; the gate in [test_play] is what will say whether a given
+# number is earning its place.
+trainable_blocks = 4
+
 [freeze_bn]
 # The batches now come from the trainee's own play, which shifts as it learns.
 # Letting BatchNorm chase that moves the model under the workers' feet between

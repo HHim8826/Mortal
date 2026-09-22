@@ -148,6 +148,11 @@ class Brain(nn.Module):
 
         # always use EMA or CMA when True
         self._freeze_bn = False
+        # Modules held still by `freeze_trunk`. Kept so `train()` can put their
+        # BatchNorm back into eval every time the model is switched to train,
+        # which is the only way a frozen block stays frozen: `requires_grad_`
+        # stops the weights moving, and running statistics are not weights.
+        self._frozen_mods = []
 
     def forward(self, obs: Tensor, invisible_obs: Optional[Tensor] = None) -> Union[Tuple[Tensor, Tensor], Tensor]:
         if self.is_oracle:
@@ -174,7 +179,43 @@ class Brain(nn.Module):
                     mod.eval()
                     # I don't think this benefits
                     # module.requires_grad_(False)
+        for mod in self._frozen_mods:
+            mod.eval()
         return self
+
+    def freeze_trunk(self, trainable_blocks):
+        """Hold every residual block but the last `trainable_blocks` still.
+
+        The online phase trains the whole trunk on a Monte-Carlo regression of
+        Q onto the kyoku it just played. Nothing in that objective maintains a
+        value for an action the policy has stopped taking, so what it can do is
+        contract onto what it already does -- which is what it did, folding
+        further along one axis over 80,000 steps. Holding the early trunk still
+        leaves the features that were learned from 1.6M human games where they
+        are, and lets self-play move only the part that reads them.
+
+        0, or anything at or above the block count, trains everything and is
+        the behaviour this had before. Returns (blocks frozen, parameters
+        frozen) so a run can log what it actually did rather than what it asked
+        for.
+        """
+        mods = list(self.encoder.net)
+        at = [i for i, m in enumerate(mods) if isinstance(m, ResBlock)]
+        if not trainable_blocks or trainable_blocks >= len(at):
+            self._frozen_mods = []
+            self.encoder.requires_grad_(True)
+            return 0, 0
+        # Everything up to and including the last block being frozen: the stem
+        # convolution, every earlier block, and for a post-activation layout
+        # the norm and activation that sit between them.
+        cut = at[len(at) - trainable_blocks - 1]
+        self._frozen_mods = mods[:cut + 1]
+        frozen = 0
+        for mod in self._frozen_mods:
+            mod.requires_grad_(False)
+            frozen += sum(p.numel() for p in mod.parameters())
+        self.train(self.training)
+        return len(at) - trainable_blocks, frozen
 
     def reset_running_stats(self):
         for mod in self.modules():

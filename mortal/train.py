@@ -121,6 +121,18 @@ def train():
 
     mortal.freeze_bn(config['freeze_bn']['mortal'])
 
+    # How much of the trunk self-play is allowed to move. 0 is everything,
+    # which is what every run so far did.
+    trainable_blocks = config.get('freeze', {}).get('trainable_blocks', 0)
+    was_trainable = sum(parameter_count(m) for m in all_models)
+    froze, frozen_params = mortal.freeze_trunk(trainable_blocks)
+    if froze:
+        now = sum(parameter_count(m) for m in all_models)
+        logging.info(
+            f'trunk: {froze} of {config["resnet"]["num_blocks"]} blocks frozen, the last '
+            f'{trainable_blocks} train; {was_trainable:,} -> {now:,} trainable parameters '
+            f'({100 * now / was_trainable:.1f}%)')
+
     decay_params = []
     no_decay_params = []
     for model in all_models:
@@ -128,6 +140,12 @@ def train():
         to_decay = set()
         for mod_name, mod in model.named_modules():
             for name, param in mod.named_parameters(prefix=mod_name, recurse=False):
+                # A frozen parameter is left out of the optimizer, not merely
+                # left without a gradient: AdamW would otherwise carry two
+                # moment tensors for each one, which for a 40-block trunk is
+                # most of 87 MB of a card the workers are already sharing.
+                if not param.requires_grad:
+                    continue
                 params_dict[name] = param
                 if isinstance(mod, (nn.Linear, nn.Conv1d)) and name.endswith('weight'):
                     to_decay.add(name)
