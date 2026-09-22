@@ -35,6 +35,7 @@ import argparse
 import logging
 import os
 import time
+from glob import glob
 from os import path
 
 import torch
@@ -92,6 +93,18 @@ def main():
                          'the logs accumulate. Throughput needs games in flight too '
                          '(4.6 games/s at 250 walls against 5.4 at 1,000), so this is '
                          'the largest piece that fits rather than the smallest')
+    ap.add_argument('--resume', action='store_true',
+                    help='keep the games already in the track directories and play only '
+                         'the range asked for now. `collect` and `paired` both read the '
+                         'directory, so a run cut short is finished by pointing --base '
+                         'at the first wall it never reached; without this the first '
+                         'thing a run does is delete what the last one played')
+    ap.add_argument('--opponent', default=None,
+                    help='score against this checkpoint instead of the configured ruler. '
+                         'A run trains against a frozen copy of itself and is measured '
+                         'against something else; if a checkpoint is best-responding to '
+                         'the copy rather than improving, it wins here and loses there, '
+                         'and only running both says which happened')
     ap.add_argument('--device', default=None)
     args = ap.parse_args()
 
@@ -102,7 +115,8 @@ def main():
                          'curse is baked into the answer')
 
     device = torch.device(args.device or config['control']['device'])
-    player = TestPlayer(device=device)
+    player = TestPlayer(device=device, opponent=args.opponent)
+    logging.info(f'opponent: {args.opponent or config["baseline"]["test"]["state_file"]}')
     player.seed_base, player.seed_key = args.base, key
 
     jobs, meta = [], []
@@ -115,7 +129,12 @@ def main():
                      dqn.to(device).requires_grad_(False), name))
         label = path.join(path.basename(path.dirname(file)), path.basename(file))
         meta.append((name, label, steps, best))
-        player.clear(name)
+        if args.resume:
+            have = len(glob(path.join(player.track_dir(name), '**', '*.json.gz'),
+                            recursive=True))
+            logging.info(f'{name}: keeping {have:,} games already played')
+        else:
+            player.clear(name)
 
     for name, base, steps, best in meta:
         logging.info(f'{name}: {base}, {steps:,} steps, recorded best {best}'

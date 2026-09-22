@@ -17,8 +17,22 @@ from libriichi.arena import OneVsThree
 from config import config
 
 class TestPlayer:
-    def __init__(self, device=None, rank=0, world_size=1):
-        baseline_cfg = config['baseline']['test']
+    def __init__(self, device=None, rank=0, world_size=1, opponent=None):
+        """`opponent` replaces the configured ruler for this player.
+
+        The ruler is normally fixed for ever, and should be: one that changes
+        measures nothing. But a run trains against a frozen copy of itself and
+        is then scored against a different opponent entirely, and those two
+        can come apart -- a policy that best-responds to the copy it plays all
+        day gets better at that and worse at everything else. Telling the two
+        apart means scoring the same pair of checkpoints against the opponent
+        they trained against, which is what this is for. Games go in their own
+        directory, named after the opponent, so one ruler's results never land
+        on top of another's.
+        """
+        baseline_cfg = dict(config['baseline']['test'])
+        if opponent:
+            baseline_cfg['state_file'] = opponent
         # Under DDP each rank plays its share of test games on its own GPU, so
         # the champion lives there too rather than on the configured device.
         device = device or torch.device(baseline_cfg['device'])
@@ -52,7 +66,10 @@ class TestPlayer:
             name = 'baseline',
         )
         self.chal_version = config['control']['version']
-        self.log_dir = path.abspath(config['test_play']['log_dir'])
+        log_dir = config['test_play']['log_dir']
+        if opponent:
+            log_dir += '_vs_' + path.splitext(path.basename(opponent))[0]
+        self.log_dir = path.abspath(log_dir)
         self.rank = rank
         self.world_size = world_size
         # The walls a test play deals. Fixed, because a run's numbers are only
