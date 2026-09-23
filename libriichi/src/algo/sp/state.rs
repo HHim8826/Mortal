@@ -1,5 +1,6 @@
-use super::CALC_SHANTEN_FN;
+use super::{CALC_ALL, CALC_SHANTEN_FN};
 use super::tile::{DiscardTile, DrawTile, RequiredTile};
+use crate::algo::shanten::Neighbours;
 use crate::tile::Tile;
 use crate::{must_tile, t, tu8};
 
@@ -103,15 +104,14 @@ impl State {
     ) -> ArrayVec<[DiscardTile; 14]> {
         let mut discard_tiles = ArrayVec::default();
 
-        let mut tehai = self.tehai;
+        let tehai = self.tehai;
+        let neighbours = Neighbours::new(&tehai, tehai_len_div3, CALC_ALL);
         for tid in 0..34 {
             if tehai[tid] == 0 {
                 continue;
             }
 
-            tehai[tid] -= 1;
-            let shanten_after = CALC_SHANTEN_FN(&tehai, tehai_len_div3);
-            tehai[tid] += 1;
+            let shanten_after = neighbours.without(tid);
 
             let shanten_diff = shanten_after - shanten;
 
@@ -135,15 +135,13 @@ impl State {
     ) -> ArrayVec<[DrawTile; 37]> {
         let mut draw_tiles = ArrayVec::default();
 
-        let mut tehai = self.tehai;
+        let neighbours = Neighbours::new(&self.tehai, tehai_len_div3, CALC_ALL);
         for (tid, &count) in self.tiles_in_wall.iter().enumerate() {
             if count == 0 {
                 continue;
             }
 
-            tehai[tid] += 1;
-            let shanten_after = CALC_SHANTEN_FN(&tehai, tehai_len_div3);
-            tehai[tid] -= 1;
+            let shanten_after = neighbours.with(tid);
 
             let shanten_diff = shanten_after - shanten;
 
@@ -175,9 +173,8 @@ impl State {
     }
 
     pub(super) fn get_required_tiles(&self, tehai_len_div3: u8) -> ArrayVec<[RequiredTile; 34]> {
-        let mut tehai = self.tehai;
-
-        let shanten = CALC_SHANTEN_FN(&tehai, tehai_len_div3);
+        let shanten = CALC_SHANTEN_FN(&self.tehai, tehai_len_div3);
+        let neighbours = Neighbours::new(&self.tehai, tehai_len_div3, CALC_ALL);
         let mut required_tiles = ArrayVec::default();
 
         for (tid, &count) in self.tiles_in_wall.iter().enumerate() {
@@ -185,9 +182,7 @@ impl State {
                 continue;
             }
 
-            tehai[tid] += 1;
-            let shanten_after = CALC_SHANTEN_FN(&tehai, tehai_len_div3);
-            tehai[tid] -= 1;
+            let shanten_after = neighbours.with(tid);
 
             if shanten_after < shanten {
                 required_tiles.push(RequiredTile {

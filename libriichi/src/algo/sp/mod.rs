@@ -45,3 +45,5 @@ pub const MAX_TSUMOS_LEFT: usize = 17;
 const CALC_SHANTEN_FN: fn(&[u8; 34], u8) -> i8 = super::shanten::calc_normal;
 #[cfg(not(feature = "sp_reproduce_cpp_ver"))]
 const CALC_SHANTEN_FN: fn(&[u8; 34], u8) -> i8 = super::shanten::calc_all;
+/// Whether `shanten::Neighbours` answers as `CALC_SHANTEN_FN` above does.
+const CALC_ALL: bool = cfg!(not(feature = "sp_reproduce_cpp_ver"));
