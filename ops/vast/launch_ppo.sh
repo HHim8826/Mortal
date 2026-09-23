@@ -69,7 +69,7 @@ esac
 [ -n "${LR:-}" ] && FLAGS="$FLAGS --lr $LR"
 
 if [ ! -e "$START" ]; then
-    echo "no $START to start from: run train_policy.py, then sharpen_policy.py" >&2
+    echo "no $START to start from: run python -m policy.train_policy, then python -m policy.sharpen_policy" >&2
     exit 1
 fi
 # The head must already carry its play temperature: the workers sample it raw
@@ -79,7 +79,7 @@ import sys, torch
 s = torch.load('$START', weights_only=True, map_location='cpu')
 t = s.get('play_temperature')
 if not t:
-    sys.exit('$START has no play temperature folded in; run sharpen_policy.py')
+    sys.exit('$START has no play temperature folded in; run python -m policy.sharpen_policy')
 print('starting from a policy sharpened to %g' % t)
 "
 
@@ -149,7 +149,7 @@ done
 # it goes first.
 start trainer MORTAL_DEVICE=cuda:0 MORTAL_LOADER_RAYON_THREADS=$LOADER_RAYON \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    $PY train_ppo.py --from "$START" --out "$RUN" $FLAGS
+    $PY -m policy.train_ppo --from "$START" --out "$RUN" $FLAGS
 
 for i in $(seq 0 $((WORKERS - 1))); do
     start "worker$i" MORTAL_DEVICE=cuda:${GPUS[$(( i % ${#GPUS[@]} ))]} MORTAL_WORKER=$i MORTAL_TB_DIR=$RUN/tb \

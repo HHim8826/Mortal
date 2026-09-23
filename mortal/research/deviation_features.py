@@ -23,7 +23,7 @@ What comes out is what a probe needs: the 1024 trunk features of each
 measured state, the mask, the two actions compared, and the causal
 advantage between them.
 
-    python deviation_features.py --results /root/eval/deviation/sweep/deviations.json \
+    python -m research.deviation_features --results /root/eval/deviation/sweep/deviations.json \
         --policy logs/policy/policy-t0.05.pth
 """
 import argparse
@@ -38,7 +38,7 @@ import torch
 
 import prelude                                          # noqa: F401
 from config import config
-from deviation_cost import (CHALLENGER, _state, decoded, load_policy, pick_target, play,
+from research.deviation_cost import (CHALLENGER, _state, decoded, load_policy, pick_target, play,
                             read, seat_of, spread, start_workers)
 from dataloader import digest64
 from engine import MortalEngine

@@ -28,7 +28,7 @@ What the gap between seen and unseen means:
   unseen flat, seen far below it     overfitting; the corpus is the limit
   both flat and close together       capacity; a bigger trunk is the lever
 
-    python validate_supervised.py --holdout /root/holdout \\
+    python -m evaluation.validate_supervised --holdout /root/holdout \\
         logs/mortal-120000.pth logs/mortal-800k.pth logs/best_ema.pth
 """
 import argparse

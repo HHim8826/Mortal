@@ -1,7 +1,7 @@
 """Train the hand-reading model, and check it against the rules it must beat.
 
     cd mortal
-    MORTAL_CFG=config.vast.toml python train_tenpai.py \\
+    MORTAL_CFG=config.vast.toml python -m tenpai.train_tenpai \\
         --globs '/root/hf-dataset/data/*.parquet' --steps 20000
 
 Accuracy is not the test here. What goes on a screen is a percentage, so the
@@ -37,9 +37,9 @@ from torch import optim
 from torch.utils.data import DataLoader
 
 import prelude                                          # noqa: F401
-from tenpai_data import (CONTEXT_WIDTH, DISCARDED, FUURO, RIICHI, SUJI,
+from tenpai.tenpai_data import (CONTEXT_WIDTH, DISCARDED, FUURO, RIICHI, SUJI,
                          TILE_KINDS, TURN, TenpaiDataset)
-from tenpai_net import TenpaiNet, losses
+from tenpai.tenpai_net import TenpaiNet, losses
 
 # Empirical rates are taken in these buckets: has this seat declared riichi,
 # is the tile one of its own discards, is it suji of them, and how late is it.

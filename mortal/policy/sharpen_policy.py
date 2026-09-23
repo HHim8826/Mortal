@@ -1,6 +1,6 @@
 """Fold a play temperature into the policy head, so that what is trained is what is played.
 
-    python sharpen_policy.py --from logs/policy/policy.pth --temperature 0.05
+    python -m policy.sharpen_policy --from logs/policy/policy.pth --temperature 0.05
 
 The head out of `train_policy.py` carries the teacher's own scale, and that
 scale is not a policy: sampling it deviates from its own best action on two

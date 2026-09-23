@@ -136,7 +136,7 @@ def backup(api):
         f'reference refresh {flags.get("ref_refresh")}, lr {flags.get("lr")}, '
         f'target kl {flags.get("target_kl")}\n'
         f'- self-play against the frozen start (2.5 is level, lower is better):\n{verdict}\n'
-        f'- `policy.pth` plays with `evaluate.py --model x=policy.pth#policy`\n'
+        f'- `policy.pth` plays with `python -m evaluation.evaluate --model x=policy.pth#policy`\n'
         f'- backed up {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M} UTC\n',
         encoding='utf-8')
 

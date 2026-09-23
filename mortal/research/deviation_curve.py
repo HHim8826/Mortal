@@ -18,7 +18,7 @@ another. Only the second is worth training on, so the moderators are tested.
 
 And the obvious way to test them is wrong. See `moderators`.
 
-    python deviation_curve.py /root/eval/deviation/sweep/deviations.json
+    python -m research.deviation_curve /root/eval/deviation/sweep/deviations.json
 """
 import argparse
 import json

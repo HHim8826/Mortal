@@ -1,6 +1,6 @@
 """Is a sampled alternative actually worse than the argmax, in the data?
 
-    python advantage_signal.py --policy logs/policy/policy-t0.05.pth \
+    python -m research.advantage_signal --policy logs/policy/policy-t0.05.pth \
         --logs '/root/eval3s/dev/vs-*/<ident>/seeds-*' --games 4000
 
 Phase 3 trained three configurations of PPO for 600,000 self-play games and

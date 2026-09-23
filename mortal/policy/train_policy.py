@@ -1,7 +1,7 @@
 """Give a trained v4 model a policy of its own and a critic of the whole game.
 
     cd mortal
-    python train_policy.py --from logs/hf-0911/best_ema.pth \\
+    python -m policy.train_policy --from logs/hf-0911/best_ema.pth \\
         --globs '/root/hf-dataset/data/*.parquet' --steps 20000
 
 Mortal decides by argmax of Q, and that Q is doing three jobs: estimating the

@@ -28,7 +28,7 @@ called the answer. A probe that has found real headroom is positive down
 the column; one that is fitting noise sits at zero, which is what the
 current policy already gets.
 
-    python deviation_probe.py /root/eval/deviation/*/features.npz
+    python -m research.deviation_probe /root/eval/deviation/*/features.npz
 """
 import argparse
 

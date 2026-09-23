@@ -1,14 +1,14 @@
 """Evaluate checkpoints on fixed, named sets of walls, and compare them paired.
 
     # play two checkpoints against the v3 bot on the first 250 walls of `dev`
-    python evaluate.py play --set dev --limit-seeds 250 \\
+    python -m evaluation.evaluate play --set dev --limit-seeds 250 \\
         --model offline520=logs/v4/best_ema.pth --model online560=logs/v4o/best_ema.pth
 
     # compare what has been played; every model is set against the first
-    python evaluate.py report --set dev \\
+    python -m evaluation.evaluate report --set dev \\
         --model offline520=logs/v4/best_ema.pth --model online560=logs/v4o/best_ema.pth
 
-    python evaluate.py sets      # what the wall sets are
+    python -m evaluation.evaluate sets      # what the wall sets are
 
 Why this and not test play inside train.py:
 
@@ -322,7 +322,7 @@ def load_model(spec, device):
         # legal actions -- so the engine plays it without knowing the
         # difference, and the two are measured on one ruler.
         if 'policy' not in state:
-            raise SystemExit(f'{spec.file} has no policy head; train one with train_policy.py')
+            raise SystemExit(f'{spec.file} has no policy head; train one with `python -m policy.train_policy`')
         head = PolicyHead(version=version).eval()
         head.load_state_dict(state['policy'])
     else:

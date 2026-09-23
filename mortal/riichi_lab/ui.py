@@ -340,12 +340,12 @@ class Dashboard:
             if width >= 110:
                 wait_text = '--'
                 if estimate:
-                    from riichi_lab_analysis import TILES
+                    from riichi_lab.analysis import TILES
                     top = sorted(range(34), key=lambda k: estimate['waits'][k], reverse=True)[
                         :3 if width >= 150 else 2]
                     wait_text = ' '.join(f'{TILES[k]} {estimate["waits"][k]:.1%}' for k in top)
                 elif i == board.seat and prediction:
-                    from riichi_lab_analysis import TILES
+                    from riichi_lab.analysis import TILES
                     available = {tile.rstrip('r') for tile in p.hand} & set(TILES)
                     top = sorted(available, key=lambda t: prediction['any_wait'][TILES.index(t)],
                                  reverse=True)[:2]

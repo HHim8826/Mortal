@@ -2,10 +2,10 @@
 
     pip install websockets rich
     export RIICHI_BOT_TOKEN=...                 # from riichi.dev/bots
-    python riichi_lab.py                        # validation ladder
-    python riichi_lab.py --ranked               # ranked, once validated
-    python riichi_lab.py --ranked --games 50 --log-dir logs/riichi
-    python riichi_lab.py --display plain        # line logs for pipes / services
+    python -m riichi_lab                        # validation ladder
+    python -m riichi_lab --ranked               # ranked, once validated
+    python -m riichi_lab --ranked --games 50 --log-dir logs/riichi
+    python -m riichi_lab --display plain        # line logs for pipes / services
 
 Interactive terminals use a quiet full-screen dashboard, sampled at 2 Hz.
 Resize the terminal to show more of the rivers; Ctrl+C restores the prompt.
@@ -56,8 +56,8 @@ import torch
 
 from engine import MortalEngine
 from model import Brain, DQN
-from riichi_lab_ui import Dashboard, TableState, use_dashboard
-from riichi_lab_analysis import TableAnalysis, TenpaiPredictor
+from riichi_lab.ui import Dashboard, TableState, use_dashboard
+from riichi_lab.analysis import TableAnalysis, TenpaiPredictor
 
 # Only for the default checkpoint, and only if a training config happens to be
 # here. Playing needs a checkpoint and nothing else -- the shape of the network

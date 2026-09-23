@@ -1,6 +1,6 @@
 """What one step away from the argmax costs, measured by replaying the wall.
 
-    python deviation_cost.py --policy logs/policy/policy-t0.05.pth \
+    python -m research.deviation_cost --policy logs/policy/policy-t0.05.pth \
         --seeds 25 --blocks 8 --out logs/deviation
 
 Phase 3 rests on one number. `advantage_signal.py` asked whether decisions
@@ -61,7 +61,7 @@ CHALLENGER = 'trainee'
 # `evaluate.py` owns them, and phase 2's -1.13 +- 1.53 for sampling end to end
 # is on this scale. The kyoku's GRP delta is a different one, `[env] pts`, and
 # the two must not be added up or compared without saying which is which.
-from evaluate import PTS
+from evaluation.evaluate import PTS
 
 # The last slot of the action space is pass, and it is legal in exactly the
 # states where someone else's tile is on offer -- a call: chi, pon, kan, ron,
@@ -89,7 +89,7 @@ def load_policy(file):
     """
     state = torch.load(file, weights_only=True, map_location='cpu')
     if 'policy' not in state:
-        raise SystemExit(f'{file} has no policy head; train one with train_policy.py')
+        raise SystemExit(f'{file} has no policy head; train one with `python -m policy.train_policy`')
     cfg = state['config']
     version = cfg['control'].get('version', 1)
     brain = Brain(version=version, conv_channels=cfg['resnet']['conv_channels'],

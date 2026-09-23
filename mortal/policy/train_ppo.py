@@ -1,8 +1,8 @@
 """Improve the distilled policy with a clipped policy gradient.
 
-    python train_ppo.py --from logs/policy/policy-t0.05.pth --out logs/ppo/kl
-    python train_ppo.py --from ... --out logs/ppo/kl-refresh --ref-refresh 10
-    python train_ppo.py --from ... --out logs/ppo/plain      --kl-coef 0
+    python -m policy.train_ppo --from logs/policy/policy-t0.05.pth --out logs/ppo/kl
+    python -m policy.train_ppo --from ... --out logs/ppo/kl-refresh --ref-refresh 10
+    python -m policy.train_ppo --from ... --out logs/ppo/plain      --kl-coef 0
 
 The v4 online run regressed only the Q of the action that was played, left
 every other action to drift through the shared trunk, and explored so little
@@ -68,7 +68,7 @@ def load_start(file, device):
     state = torch.load(file, weights_only=True, map_location='cpu')
     for key in ('policy', 'critic', 'mortal'):
         if key not in state:
-            raise SystemExit(f'{file} has no {key}; train one with train_policy.py')
+            raise SystemExit(f'{file} has no {key}; train one with `python -m policy.train_policy`')
     cfg = state['config']
     version = cfg['control'].get('version', 1)
     if version != 4:
@@ -77,7 +77,7 @@ def load_start(file, device):
         logging.warning(
             f'{file} has no play temperature folded in. Its softmax is the teacher own '
             'scale, which samples 65% non-argmax moves and plays at 88% fourths -- run '
-            'sharpen_policy.py first unless this is deliberate.')
+            '`python -m policy.sharpen_policy` first unless this is deliberate.')
     brain = Brain(version=4, conv_channels=cfg['resnet']['conv_channels'],
                   num_blocks=cfg['resnet']['num_blocks']).eval()
     brain.load_state_dict(state['mortal'])

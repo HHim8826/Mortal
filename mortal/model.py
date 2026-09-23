@@ -330,7 +330,7 @@ def head_state(kind, state):
         case 'policy':
             if 'policy' not in state:
                 raise KeyError('this checkpoint has no policy head; '
-                               'train one with train_policy.py')
+                               'train one with `python -m policy.train_policy`')
             return state['policy']
     raise ValueError(f'unknown head {kind!r}; expected dqn or policy')
 

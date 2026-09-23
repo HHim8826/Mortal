@@ -28,7 +28,7 @@ on the GPU. One arena leaves most of a box idle -- it advances every game in
 flight on one thread, then encodes in parallel, then runs one forward -- so
 two fall into each other's gaps and the pair costs far less than twice one.
 
-    python compare_checkpoints.py --seeds 15000 --key 0x5eed \\
+    python -m evaluation.compare_checkpoints --seeds 15000 --key 0x5eed \\
         logs/hf-0911/best_ema.pth logs/best_ema.pth
 """
 import argparse
@@ -43,7 +43,7 @@ import torch
 
 import prelude                                          # noqa: F401
 from config import config
-from evaluate import sha256_of
+from evaluation.evaluate import sha256_of
 from model import Brain, DQN
 from player import TestPlayer
 

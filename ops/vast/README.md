@@ -46,13 +46,13 @@ Each script does one job. The table groups them by when you use them.
 | `selfplay_bench.py`, `bench_grid.sh` | Measure self-play throughput by games in flight, arenas, and opponent version. |
 | `eval_perf.py` | Samples CPU, thread, and GPU use during an evaluation. |
 
-`ab_checkpoints.py` is not here. `mortal/evaluate.py` replaces it: it plays any
+`ab_checkpoints.py` is not here. `python -m evaluation.evaluate` (mortal/evaluation/evaluate.py) replaces it: it plays any
 checkpoints on fixed, named sets of walls and compares them paired.
 
 ## A policy-gradient run
 
-`launch_ppo.sh` wants a checkpoint that `train_policy.py` distilled and
-`sharpen_policy.py` sharpened, and `config.ppo.toml` rather than
+`launch_ppo.sh` wants a checkpoint that `policy.train_policy` distilled and
+`policy.sharpen_policy` sharpened, and `config.ppo.toml` rather than
 `config.online.toml`. Three things differ from the Q-learning run:
 
 - The workers build a policy head, not a Q head (`[online] head = 'policy'`),

@@ -10,7 +10,7 @@ import time
 import numpy as np
 import torch
 
-from tenpai_net import TenpaiNet
+from tenpai.tenpai_net import TenpaiNet
 
 
 TILES = tuple(f'{n}{s}' for s in 'mps' for n in range(1, 10)) + tuple('ESWNPFC')

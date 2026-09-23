@@ -1,7 +1,7 @@
 """Move the policy with the human corpus, weighted by how the kyoku went.
 
     cd mortal
-    python train_awr.py --from logs/policy/policy-t0.05.pth \
+    python -m policy.train_awr --from logs/policy/policy-t0.05.pth \
         --globs '/root/hf-dataset/data/*.parquet' --steps 20000
 
 Phase 3 established that online PPO is not broken here, it is slow: the
