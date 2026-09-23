@@ -142,13 +142,22 @@ parquet_globs = []
 globs = []
 file_index = 'logs/v4o/file_index.pth'
 file_batch_size = 20
-prefetch_factor = 4
+# Each prefetched batch is 1024 x 1012 x 34 float32, 141 MB, held in shared
+# memory and again pinned. Four each from six loaders kept 7.3 GB of them
+# queued in the trainer on a 30 GB box, for a trainer that waits on data 90% of
+# the time anyway: self-play is the bottleneck, and depth here buys nothing.
+prefetch_factor = 2
 in_order = false
 reserve_ratio = 0.2
 # The trainer must decode gz logs at the rate it consumes them, ~1,000
 # instances/s, which is ~6 cores of v4 encoding. The rest of the box belongs to
 # the workers, who need far more of it.
-num_workers = 6
+#
+# Three loaders of two threads rather than six of one: the same six cores of
+# encoding, but each loader also holds ~2 GB of decoded games, and six of them
+# with the queue above left 5 GB of a 30 GB cgroup for an evaluation that
+# plays 12,000 games at once. launch_online.sh sizes the threads from this.
+num_workers = 3
 # Only the trainee's seat is learned from; the three champions' seats are
 # discarded. train.py sets that filter itself in online mode, so this list,
 # which selects human players out of a corpus, stays empty.

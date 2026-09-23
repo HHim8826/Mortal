@@ -41,6 +41,7 @@ print('RUN=' + os.path.dirname(c['control']['state_file']))
 print('PORT=%d' % c['online']['remote']['port'])
 print('CHAMPION=' + c['baseline']['train']['state_file'])
 print('BEST_EMA=' + os.path.splitext(c['control']['best_state_file'])[0] + '_ema.pth')
+print('LOADERS=%d' % max(1, c['dataset']['num_workers']))
 ")"
 
 # nproc reports the host's CPUs, not the ones this container may use: 256
@@ -55,7 +56,9 @@ if [ -r /sys/fs/cgroup/cpu.max ]; then
         [ "$CPUS" -lt 1 ] && CPUS=1
     fi
 fi
-LOADER_RAYON=${LOADER_RAYON:-$(( CPUS / 4 / 6 ))}
+# A quarter of the box for the trainer's loaders, split over however many the
+# config asks for.
+LOADER_RAYON=${LOADER_RAYON:-$(( CPUS / 4 / LOADERS ))}
 WORKER_RAYON=${WORKER_RAYON:-$(( CPUS * 3 / 4 / WORKERS ))}
 [ "$LOADER_RAYON" -lt 1 ] && LOADER_RAYON=1
 [ "$WORKER_RAYON" -lt 1 ] && WORKER_RAYON=1
