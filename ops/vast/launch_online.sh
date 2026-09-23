@@ -40,6 +40,7 @@ c = toml.load('$CFG')
 print('RUN=' + os.path.dirname(c['control']['state_file']))
 print('PORT=%d' % c['online']['remote']['port'])
 print('CHAMPION=' + c['baseline']['train']['state_file'])
+print('BEST_EMA=' + os.path.splitext(c['control']['best_state_file'])[0] + '_ema.pth')
 ")"
 
 # nproc reports the host's CPUs, not the ones this container may use: 256
@@ -75,6 +76,10 @@ elif [ -n "$SEED_FROM" ]; then
     # The opponent, frozen here on purpose: refresh it by hand, between
     # sessions, or one buffer will hold games played against two of them.
     [ -e "$CHAMPION" ] || cp "$SEED_FROM" "$CHAMPION"
+    # And the gate's champion, which is a different file: the model the first
+    # evaluation has to beat. Without it that evaluation finds no champion and
+    # crowns whatever it measured, so the seed is never a bar at all.
+    [ -e "$BEST_EMA" ] || cp "$SEED_FROM" "$BEST_EMA"
 else
     echo "starting from random weights"
 fi
