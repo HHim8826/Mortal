@@ -489,62 +489,74 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
             };
             self.state.undo_deal(tile);
 
+            // The chance, seen from turn i, of drawing it first at turn j is
+            // tsumo_probs[j] * not_tsumo_probs[j] / not_tsumo_probs[i], and
+            // every quantity below is a sum of that over j >= i. The
+            // denominator does not depend on j, so each is a suffix sum
+            // divided once: O(T) where the original's double loop was O(T^2),
+            // with a division in its inner loop. Equal up to the order the
+            // floats are added in, not bit for bit.
             let tsumo_probs = &self.tsumo_prob_table[count as usize - 1];
-            for i in 0..MAX_TSUMO {
-                let m = not_tsumo_probs[i];
-                if m == 0. {
-                    // We are breaking here because `not_tsumo_probs[i..]` must
-                    // all be zero, since `not_tsumo_probs` is monotonically
-                    // decreasing.
-                    //
-                    // This divide-by-zero check is missing in the original
-                    // version, which is very problematic.
-                    break;
-                }
+            let mut reach = [0.; MAX_TSUMO];
+            for j in 0..MAX_TSUMO {
+                reach[j] = tsumo_probs[j] * not_tsumo_probs[j];
+            }
 
-                for j in i..MAX_TSUMO {
-                    let n = not_tsumo_probs[j];
-                    if n == 0. {
-                        // `not_tsumo_probs[j..]` must all be zero, no need to
-                        // proceed.
-                        break;
-                    }
-                    // 現在の巡目が i の場合に j 巡目に有効牌を引く確率
-                    let prob = tsumo_probs[j] * n / m;
-
-                    match &scores_or_values {
-                        ScoresOrValues::Scores(scores) => {
-                            let assume_riichi = self.sup.is_menzen && self.sup.prefer_riichi;
-                            // 聴牌の場合は次で和了
+            match &scores_or_values {
+                ScoresOrValues::Scores(scores) => {
+                    let assume_riichi = self.sup.is_menzen && self.sup.prefer_riichi;
+                    // 最後の巡目で和了の場合は海底撈月成立
+                    let haitei = |j: usize| (self.sup.calc_haitei && j == MAX_TSUMO - 1) as usize;
+                    // Sums over j > i: the win, and its value without the
+                    // bonuses that only apply at j == i or i == 0.
+                    let (mut later, mut later_value) = (0., 0.);
+                    for i in (0..MAX_TSUMO).rev() {
+                        let m = not_tsumo_probs[i];
+                        if m != 0. {
                             // i 巡目で聴牌の場合はダブル立直成立
-                            let win_double_riichi =
-                                assume_riichi && self.sup.calc_double_riichi && i == 0;
+                            let double_riichi =
+                                (assume_riichi && self.sup.calc_double_riichi && i == 0) as usize;
                             // i 巡目で聴牌し、次の巡目で和了の場合は一発成立
-                            let win_ippatsu = assume_riichi && j == i;
-                            // 最後の巡目で和了の場合は海底撈月成立
-                            let win_haitei = self.sup.calc_haitei && j == MAX_TSUMO - 1;
-                            let han_plus = win_double_riichi as usize
-                                + win_ippatsu as usize
-                                + win_haitei as usize;
-
-                            win_probs[i] += prob;
-                            exp_values[i] += prob * scores[han_plus];
+                            let ippatsu = assume_riichi as usize;
+                            let now = reach[i] * scores[double_riichi + ippatsu + haitei(i)];
+                            let rest = if double_riichi == 1 {
+                                (i + 1..MAX_TSUMO)
+                                    .map(|j| reach[j] * scores[1 + haitei(j)])
+                                    .sum::<f32>()
+                            } else {
+                                later_value
+                            };
+                            win_probs[i] += (reach[i] + later) / m;
+                            exp_values[i] += (now + rest) / m;
                         }
-                        ScoresOrValues::Values(next_values) => {
-                            if shanten == 1 {
-                                // 1向聴の場合は次で聴牌
-                                tenpai_probs[i] += prob;
-                            }
-                            if j < MAX_TSUMO - 1 {
-                                if shanten > 1 {
-                                    // 2向聴以上で max_tsumo_ - 1 巡目以下の場合
-                                    tenpai_probs[i] += prob * next_values.tenpai_probs[j + 1];
-                                }
-                                // 聴牌以上で max_tsumo_ - 1 巡目以下の場合
-                                win_probs[i] += prob * next_values.win_probs[j + 1];
-                                exp_values[i] += prob * next_values.exp_values[j + 1];
-                            }
+                        later += reach[i];
+                        later_value += reach[i] * scores[haitei(i)];
+                    }
+                }
+                ScoresOrValues::Values(next_values) => {
+                    // Sums over j >= i; the terms that read turn j + 1 stop
+                    // one short of the last turn.
+                    let (mut drawn, mut tenpai, mut win, mut value) = (0., 0., 0., 0.);
+                    for i in (0..MAX_TSUMO).rev() {
+                        drawn += reach[i];
+                        if i < MAX_TSUMO - 1 {
+                            tenpai += reach[i] * next_values.tenpai_probs[i + 1];
+                            win += reach[i] * next_values.win_probs[i + 1];
+                            value += reach[i] * next_values.exp_values[i + 1];
                         }
+                        let m = not_tsumo_probs[i];
+                        if m == 0. {
+                            // Divide-by-zero, missing in the original version.
+                            continue;
+                        }
+                        if shanten == 1 {
+                            // 1向聴の場合は次で聴牌
+                            tenpai_probs[i] += drawn / m;
+                        } else if shanten > 1 {
+                            tenpai_probs[i] += tenpai / m;
+                        }
+                        win_probs[i] += win / m;
+                        exp_values[i] += value / m;
                     }
                 }
             }
@@ -765,8 +777,11 @@ mod test {
     use crate::hand::hand;
     use crate::tuz;
 
+    /// Relative, not to the last bit. The expected values were captured from
+    /// this implementation, and summing the same terms in another order --
+    /// the draw recurrence as suffix sums -- moves them by about 3e-7.
     fn feq(a: f32, b: f32) -> bool {
-        (a - b).abs() <= f32::EPSILON
+        (a - b).abs() <= 1e-5 * b.abs().max(1.)
     }
 
     #[test]
