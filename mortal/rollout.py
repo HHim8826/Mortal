@@ -142,7 +142,16 @@ def behaviour_of(actions, masks, log, seat, sampler):
         bits = mask_bits_of(mask)
         legal = int(np.count_nonzero(mask))
         meta = metas[used] if used < len(metas) else None
-        if meta is not None and meta['mask_bits'] == bits:
+        # A decline and a kyoku-ending action never have a `meta` of their
+        # own, so they are named before one is tried. Tried first, a call
+        # declined and then taken on the very next discard -- the same offer,
+        # the same mask -- gave the decline the taken call's `meta`, and the
+        # call that was actually made came out 'unknown'.
+        if action == NONE:
+            kinds.append('declined')
+        elif action in ENDS_KYOKU:
+            kinds.append('ended')
+        elif meta is not None and meta['mask_bits'] == bits:
             used += 1
             values = meta['q_values']
             if len(values) != legal:
@@ -159,10 +168,6 @@ def behaviour_of(actions, masks, log, seat, sampler):
         elif legal == 1 and mask[action]:
             probs[i] = 1.
             kinds.append('forced')
-        elif action == NONE:
-            kinds.append('declined')
-        elif action in ENDS_KYOKU:
-            kinds.append('ended')
         elif i > 0 and actions[i - 1] == KAN:
             kinds.append('kan_select')
         else:
@@ -185,7 +190,10 @@ def aligned_metas(actions, masks, log, seat):
     used = 0
     for action, mask in zip(actions, masks):
         meta = metas[used] if used < len(metas) else None
-        if meta is not None and meta['mask_bits'] == mask_bits_of(mask):
+        if action == NONE or action in ENDS_KYOKU:
+            # Never one of their own; see behaviour_of.
+            out.append(None)
+        elif meta is not None and meta['mask_bits'] == mask_bits_of(mask):
             used += 1
             legal = int(np.count_nonzero(mask))
             # A length that does not match the mask means the pairing has
