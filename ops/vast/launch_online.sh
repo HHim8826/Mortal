@@ -140,7 +140,7 @@ done
 # replaced -- that is the bug this replaced.
 TB_LOGDIR=/root/Mortal/mortal/logs
 if ! pgrep -f "[t]ensorboard --logdir $TB_LOGDIR --host" >/dev/null; then
-    pkill -f "[t]ensorboard.*--port 6007"
+    pkill -f "[t]ensorboard.*--port 6007" || true   # nothing to replace on a fresh box, and set -e
     sleep 1
     setsid nohup /root/venv/bin/tensorboard --logdir "$TB_LOGDIR" \
         --host 127.0.0.1 --port 6007 > /root/tensorboard.log 2>&1 < /dev/null &
