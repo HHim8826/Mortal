@@ -80,6 +80,8 @@ class TestPlayer:
         # comes from.
         self.seed_base = 10000
         self.seed_key = 0x2000
+        # Walls per piece when an evaluation is played in pieces; see play_all.
+        self.chunk = config['test_play'].get('chunk')
         # Each game's rank as `paired` last read it, by file. A comparison
         # asks for the running difference after every chunk, and decoding
         # every game so far each time made those calls grow with the square
@@ -139,6 +141,25 @@ class TestPlayer:
         They share the champion, which holds nothing between calls, so it stays
         one copy of one model on the GPU.
         """
+        chunk = self.chunk or seed_count
+        if chunk < seed_count:
+            # A piece at a time, every track together within each piece. The
+            # games are the same either way -- a wall is dealt by its seed, and
+            # every piece lands in the same directories for `collect` and
+            # `paired` -- but the batches are a fraction of the size, and on a
+            # card the self-play workers already hold most of, three tracks of
+            # 4,000 games at once ran it out of memory.
+            base = self.seed_base
+            try:
+                for start in range(0, seed_count, chunk):
+                    self.seed_base = base + start
+                    self.play_all_at_once(min(chunk, seed_count - start), jobs, device)
+            finally:
+                self.seed_base = base
+            return
+        self.play_all_at_once(seed_count, jobs, device)
+
+    def play_all_at_once(self, seed_count, jobs, device):
         torch.backends.cudnn.benchmark = False
         failures = []
 
