@@ -114,6 +114,14 @@ def run_settings():
 
 
 def backup(api, dry_run=False):
+    """One round. True when the repo now holds what is on disk -- uploaded, or
+    already there -- and False when some of it could not be copied.
+
+    A failed upload raises. `main` keeps a loop going through either, and makes
+    a single round's answer its exit code: the watchdog's last backup of a
+    finished run is asking exactly this, and read success off a round that
+    had caught its own upload error.
+    """
     if STAGE.exists():
         shutil.rmtree(STAGE)
     STAGE.mkdir(parents=True)
@@ -121,15 +129,17 @@ def backup(api, dry_run=False):
     state = stable_copy(RUN / 'mortal.pth', STAGE / 'mortal.pth')
     if state is None:
         log('mortal.pth never held still long enough to copy; skipping this round')
-        return
+        return False
     steps, best = state['steps'], state['best_perf']
     del state
 
+    complete = True
     have_best = (RUN / 'best.pth').exists()
     if have_best and stable_copy(RUN / 'best.pth', STAGE / 'best.pth') is None:
         log('best.pth would not copy cleanly; uploading without it this round')
         (STAGE / 'best.pth').unlink(missing_ok=True)
         have_best = False
+        complete = False
     # The weight average's own best, a candidate until it beats best.pth.
     ema = state_ema = None
     if (RUN / 'best_ema.pth').exists():
@@ -137,6 +147,7 @@ def backup(api, dry_run=False):
         if state_ema is None:
             log('best_ema.pth would not copy cleanly; uploading without it this round')
             (STAGE / 'best_ema.pth').unlink(missing_ok=True)
+            complete = False
         else:
             ema = state_ema['best_perf']
             del state_ema
@@ -151,7 +162,7 @@ def backup(api, dry_run=False):
     last = json.loads(LAST.read_text()) if LAST.exists() else {}
     if last.get('hashes') == hashes:
         log(f'nothing has changed since the last round (step {steps:,}); nothing to back up')
-        return
+        return complete
 
     shutil.copyfile(CONFIG, STAGE / CONFIG.name)
     for name in ('train.log', 'trainer.log'):
@@ -189,12 +200,13 @@ def backup(api, dry_run=False):
                 log(f'would upload {f.relative_to(STAGE)} ({f.stat().st_size / 2**20:.1f} MB) '
                     f'to {REPO}/{PATH_IN_REPO or ""}')
         log((STAGE / 'README.md').read_text(encoding='utf-8'))
-        return
+        return complete
     api.upload_folder(folder_path=str(STAGE), repo_id=REPO, repo_type='model',
                       path_in_repo=PATH_IN_REPO,
                       commit_message=f'{"online " if ONLINE else ""}step {steps:,}')
     LAST.write_text(json.dumps({'steps': steps, 'best_perf': best, 'hashes': hashes}))
     log(f'backed up step {steps:,} (best {best}){" with best.pth" if have_best else ""}')
+    return complete
 
 
 def main():
@@ -210,15 +222,18 @@ def main():
         sys.exit(f'{REPO} is public; refusing to upload checkpoints to it')
 
     while True:
+        ok = False
         try:
             with open(LOCK, 'w') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
-                backup(api, dry_run=args.dry_run)
+                ok = backup(api, dry_run=args.dry_run)
         except Exception as exc:
             # A failed round must not end the loop; the next one retries.
             log(f'backup failed: {exc!r}')
         if not args.loop:
-            return
+            # A single round is someone asking whether the repo now holds the
+            # run, so the answer goes into the exit code.
+            sys.exit(0 if ok else 1)
         time.sleep(BACKUP_EVERY)
 
 

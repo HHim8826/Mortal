@@ -25,7 +25,7 @@ PHASE_FILE=${WATCHDOG_PHASE:-/root/phase}
 STOP_AT_FILE=${WATCHDOG_STOP_AT:-/root/stop_at_step}
 MORTAL=${WATCHDOG_MORTAL:-/root/Mortal/mortal}
 PIDFILE=${WATCHDOG_PIDFILE:-/root/watchdog.pid}
-PY=/root/venv/bin/python
+PY=${WATCHDOG_PY:-/root/venv/bin/python}
 CHECK_EVERY=60
 
 say() {
@@ -203,6 +203,39 @@ stop_run() {
     sleep 5
 }
 
+# One last backup of a finished run before letting go: the loop's next round
+# could be two hours off, and a finished run is the one most likely to have its
+# box destroyed before then. The backup takes a lock, so this cannot run into a
+# round of the loop, and a single round exits non-zero when the repo does not
+# now hold the run.
+#
+# Returns 0 once the run is backed up and the watchdog may exit. Until then the
+# run stays stopped and the watchdog stays, trying again every FINAL_RETRY
+# seconds: "finished" in the log is what tells a person the box can go, so it
+# is not written while the last state exists only here.
+BACKUP_SCRIPT=${WATCHDOG_BACKUP:-/root/backup_hf.py}
+BACKUP_LOG=${WATCHDOG_BACKUP_LOG:-/root/backup.log}
+FINAL_RETRY=${WATCHDOG_FINAL_RETRY:-600}
+final_done=''
+final_tried=0
+
+finished_and_backed_up() {
+    local now
+    [ -n "$final_done" ] && return 0
+    # A box that was never given the backup has nothing to wait for.
+    [ -e "$BACKUP_SCRIPT" ] || { final_done=1; return 0; }
+    now=$(date +%s)
+    [ $((now - final_tried)) -ge "$FINAL_RETRY" ] || return 1
+    final_tried=$now
+    say "the $1 run finished; backing it up once more"
+    if MORTAL_RUN="$(run_dir "$1")" "$PY" "$BACKUP_SCRIPT" >> "$BACKUP_LOG" 2>&1; then
+        final_done=1
+        return 0
+    fi
+    say "the final backup FAILED; the $1 run stays stopped and this tries again every $((FINAL_RETRY / 60)) min. Do not release the box: see $BACKUP_LOG"
+    return 1
+}
+
 fails=0
 first_fail=0
 
@@ -293,17 +326,11 @@ while true; do
     fi
 
     if training_complete "$p"; then
-        # One last backup before letting go: the loop's next round could be two
-        # hours off, and a finished run is the one most likely to have its box
-        # destroyed before then. The backup takes a lock, so this cannot run
-        # into a round of the loop.
-        if [ -e /root/backup_hf.py ]; then
-            say "the $p run finished; backing it up once more"
-            MORTAL_RUN="$(run_dir "$p")" "$PY" /root/backup_hf.py >> /root/backup.log 2>&1 \
-                || say "the final backup failed; see /root/backup.log"
+        if finished_and_backed_up "$p"; then
+            say "the $p run finished and is backed up; nothing left to watch"
+            exit 0
         fi
-        say "the $p run finished; nothing left to watch"
-        exit 0
+        continue
     fi
     say "the $p run is not running; it crashed or was killed"
     tr '\r' '\n' < "$(main_log "$p")" 2>/dev/null \
