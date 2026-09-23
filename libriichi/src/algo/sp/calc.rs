@@ -234,9 +234,9 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
             } else if self.sup.calc_shanten_down && shanten_diff == 1 && shanten < SHANTEN_THRES {
                 self.state.discard(tile);
                 let required_tiles = self.state.get_required_tiles(self.sup.tehai_len_div3);
-                self.state.n_extra_tsumo += 1;
+                self.state.add_extra_tsumo();
                 let values = self.draw(shanten + 1);
-                self.state.n_extra_tsumo -= 1;
+                self.state.remove_extra_tsumo();
                 self.state.undo_discard(tile);
 
                 let candidate = Candidate::from(RawCandidate {
@@ -418,9 +418,9 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
             }
 
             self.state.deal(tile);
-            self.state.n_extra_tsumo += 1;
+            self.state.add_extra_tsumo();
             let next_values = self.discard(shanten);
-            self.state.n_extra_tsumo -= 1;
+            self.state.remove_extra_tsumo();
             self.state.undo_deal(tile);
 
             for i in 0..MAX_TSUMO - 1 {
@@ -594,9 +594,9 @@ impl<const MAX_TSUMO: usize> SPCalculatorState<'_, MAX_TSUMO> {
             {
                 // 向聴戻しになる打牌
                 self.state.discard(tile);
-                self.state.n_extra_tsumo += 1;
+                self.state.add_extra_tsumo();
                 values = self.draw(shanten + 1);
-                self.state.n_extra_tsumo -= 1;
+                self.state.remove_extra_tsumo();
                 self.state.undo_discard(tile);
             } else {
                 // 手牌に存在しない牌、または向聴落としが無効な場合に向聴落としとなる牌
