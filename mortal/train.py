@@ -377,6 +377,20 @@ def train():
             with torch.no_grad():
                 torch._foreach_lerp_(ema_tensors, live_tensors, 1 - ema_decay)
 
+    # The watchdog restarts a run that has written nothing for an hour, and a
+    # checkpoint is not the only sign of life: an evaluation of 8,000 walls
+    # plays for longer than that between two saves, and was killed as stuck
+    # before the gate could decide. This file is rewritten at every save and
+    # after every piece of an evaluation, and the watchdog reads the newer of
+    # the two. A piece that never finishes still stops it.
+    heartbeat_file = path.join(path.dirname(state_file) or '.', 'heartbeat')
+
+    def heartbeat(what):
+        if not ddp.is_main:
+            return
+        with open(heartbeat_file, 'w', encoding='utf-8') as f:
+            f.write(f'{datetime.now().isoformat(timespec="seconds")} step {steps} {what}\n')
+
     def save_state():
         """Write the checkpoint and return it.
 
@@ -405,6 +419,7 @@ def train():
             state['best_perf_ema'] = best_perf_ema
         if ddp.is_main:
             torch.save(state, state_file)
+        heartbeat('saved')
         return state
 
     optimizer.zero_grad(set_to_none=True)
@@ -733,7 +748,11 @@ def train():
                                      f'at key {test_player.seed_key:#x}')
                     # All of them at once: one arena alone leaves most of the
                     # box idle, and they are independent games. See play_all.
-                    test_player.play_all(test_games // 4, jobs, device)
+                    def piece_done(done, total):
+                        heartbeat(f'evaluating, {done:,} of {total:,} walls played')
+                        logging.info(f'evaluation: {done:,} of {total:,} walls played')
+
+                    test_player.play_all(test_games // 4, jobs, device, on_piece=piece_done)
                     ddp.barrier()
                     mortal.train()
                     dqn.train()

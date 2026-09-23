@@ -126,8 +126,13 @@ class TestPlayer:
     def play(self, seed_count, mortal, dqn, device, track=None):
         self.play_all(seed_count, [(mortal, dqn, track)], device)
 
-    def play_all(self, seed_count, jobs, device):
+    def play_all(self, seed_count, jobs, device, on_piece=None):
         """Play this rank's seeds with each (mortal, dqn, track), all at once.
+
+        `on_piece(done, total)`, if given, is called with the walls played so
+        far after every piece: an evaluation of 8,000 walls runs for more than
+        an hour without saving anything, and this is how the trainer says it
+        is still getting somewhere.
 
         The tracks are separate games that only share seeds, and libriichi
         releases the GIL while it plays them, so threads here really do run at
@@ -153,11 +158,16 @@ class TestPlayer:
             try:
                 for start in range(0, seed_count, chunk):
                     self.seed_base = base + start
-                    self.play_all_at_once(min(chunk, seed_count - start), jobs, device)
+                    here = min(chunk, seed_count - start)
+                    self.play_all_at_once(here, jobs, device)
+                    if on_piece:
+                        on_piece(start + here, seed_count)
             finally:
                 self.seed_base = base
             return
         self.play_all_at_once(seed_count, jobs, device)
+        if on_piece:
+            on_piece(seed_count, seed_count)
 
     def play_all_at_once(self, seed_count, jobs, device):
         torch.backends.cudnn.benchmark = False

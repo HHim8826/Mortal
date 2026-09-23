@@ -9,6 +9,8 @@ must load before anything is uploaded. A torn file never reaches the repo.
 """
 import argparse
 import datetime
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -33,9 +35,13 @@ ONLINE = RUN.name == 'v4o'
 # and 600k weights with its own. `online/` stays that first run's.
 HF_PATH_FILE = Path(os.environ.get('MORTAL_HF_PATH_FILE', '/root/hf_path'))
 RESERVED = {'online'}
-CONFIG = Path('/root/Mortal/mortal/'
+CONFIG = Path(os.environ.get('MORTAL_HF_CONFIG') or '/root/Mortal/mortal/'
               + ('config.online.toml' if ONLINE else 'config.vast.toml'))
-STAGE = Path('/root/hf-backup-stage')
+# Where the round is staged and remembered, and the lock that keeps a one-off
+# backup (the watchdog's, when a run ends) from running into the loop's.
+STATE_DIR = Path(os.environ.get('MORTAL_HF_STATE_DIR', '/root'))
+STAGE = STATE_DIR / 'hf-backup-stage'
+LOCK = STATE_DIR / 'hf-backup.lock'
 BACKUP_EVERY = 2 * 3600
 
 
@@ -51,8 +57,15 @@ def path_in_repo():
 
 
 PATH_IN_REPO = path_in_repo()
-LAST = Path(f'/root/hf-backup-last-{PATH_IN_REPO}.json' if ONLINE
-            else '/root/hf-backup-last.json')
+LAST = STATE_DIR / (f'hf-backup-last-{PATH_IN_REPO}.json' if ONLINE else 'hf-backup-last.json')
+
+
+def sha256_of(file):
+    h = hashlib.sha256()
+    with open(file, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
 
 
 def log(msg):
@@ -112,11 +125,6 @@ def backup(api, dry_run=False):
     steps, best = state['steps'], state['best_perf']
     del state
 
-    last = json.loads(LAST.read_text()) if LAST.exists() else {}
-    if last.get('steps') == steps:
-        log(f'still at step {steps}; nothing new to back up')
-        return
-
     have_best = (RUN / 'best.pth').exists()
     if have_best and stable_copy(RUN / 'best.pth', STAGE / 'best.pth') is None:
         log('best.pth would not copy cleanly; uploading without it this round')
@@ -132,6 +140,18 @@ def backup(api, dry_run=False):
         else:
             ema = state_ema['best_perf']
             del state_ema
+
+    # What was staged, by content. Not by step: a gated run writes a second
+    # checkpoint at the step it evaluates -- the gate's failure count, and a
+    # new champion in best_ema.pth -- and a round that had already uploaded the
+    # first under that step skipped the second for good. When the gate then
+    # stopped the run no later step ever came, and the repo kept the state
+    # from before the decision.
+    hashes = {f.name: sha256_of(f) for f in sorted(STAGE.glob('*.pth'))}
+    last = json.loads(LAST.read_text()) if LAST.exists() else {}
+    if last.get('hashes') == hashes:
+        log(f'nothing has changed since the last round (step {steps:,}); nothing to back up')
+        return
 
     shutil.copyfile(CONFIG, STAGE / CONFIG.name)
     for name in ('train.log', 'trainer.log'):
@@ -173,7 +193,7 @@ def backup(api, dry_run=False):
     api.upload_folder(folder_path=str(STAGE), repo_id=REPO, repo_type='model',
                       path_in_repo=PATH_IN_REPO,
                       commit_message=f'{"online " if ONLINE else ""}step {steps:,}')
-    LAST.write_text(json.dumps({'steps': steps, 'best_perf': best}))
+    LAST.write_text(json.dumps({'steps': steps, 'best_perf': best, 'hashes': hashes}))
     log(f'backed up step {steps:,} (best {best}){" with best.pth" if have_best else ""}')
 
 
@@ -191,7 +211,9 @@ def main():
 
     while True:
         try:
-            backup(api, dry_run=args.dry_run)
+            with open(LOCK, 'w') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                backup(api, dry_run=args.dry_run)
         except Exception as exc:
             # A failed round must not end the loop; the next one retries.
             log(f'backup failed: {exc!r}')

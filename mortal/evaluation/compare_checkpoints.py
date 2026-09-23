@@ -147,6 +147,10 @@ def main():
     device = torch.device(args.device or config['control']['device'])
     player = TestPlayer(device=device, opponent=args.opponent)
     player.seed_base, player.seed_key = args.base, key
+    # --chunk is the arena size here, and this loop cuts the walls into pieces
+    # itself. The config's test_play.chunk is for the trainer's evaluation on a
+    # card the workers share; left on, it cut every --chunk 1000 into four 250s.
+    player.chunk = None
 
     opponent = args.opponent or config['baseline']['test']['state_file']
     jobs, meta = [], []

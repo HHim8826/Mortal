@@ -116,6 +116,26 @@ last_step() {
         | sed 's/.*total steps: //; s/ .*//; s/,//g'
 }
 
+# Seconds since the run last showed it was getting somewhere: the newer of its
+# checkpoint and the heartbeat train.py rewrites at every save and after every
+# piece of an evaluation. The checkpoint alone was the old test, and an
+# evaluation of 8,000 walls runs longer than the online stall limit without
+# saving -- it was restarted as stuck before the gate could decide, and the
+# restarted trainer resumed past the evaluation and never ran it again. Empty
+# when there is no checkpoint yet.
+quiet_for() {
+    local run ckpt beat seen
+    run=$(run_dir "$1")
+    ckpt="$run/mortal.pth"
+    beat="$run/heartbeat"
+    [ -e "$ckpt" ] || return
+    seen=$(stat -c %Y "$ckpt")
+    if [ -e "$beat" ] && [ "$(stat -c %Y "$beat")" -gt "$seen" ]; then
+        seen=$(stat -c %Y "$beat")
+    fi
+    echo $(( $(date +%s) - seen ))
+}
+
 # The last line of a finished run, written by train.py once the epoch is done.
 # Without this a completed run would be restarted for ever.
 #
@@ -262,11 +282,10 @@ while true; do
     gated=''
 
     if alive "$p"; then
-        ckpt="$(run_dir "$p")/mortal.pth"
-        [ -e "$ckpt" ] || continue
-        age=$(( $(date +%s) - $(stat -c %Y "$ckpt") ))
+        age=$(quiet_for "$p")
+        [ -n "$age" ] || continue
         if [ "$age" -gt "$(stall "$p")" ]; then
-            say "nothing saved for $age s: the $p run is stuck, restarting it"
+            say "nothing saved and no evaluation progress for $age s: the $p run is stuck, restarting it"
             stop_run "$p"
             start_run "$p"
         fi
@@ -274,6 +293,15 @@ while true; do
     fi
 
     if training_complete "$p"; then
+        # One last backup before letting go: the loop's next round could be two
+        # hours off, and a finished run is the one most likely to have its box
+        # destroyed before then. The backup takes a lock, so this cannot run
+        # into a round of the loop.
+        if [ -e /root/backup_hf.py ]; then
+            say "the $p run finished; backing it up once more"
+            MORTAL_RUN="$(run_dir "$p")" "$PY" /root/backup_hf.py >> /root/backup.log 2>&1 \
+                || say "the final backup failed; see /root/backup.log"
+        fi
         say "the $p run finished; nothing left to watch"
         exit 0
     fi
