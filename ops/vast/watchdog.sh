@@ -118,8 +118,18 @@ last_step() {
 
 # The last line of a finished run, written by train.py once the epoch is done.
 # Without this a completed run would be restarted for ever.
+#
+# Or the gate's stop: with gate_patience set, the trainer exits 3 after that
+# many evaluations without a new champion, and that is the run ending itself,
+# not a crash. Restarted, it would read the count back, train another
+# evaluation's worth, fail, stop, and be restarted again -- the stopping rule
+# undone one evaluation at a time. Only after the last launch, so a run started
+# again by hand is watched again.
 training_complete() {
-    tail -c 200000 "$(main_log "$1")" 2>/dev/null | tr '\r' '\n' | grep -q 'training is complete'
+    tail -c 200000 "$(main_log "$1")" 2>/dev/null | tr '\r' '\n' \
+        | awk '/^==== launched/ { done = 0 }
+               /training is complete|evaluations without a new champion, stopping/ { done = 1 }
+               END { exit !done }'
 }
 
 stop_at() {
@@ -226,7 +236,10 @@ while true; do
     find "$MORTAL/online" -maxdepth 2 -name '.ipynb_checkpoints' -type d \
         -exec rm -rf {} + 2>/dev/null
 
-    if ! pgrep -f "[b]ackup_hf.py --loop" >/dev/null; then
+    # Only on a box that was given the backup script: one without Hugging Face
+    # credentials would retry it every minute, and a run that is not the one
+    # the repository's `online/` holds should not be uploading over it.
+    if [ -e /root/backup_hf.py ] && ! pgrep -f "[b]ackup_hf.py --loop" >/dev/null; then
         say "backup loop is gone; starting it"
         setsid nohup env MORTAL_RUN="$(run_dir "$p")" \
             "$PY" /root/backup_hf.py --loop >> /root/backup.log 2>&1 < /dev/null &

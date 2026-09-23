@@ -119,8 +119,17 @@ done
 start trainer MORTAL_DEVICE=cuda:0 MORTAL_LOADER_RAYON_THREADS=$LOADER_RAYON \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True $PY train.py
 
+# The workers get the second card when there is one. On a one-card box they
+# share it with the trainer, which with most of the trunk frozen needs far less
+# of it than the whole-trunk run this was written for.
+if [ -z "${WORKER_DEVICE:-}" ]; then
+    WORKER_DEVICE=cuda:1
+    [ "$(nvidia-smi -L | wc -l)" -ge 2 ] || WORKER_DEVICE=cuda:0
+fi
+echo "workers on $WORKER_DEVICE"
+
 for i in $(seq 0 $((WORKERS - 1))); do
-    start "worker$i" MORTAL_DEVICE=cuda:1 MORTAL_WORKER=$i \
+    start "worker$i" MORTAL_DEVICE=$WORKER_DEVICE MORTAL_WORKER=$i \
         RAYON_NUM_THREADS=$WORKER_RAYON $PY client.py
 done
 

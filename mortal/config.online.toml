@@ -128,7 +128,12 @@ gate_margin = 1.0
 #
 # The real lever is neither knob. One evaluation here is 1,000 walls; the same
 # comparison at 8,000 has half the noise. Evaluate rarely and large.
-gate_patience = 0
+#
+# 3 for the run from 560k with the trunk frozen to its last 4 blocks, which is
+# exactly the second kind: it is asking whether freezing lets self-play get
+# past 560k at all, and three evaluations without a new champion is the answer
+# "no" at a cost of 30,000 steps.
+gate_patience = 3
 
 [dataset]
 # Online reads the drained self-play logs, whose paths the server hands over;
