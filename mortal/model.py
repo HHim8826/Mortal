@@ -199,23 +199,31 @@ class Brain(nn.Module):
         frozen) so a run can log what it actually did rather than what it asked
         for.
         """
+        self._frozen_mods = self.trunk_frozen_by(trainable_blocks)
+        # Everything back first, so going from 4 trainable blocks to 6 thaws
+        # the two between rather than leaving them held from last time.
+        self.encoder.requires_grad_(True)
+        for mod in self._frozen_mods:
+            mod.requires_grad_(False)
+        self.train(self.training)
+        blocks = sum(isinstance(m, ResBlock) for m in self._frozen_mods)
+        return blocks, sum(p.numel() for m in self._frozen_mods for p in m.parameters())
+
+    def trunk_frozen_by(self, trainable_blocks):
+        """The encoder modules `freeze_trunk(trainable_blocks)` holds, without holding them.
+
+        Its own method for resuming: a checkpoint saved under one setting and
+        read under another has to know which parameters the saved optimizer
+        was carrying moments for, and that follows from the setting alone.
+        """
         mods = list(self.encoder.net)
         at = [i for i, m in enumerate(mods) if isinstance(m, ResBlock)]
         if not trainable_blocks or trainable_blocks >= len(at):
-            self._frozen_mods = []
-            self.encoder.requires_grad_(True)
-            return 0, 0
+            return []
         # Everything up to and including the last block being frozen: the stem
         # convolution, every earlier block, and for a post-activation layout
         # the norm and activation that sit between them.
-        cut = at[len(at) - trainable_blocks - 1]
-        self._frozen_mods = mods[:cut + 1]
-        frozen = 0
-        for mod in self._frozen_mods:
-            mod.requires_grad_(False)
-            frozen += sum(p.numel() for p in mod.parameters())
-        self.train(self.training)
-        return len(at) - trainable_blocks, frozen
+        return mods[:at[len(at) - trainable_blocks - 1] + 1]
 
     def reset_running_stats(self):
         for mod in self.modules():

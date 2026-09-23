@@ -257,22 +257,24 @@ def main():
     where = 'every dimension' if args.full else f'rank {args.rank}'
     print(f'\n=== out of sample, {len(parts)} folds split by block, {where} ===')
     print(f"{'alpha':>10} {'R^2 vs mean':>12} {'R^2 vs logit gap':>17} {'corr':>7}")
-    every = full_probe(data, parts, args.alpha) if args.full else None
-    ready = None if args.full else [prepare(~t, t, data, args.rank) for t in parts]
-    best, best_pred = None, None
-    for alpha in args.alpha:
-        if every is not None:
-            pred = every[alpha]
-        else:
-            pred = np.zeros(n)
+    # Every alpha's out-of-fold prediction, solved once and read by both tables
+    # below: one n-vector an alpha, where solving again for the second table
+    # doubled the work and grew with --rank.
+    if args.full:
+        every = full_probe(data, parts, args.alpha)
+    else:
+        ready = [prepare(~t, t, data, args.rank) for t in parts]
+        every = {}
+        for alpha in args.alpha:
+            every[alpha] = np.zeros(n)
             for test, got in zip(parts, ready):
-                pred[test] = fit_and_predict(got, alpha)
+                every[alpha][test] = fit_and_predict(got, alpha)
+    for alpha in args.alpha:
+        pred = every[alpha]
         r2 = 1 - ((y - pred) ** 2).sum() / ((y - y.mean()) ** 2).sum()
         r2b = 1 - ((y - pred) ** 2).sum() / ((y - base) ** 2).sum()
         c = np.corrcoef(pred, y)[0, 1]
         print(f'{alpha:>10.0f} {r2:>12.5f} {r2b:>17.5f} {c:>7.4f}')
-        if best is None or r2 > best[1]:
-            best, best_pred = (alpha, r2), pred.copy()
 
     print()
     print('=== what following the probe would have been worth, at every alpha ===')
@@ -284,13 +286,7 @@ def main():
     print(f'{"alpha":>10} {"threshold":>10} {"switched":>9} {"share":>7} '
           f'{"gain per decision, GRP":>27}')
     for alpha in args.alpha:
-        if every is not None:
-            pred = every[alpha]
-        else:
-            pred = np.zeros(n)
-            for test, got in zip(parts, ready):
-                pred[test] = fit_and_predict(got, alpha)
-        for t, k, share, per, se in value_of_following(pred, y):
+        for t, k, share, per, se in value_of_following(every[alpha], y):
             flag = '' if se == 0 else f'  ({per / se:+.1f} se)'
             print(f'{alpha:>10.0f} {t:>10.2f} {k:>9,} {share:>6.1f}% '
                   f'{per:>+16.5f} +-{se:.5f}{flag}')

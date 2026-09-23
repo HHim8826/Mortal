@@ -80,6 +80,14 @@ class TestPlayer:
         # comes from.
         self.seed_base = 10000
         self.seed_key = 0x2000
+        # Each game's rank as `paired` last read it, by file. A comparison
+        # asks for the running difference after every chunk, and decoding
+        # every game so far each time made those calls grow with the square
+        # of the chunk count: 15 chunks of 1,000 walls read 120,000 files
+        # 960,000 times. Keyed on size and mtime as well as the path, because
+        # an ungated evaluation clears a track and deals the same seeds into
+        # the same file names again.
+        self._ranks = {}
 
     def test_play(self, seed_count, mortal, dqn, device):
         self.clear()
@@ -95,8 +103,12 @@ class TestPlayer:
         return self.log_dir if track is None else f'{self.log_dir}_{track}'
 
     def clear(self, track=None):
-        if path.isdir(self.track_dir(track)):
-            shutil.rmtree(self.track_dir(track))
+        where = self.track_dir(track)
+        if path.isdir(where):
+            shutil.rmtree(where)
+        # So the cache holds one evaluation's games, not every one a run made.
+        inside = path.join(where, '')
+        self._ranks = {f: r for f, r in self._ranks.items() if not f.startswith(inside)}
 
     def seeds(self, seed_count):
         """This rank's contiguous slice of [seed_base, seed_base + seed_count).
@@ -203,10 +215,16 @@ class TestPlayer:
         Returns (mean difference, its standard error, games, seeds).
         """
         def rank_in(file):
+            st = os.stat(file)
+            got = self._ranks.get(file)
+            if got is not None and got[:2] == (st.st_size, st.st_mtime_ns):
+                return got[2]
             with gzip.open(file, 'rt') as f:
                 log = f.read()
             names = json.loads(log.split('\n', 1)[0])['names']
-            return Stat.from_log(log, names.index('mortal')).avg_rank
+            rank = Stat.from_log(log, names.index('mortal')).avg_rank
+            self._ranks[file] = (st.st_size, st.st_mtime_ns, rank)
+            return rank
 
         base = self.track_dir(against)
         by_seed = defaultdict(list)

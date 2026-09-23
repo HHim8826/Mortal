@@ -31,6 +31,73 @@ def gate_says_replace(diff, se, margin=1.):
     return diff < -margin * se
 
 
+def optimizer_groups(models, keep):
+    """The optimizer's two parameter groups, as names in the order it holds them.
+
+    `models` maps a prefix to a module, and `keep(param)` says whether a
+    parameter is in the optimizer at all. Weight decay goes to the weights of
+    linear and convolutional layers and nothing else.
+
+    Names, because a saved optimizer keys its state by position, and a position
+    means nothing once the set of parameters has changed: freeze four more
+    blocks and every index after them shifts.
+    """
+    from torch import nn
+
+    decay, no_decay = [], []
+    for prefix, model in models.items():
+        names = set()
+        to_decay = set()
+        for mod_name, mod in model.named_modules():
+            for name, param in mod.named_parameters(prefix=mod_name, recurse=False):
+                if not keep(param):
+                    continue
+                names.add(name)
+                if isinstance(mod, (nn.Linear, nn.Conv1d)) and name.endswith('weight'):
+                    to_decay.add(name)
+        decay.extend(f'{prefix}.{name}' for name in sorted(to_decay))
+        no_decay.extend(f'{prefix}.{name}' for name in sorted(names - to_decay))
+    return [decay, no_decay]
+
+
+def carry_moments(held, held_names, names, want):
+    """A saved optimizer state re-keyed from the parameters it was saved over onto these.
+
+    `held` is the saved `state_dict()` and `held_names` its groups as names;
+    `names` is this run's groups and `want` this optimizer's own
+    `state_dict()`, for the positions. A parameter trained in both keeps its
+    moments and its step count, one that has started training starts from
+    nothing, which is where it would have started anyway, and the moments of
+    one that is now frozen are dropped.
+
+    Returns the state to load and how many parameters were (kept, started,
+    dropped). If the saved groups are not the size their names say, the names
+    are wrong and nothing is matched: putting one tensor's history on another
+    is worse than refusing.
+    """
+    sizes = [len(g['params']) for g in held['param_groups']]
+    if len(sizes) != len(want['param_groups']) or sizes != [len(g) for g in held_names]:
+        raise ValueError(
+            f'the saved optimizer has groups of {sizes} parameters but its names say '
+            f'{[len(g) for g in held_names]}, and this run has '
+            f'{[len(g["params"]) for g in want["param_groups"]]}: the moments cannot be '
+            'matched to the parameters they belong to')
+    by_name = {}
+    for group, group_names in zip(held['param_groups'], held_names):
+        for at, name in zip(group['params'], group_names):
+            if at in held['state']:
+                by_name[name] = held['state'][at]
+    merged = {'state': {}, 'param_groups': []}
+    for old, new, group_names in zip(held['param_groups'], want['param_groups'], names):
+        for at, name in zip(new['params'], group_names):
+            if name in by_name:
+                merged['state'][at] = by_name[name]
+        merged['param_groups'].append({**old, 'params': new['params']})
+    now = {name for group in names for name in group}
+    kept = len(by_name.keys() & now)
+    return merged, (kept, len(now) - kept, len(by_name.keys() - now))
+
+
 def train():
     import prelude
 
@@ -133,27 +200,18 @@ def train():
             f'{trainable_blocks} train; {was_trainable:,} -> {now:,} trainable parameters '
             f'({100 * now / was_trainable:.1f}%)')
 
-    decay_params = []
-    no_decay_params = []
-    for model in all_models:
-        params_dict = {}
-        to_decay = set()
-        for mod_name, mod in model.named_modules():
-            for name, param in mod.named_parameters(prefix=mod_name, recurse=False):
-                # A frozen parameter is left out of the optimizer, not merely
-                # left without a gradient: AdamW would otherwise carry two
-                # moment tensors for each one, which for a 40-block trunk is
-                # most of 87 MB of a card the workers are already sharing.
-                if not param.requires_grad:
-                    continue
-                params_dict[name] = param
-                if isinstance(mod, (nn.Linear, nn.Conv1d)) and name.endswith('weight'):
-                    to_decay.add(name)
-        decay_params.extend(params_dict[name] for name in sorted(to_decay))
-        no_decay_params.extend(params_dict[name] for name in sorted(params_dict.keys() - to_decay))
+    named_models = {'mortal': mortal, 'dqn': dqn, 'aux_net': aux_net}
+    params_by_name = {f'{prefix}.{name}': param
+                      for prefix, model in named_models.items()
+                      for name, param in model.named_parameters()}
+    # A frozen parameter is left out of the optimizer, not merely left without
+    # a gradient: AdamW would otherwise carry two moment tensors for each one,
+    # which for a 40-block trunk is most of 87 MB of a card the workers are
+    # already sharing.
+    group_names = optimizer_groups(named_models, lambda param: param.requires_grad)
     param_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': no_decay_params},
+        {'params': [params_by_name[name] for name in group_names[0]], 'weight_decay': weight_decay},
+        {'params': [params_by_name[name] for name in group_names[1]]},
     ]
     # Fused keeps the step free of host syncs: with GradScaler it skips an
     # overflowed step on the device instead of reading found_inf back, and it
@@ -189,7 +247,23 @@ def train():
         dqn.load_state_dict(state['current_dqn'])
         aux_net.load_state_dict(state['aux_net'])
         if not online or state['config']['control']['online']:
-            optimizer.load_state_dict(state['optimizer'])
+            held_names = state.get('optimizer_names')
+            if held_names is None:
+                # Saved before the names were. What it carried follows from the
+                # freeze it was saved under, and from nothing at all before
+                # there was one: every parameter, in these groups.
+                was = state['config'].get('freeze', {}).get('trainable_blocks', 0)
+                held_frozen = {id(p) for m in mortal.trunk_frozen_by(was) for p in m.parameters()}
+                held_names = optimizer_groups(named_models, lambda param: id(param) not in held_frozen)
+            # Not `load_state_dict` on the saved state as it stands: that
+            # matches by position, and refuses outright once a different
+            # freeze has changed how many parameters there are.
+            carried, (kept, started, dropped) = carry_moments(
+                state['optimizer'], held_names, group_names, optimizer.state_dict())
+            optimizer.load_state_dict(carried)
+            if started or dropped:
+                logging.info(f'optimizer: {kept:,} parameters keep their moments, {started:,} '
+                             f'start fresh, {dropped:,} are no longer trained and drop theirs')
             if fused:
                 # load_state_dict takes every group setting from the checkpoint,
                 # `fused` included, so one saved by the foreach version would
@@ -315,6 +389,9 @@ def train():
             'current_dqn': dqn.state_dict(),
             'aux_net': aux_net.state_dict(),
             'optimizer': optimizer.state_dict(),
+            # Which parameter each of those positions is, so a run that
+            # freezes differently can still find its moments.
+            'optimizer_names': group_names,
             'scheduler': scheduler.state_dict(),
             'scaler': scaler.state_dict(),
             'steps': steps,
@@ -790,8 +867,14 @@ def train():
                             }, prev_ema_file)
                         writer.flush()
 
-                    if (better or better_ema) and ddp.is_main:
-                        torch.save(state, state_file)  # with the new best_perf in it
+                    if better or better_ema or gate:
+                        # Again, now the evaluation has something to add: the
+                        # new records, and the gate's count of failures. The
+                        # count has to be written whether or not anything won,
+                        # because online exits below and the next child reads
+                        # it back from this file; saved only on a win, it was
+                        # 0 on every restart and the patience never ran out.
+                        state = save_state()
                     if better and ddp.is_main:
                         logging.info(
                             'a new record has been made, '

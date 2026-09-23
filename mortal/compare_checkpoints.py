@@ -32,6 +32,7 @@ two fall into each other's gaps and the pair costs far less than twice one.
         logs/hf-0911/best_ema.pth logs/best_ema.pth
 """
 import argparse
+import json
 import logging
 import os
 import time
@@ -42,6 +43,7 @@ import torch
 
 import prelude                                          # noqa: F401
 from config import config
+from evaluate import sha256_of
 from model import Brain, DQN
 from player import TestPlayer
 
@@ -49,6 +51,9 @@ from player import TestPlayer
 # `evaluate.py` owns them; the kyoku GRP delta is a different scale and the
 # two must never be mixed.
 PTS = [90, 45, 0, -135]
+# Beside a track's games, what played them. Not *.json: `Stat.from_dir` reads
+# every *.json under the directory as a game log.
+IDENTITY = 'identity.jsonl'
 
 
 def load(file):
@@ -73,7 +78,32 @@ def load(file):
     if steps is None:
         got = state.get('optimizer', {}).get('state', {}).get(0, {}).get('step')
         steps = int(got) if got is not None else None
-    return brain, dqn, version, steps, state.get('best_perf')
+    return brain, dqn, version, steps, state.get('best_perf'), 'ema' if ema else 'trained'
+
+
+def identity(file, weights, opponent):
+    """What a track's games were played by, as far as the games can depend on it.
+
+    The contents, not the path: a trainer overwrites `best_ema.pth` in place,
+    and a path that still names the checkpoint an interrupted comparison was
+    playing says nothing about whether it still holds it.
+    """
+    base = config['baseline']['test']
+    return {
+        'checkpoint': sha256_of(file),
+        'weights': weights,
+        'opponent': sha256_of(opponent),
+        'opponent_head': base.get('head', 'dqn'),
+        'version': config['control']['version'],
+    }
+
+
+def played_by(track_dir):
+    try:
+        with open(path.join(track_dir, IDENTITY), encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
 
 
 def main():
@@ -116,12 +146,12 @@ def main():
 
     device = torch.device(args.device or config['control']['device'])
     player = TestPlayer(device=device, opponent=args.opponent)
-    logging.info(f'opponent: {args.opponent or config["baseline"]["test"]["state_file"]}')
     player.seed_base, player.seed_key = args.base, key
 
+    opponent = args.opponent or config['baseline']['test']['state_file']
     jobs, meta = [], []
     for name, file in zip(('a', 'b'), args.checkpoints):
-        brain, dqn, version, steps, best = load(file)
+        brain, dqn, version, steps, best, weights = load(file)
         if version != player.chal_version:
             raise SystemExit(f'{file} is v{version} and the config is '
                              f'v{player.chal_version}; they read different observations')
@@ -129,13 +159,28 @@ def main():
                      dqn.to(device).requires_grad_(False), name))
         label = path.join(path.basename(path.dirname(file)), path.basename(file))
         meta.append((name, label, steps, best))
+        track = player.track_dir(name)
+        want = dict(identity(file, weights, opponent), key=key)
         if args.resume:
-            have = len(glob(path.join(player.track_dir(name), '**', '*.json.gz'),
-                            recursive=True))
+            have = len(glob(path.join(track, '**', '*.json.gz'), recursive=True))
+            had = played_by(track)
+            # `paired` matches games by seed and nothing else, so games from
+            # another checkpoint pair up with these just as well and the mix
+            # comes out labelled as this one. Checked here or not at all.
+            if have and had != want:
+                raise SystemExit(
+                    f'{name}: the {have:,} games in {track} were played by '
+                    f'{had or "something this version did not record"}, and this run is '
+                    f'{want}. --resume only continues the same checkpoint, weights, '
+                    'opponent and key; drop it to start the track over')
             logging.info(f'{name}: keeping {have:,} games already played')
         else:
             player.clear(name)
+        os.makedirs(track, exist_ok=True)
+        with open(path.join(track, IDENTITY), 'w', encoding='utf-8') as f:
+            json.dump(want, f)
 
+    logging.info(f'opponent: {opponent}')
     for name, base, steps, best in meta:
         logging.info(f'{name}: {base}, {steps:,} steps, recorded best {best}'
                      if steps else f'{name}: {base}, recorded best {best}')
