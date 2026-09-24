@@ -10,7 +10,7 @@ version = 4
 online = false
 # Global: split evenly over the eight chips.
 batch_size = 1024
-save_every = 2000
+save_every = 10000
 ema_decay = 0.9998
 
 [dataset]
@@ -21,7 +21,9 @@ prefetch_factor = 4
 in_order = false
 reserve_ratio = 0.2
 # 24 workers x MORTAL_LOADER_RAYON_THREADS=3 covers 72 of the 96 CPUs and leaves
-# the rest to the process feeding the chips.
+# the rest to the process feeding the chips. Measured end to end on the v5e-8
+# (2026-09-24): ~73,000 samples/s, and 32 x 3 no faster; 40 x 2 was slower and
+# 48 x 2 ran out of memory, since each worker holds ~5 GB of decoded games.
 num_workers = 24
 player_names_files = []
 num_epochs = 1

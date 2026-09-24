@@ -86,7 +86,8 @@ EOF
 
 echo "== train"
 mkdir -p "$OUT"
-python3 -m tpu.run --out "$OUT" "${INIT_ARGS[@]}" --steps "$STEPS" --hours "$HOURS" 2>&1 | tee "$OUT/train.log"
+# --remat: faster on the v5e, not only smaller.
+python3 -m tpu.run --out "$OUT" "${INIT_ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat 2>&1 | tee "$OUT/train.log"
 
 echo "== upload"
 python3 - <<EOF

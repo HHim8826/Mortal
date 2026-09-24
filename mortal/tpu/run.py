@@ -50,10 +50,51 @@ def build_file_list(dataset_cfg, seed):
     return files
 
 
-def loader(config, files, batch_size, seed):
+class Slots:
+    """Shared memory the loader's workers stack observations into, reused batch after batch.
+
+    Sent the usual way, every batch lands in shared memory allocated for it, and
+    the first read of it in this process faults in every page. On the Kaggle host
+    that, not decoding, was the limit: torch's DataLoader moved ~46,000 samples/s
+    of float32 observations with workers that decoded nothing at all, and the
+    device_put that first reads a batch halved what the real loader delivered.
+    These slots are allocated and touched here once, before the workers are
+    forked, so their pages stay mapped: a worker takes a free slot, stacks a
+    batch into it, and sends only the slot's number, which comes back once the
+    batch is on the devices.
+    """
+
+    def __init__(self, count, batch_size, shape=(1012, 34)):
+        import multiprocessing
+        import torch
+        self.obs = torch.zeros((count, batch_size, *shape), dtype=torch.bfloat16).share_memory_()
+        self.free = multiprocessing.get_context('fork').SimpleQueue()
+        for i in range(count):
+            self.free.put(i)
+
+
+def init_worker(*args):
+    """dataloader.worker_init_fn, in a worker that dies with the process it serves.
+
+    Left alone, a worker outlives a trainer that is killed -- by the OOM killer,
+    say: it waits for a slot that nobody will free, and it holds the TPU open,
+    because it was forked from a process that had it, so the next run cannot
+    start. On Kaggle that took 27 orphans and a kill -9 each.
+    """
+    import ctypes
+    import signal
+    from dataloader import worker_init_fn
+    ctypes.CDLL(None).prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
+    if os.getppid() == 1:                            # it died before that took hold
+        os._exit(1)
+    worker_init_fn(*args)
+
+
+def loader(config, files, batch_size, seed, slots=None):
+    import functools
     import torch
     from torch.utils.data import DataLoader
-    from dataloader import FileDatasetsIter, worker_init_fn
+    from dataloader import FileDatasetsIter
     ds = config['dataset']
     data = FileDatasetsIter(
         version=4, file_list=files, pts=config['env']['pts'],
@@ -61,18 +102,73 @@ def loader(config, files, batch_size, seed):
         parquet=bool(files) and not isinstance(files[0], str), player_names=[],
         num_epochs=ds['num_epochs'], enable_augmentation=ds['enable_augmentation'],
         augmented_first=ds['augmented_first'])
-    kw = {'prefetch_factor': ds.get('prefetch_factor', 2), 'in_order': ds.get('in_order', True)} \
-        if ds['num_workers'] > 0 else {}
+    # The slots reach the workers by fork, which is what the DataLoader uses on Linux.
+    kw = {'prefetch_factor': ds.get('prefetch_factor', 2), 'in_order': ds.get('in_order', True),
+          'multiprocessing_context': 'fork'} if ds['num_workers'] > 0 else {}
     torch.manual_seed(seed)
     return DataLoader(data, batch_size=batch_size, drop_last=True, num_workers=ds['num_workers'],
-                      worker_init_fn=worker_init_fn, **kw)
+                      worker_init_fn=init_worker, collate_fn=functools.partial(collate, slots=slots), **kw)
+
+
+def collate(samples, slots=None):
+    """default_collate, with the observations in bfloat16, in a slot if there are slots.
+
+    The step casts them to bfloat16 first thing, and torch rounds float32 to
+    bfloat16 as XLA does, to nearest with ties to even, so the net sees the same
+    input from half the bytes.
+    """
+    import torch
+    from torch.utils.data import default_collate
+    rest = default_collate([s[1:] for s in samples])
+    frames = [torch.from_numpy(s[0]) for s in samples]
+    if slots is not None:
+        slot = slots.free.get()
+        torch.stack(frames, out=slots.obs[slot])
+        return [slot, *rest]
+    obs = torch.empty((len(samples), *samples[0][0].shape), dtype=torch.bfloat16)
+    if torch.utils.data.get_worker_info() is not None:
+        obs.share_memory_()           # what default_collate does, so it is not copied again
+    torch.stack(frames, out=obs)
+    return [obs, *rest]
 
 
 def as_arrays(batch):
+    import ml_dtypes
+    import torch
     obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks = batch
-    return (obs.numpy(), actions.numpy().astype(np.int32), masks.numpy(),
-            steps_to_done.numpy().astype(np.int32), kyoku_rewards.numpy().astype(np.float32),
-            player_ranks.numpy().astype(np.int32))
+    # numpy has no bfloat16 of its own; ml_dtypes' is the one JAX takes.
+    return (obs.view(torch.int16).numpy().view(ml_dtypes.bfloat16), actions.numpy().astype(np.int32),
+            masks.numpy(), steps_to_done.numpy().astype(np.int32),
+            kyoku_rewards.numpy().astype(np.float32), player_ranks.numpy().astype(np.int32))
+
+
+def on_devices(batches, sharding, slots, threads=2):
+    """The loader's batches as arrays on the devices, in order, put there by a pool
+    so that the loop dispatching steps never waits for a copy; each slot goes back
+    to the workers once its batch has arrived.
+    """
+    import collections
+    from concurrent.futures import ThreadPoolExecutor
+    import jax
+    # A CPU backend may alias the host memory it is given, which the slot's next
+    # batch would then overwrite.
+    aliasing = any(d.platform == 'cpu' for d in sharding.device_set)
+
+    def put(batch):
+        slot, *rest = batch
+        obs = slots.obs[slot].clone() if aliasing else slots.obs[slot]
+        arrays = jax.block_until_ready(jax.device_put(as_arrays([obs, *rest]), sharding))
+        slots.free.put(slot)
+        return arrays
+
+    with ThreadPoolExecutor(threads) as pool:
+        pending = collections.deque()
+        for batch in batches:
+            pending.append(pool.submit(put, batch))
+            if len(pending) > 2 * threads:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
 
 def main():
@@ -84,7 +180,8 @@ def main():
     ap.add_argument('--hours', type=float, default=0,
                     help='save and stop after this long; a Kaggle session ends at 9 h, uploads or not')
     ap.add_argument('--remat', action='store_true',
-                    help='recompute block activations in the backward pass; for a batch that does not fit')
+                    help='recompute block activations in the backward pass: less memory, and on a '
+                         'v5e-8 faster as well (7.1 ms a step at batch 1,024 against 9.0)')
     ap.add_argument('--log-every', type=int, default=100)
     args = ap.parse_args()
 
@@ -182,26 +279,31 @@ def main():
 
     started = time.perf_counter()
     files = build_file_list(config['dataset'], seed=steps)
-    sums, n, waited, t_log = {}, 0, 0., time.perf_counter()
+    ds = config['dataset']
+    # One for every batch the DataLoader keeps in flight, and for the ones on the way
+    # to the devices; with fewer the workers wait for slots, which costs speed only.
+    slots = Slots(ds['num_workers'] * ds.get('prefetch_factor', 2) + 8, batch_size)
+    window, waited, t_log = [], 0., time.perf_counter()
     # The step is dispatched, not waited for, so the device runs while the next batch
     # is fetched; time spent in the fetch itself is the loader not keeping up.
     t_back = time.perf_counter()
-    for batch in loader(config, files, batch_size, seed=steps):
+    for arrays in on_devices(loader(config, files, batch_size, steps, slots), split, slots):
         waited += time.perf_counter() - t_back
-        arrays = jax.device_put(as_arrays(batch), split)
         state, losses = step(state, arrays)
         steps += 1
-        for k, v in losses.items():
-            sums[k] = sums.get(k, 0.) + v
-        n += 1
+        # Kept on the device until the log: adding them up as they come is three more
+        # dispatches a step, on the thread the step is waiting for.
+        window.append(losses)
         if steps % args.log_every == 0:
             # Reading the losses back waits for the device to finish the window's
             # steps, so the window ends after it: dispatch alone is not training.
-            means = {k: float(v) / n for k, v in sums.items()}
+            got = jax.device_get(window)
+            means = {k: float(np.mean([w[k] for w in got])) for k in got[0]}
             dt = time.perf_counter() - t_log
             logging.info(f'step {steps:,}: ' + ', '.join(f'{k} {v:.4f}' for k, v in means.items())
-                         + f'; {n * batch_size / dt:,.0f} samples/s, waiting for data {waited / dt:.0%}')
-            sums, n, waited, t_log = {}, 0, 0., time.perf_counter()
+                         + f'; {len(window) * batch_size / dt:,.0f} samples/s, '
+                         f'waiting for data {waited / dt:.0%}')
+            window, waited, t_log = [], 0., time.perf_counter()
         if steps % save_every == 0:
             save()
         if args.steps and steps >= args.steps:
