@@ -195,7 +195,18 @@ def main():
     loaded, versions = {}, set()
     for file in args.checkpoints:
         version, modules = load(file, device)
-        loaded[path.basename(file)] = modules
+        # Named by the file, and by as much of its path as tells two apart: every
+        # gated run's checkpoint is a best_ema.pth, and the second one of those
+        # would otherwise replace the first here without a word.
+        name = path.basename(file)
+        parts = path.normpath(file).split(path.sep)
+        for depth in range(2, len(parts) + 1):
+            if name not in loaded:
+                break
+            name = path.join(*parts[-depth:])
+        if name in loaded:
+            raise SystemExit(f'{file} is given twice')
+        loaded[name] = modules
         versions.add(version)
     if len(versions) > 1:
         raise SystemExit(f'checkpoints disagree on the observation version: {versions}. '
