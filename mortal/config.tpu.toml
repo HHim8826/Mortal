@@ -1,0 +1,56 @@
+# Offline v4 training on a Kaggle TPU v5e-8 with `python -m tpu.run`.
+#
+# The offline recipe of config.vast.toml, so a run here is comparable with the
+# 192x40 that stopped at 800k: the same loss weights, optimizer, schedule and
+# global batch. Only the loader is sized for the host: 96 CPUs, which encode v4
+# at ~115,000 instances/s when all of them decode (measured 2026-09-24).
+
+[control]
+version = 4
+online = false
+# Global: split evenly over the eight chips.
+batch_size = 1024
+save_every = 2000
+ema_decay = 0.9998
+
+[dataset]
+parquet_globs = ['/root/hf-dataset/data/*.parquet']
+globs = []
+file_batch_size = 20
+prefetch_factor = 4
+in_order = false
+reserve_ratio = 0.2
+# 24 workers x MORTAL_LOADER_RAYON_THREADS=3 covers 72 of the 96 CPUs and leaves
+# the rest to the process feeding the chips.
+num_workers = 24
+player_names_files = []
+num_epochs = 1
+enable_augmentation = false
+augmented_first = false
+
+[env]
+gamma = 1
+pts = [3.0, 1.5, 0.0, -4.5]
+
+# A run started with --init takes the net's shape from the checkpoint instead.
+[resnet]
+conv_channels = 192
+num_blocks = 40
+
+[cql]
+min_q_weight = 5
+
+[aux]
+next_rank_weight = 0.2
+
+[optim]
+eps = 1e-8
+betas = [0.9, 0.999]
+weight_decay = 0.1
+max_grad_norm = 0
+
+[optim.scheduler]
+peak = 1e-4
+final = 1e-5
+warm_up_steps = 2000
+max_steps = 1000000

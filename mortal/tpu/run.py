@@ -81,6 +81,8 @@ def main():
     ap.add_argument('--init', help='an .npz from `tpu.convert export`; from scratch without it')
     ap.add_argument('--grow-to', type=int, help='deepen the --init net to this many blocks')
     ap.add_argument('--steps', type=int, default=0, help='stop after this many; 0 runs the data out')
+    ap.add_argument('--hours', type=float, default=0,
+                    help='save and stop after this long; a Kaggle session ends at 9 h, uploads or not')
     ap.add_argument('--log-every', type=int, default=100)
     args = ap.parse_args()
 
@@ -158,6 +160,7 @@ def main():
         convert.save_npz(path.join(args.out, 'weights_ema.npz'), host['ema'], meta)
         logging.info(f'saved at step {steps:,}')
 
+    started = time.perf_counter()
     files = build_file_list(config['dataset'], seed=steps)
     sums, n, waited, t_log = {}, 0, 0., time.perf_counter()
     # The step is dispatched, not waited for, so the device runs while the next batch
@@ -180,6 +183,9 @@ def main():
         if steps % save_every == 0:
             save()
         if args.steps and steps >= args.steps:
+            break
+        if args.hours and time.perf_counter() - started > args.hours * 3600:
+            logging.info(f'{args.hours} h are up')
             break
         t_back = time.perf_counter()
     save()
