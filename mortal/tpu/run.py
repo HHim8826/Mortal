@@ -31,8 +31,12 @@ from os import path
 
 import numpy as np
 
-import prelude                                          # noqa: F401  (logging format)
 from config import config
+
+# prelude's format, without prelude: it pulls in torch's tensorboard, which a TPU host
+# running only this has no use for.
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)8s %(filename)12s:%(lineno)-4s %(message)s')
 
 
 def build_file_list(dataset_cfg, seed):
