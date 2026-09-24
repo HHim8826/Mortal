@@ -142,12 +142,19 @@ def as_arrays(batch):
             kyoku_rewards.numpy().astype(np.float32), player_ranks.numpy().astype(np.int32))
 
 
-def on_devices(batches, sharding, slots, threads=2):
-    """The loader's batches as arrays on the devices, in order, put there by a pool
-    so that the loop dispatching steps never waits for a copy; each slot goes back
-    to the workers once its batch has arrived.
+def on_devices(batches, sharding, slots, threads=2, ready=8):
+    """The loader's batches as arrays on the devices, in order.
+
+    A feeder thread takes each batch from the loader and hands it to a pool that
+    puts it on the devices; the loop dispatching steps only takes them off a queue
+    of at most `ready`. So a batch already on the devices never waits behind the
+    loader's next one -- in lockstep, one slow decode held up every finished batch
+    behind it, which cost a quarter of the speed at 72,000 samples/s (#47) -- and
+    the loader's own next() is off the dispatching thread. Each slot goes back to
+    the workers once its batch has arrived, whether or not it has been taken yet.
     """
-    import collections
+    import queue
+    import threading
     from concurrent.futures import ThreadPoolExecutor
     import jax
     # A CPU backend may alias the host memory it is given, which the slot's next
@@ -161,14 +168,47 @@ def on_devices(batches, sharding, slots, threads=2):
         slots.free.put(slot)
         return arrays
 
-    with ThreadPoolExecutor(threads) as pool:
-        pending = collections.deque()
-        for batch in batches:
-            pending.append(pool.submit(put, batch))
-            if len(pending) > 2 * threads:
-                yield pending.popleft().result()
-        while pending:
-            yield pending.popleft().result()
+    # Started here rather than in the feeder: iter() forks the workers, and their
+    # PR_SET_PDEATHSIG fires when the thread that forked them ends, not the process.
+    loaded = iter(batches)
+    out = queue.Queue(ready)
+    stop = threading.Event()
+    end = object()
+
+    def offer(item):
+        while not stop.is_set():
+            try:
+                out.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def feed():
+        try:
+            for batch in loaded:
+                if not offer(pool.submit(put, batch)):
+                    return
+        except BaseException as exc:
+            offer(exc)
+        else:
+            offer(end)
+
+    pool = ThreadPoolExecutor(threads)
+    feeder = threading.Thread(target=feed, name='on_devices', daemon=True)
+    feeder.start()
+    try:
+        while (item := out.get()) is not end:
+            if isinstance(item, BaseException):
+                raise item
+            yield item.result()
+    finally:
+        # Stopped early, or failed: the feeder notices once the loader's next() returns,
+        # which is at most one batch away, and the puts under way finish, so their
+        # slots are back before the workers are shut down.
+        stop.set()
+        feeder.join(timeout=120)
+        pool.shutdown(wait=True)
 
 
 def main():
@@ -272,22 +312,27 @@ def main():
                  'shape': {'conv_channels': channels, 'num_blocks': blocks}}))
         os.replace(ckpt + '.tmp', ckpt)
         meta = {'conv_channels': channels, 'num_blocks': blocks, 'steps': steps}
-        convert.save_npz(path.join(args.out, 'weights.npz'),
-                         {'params': host['params'], 'batch_stats': host['batch_stats']}, meta)
-        convert.save_npz(path.join(args.out, 'weights_ema.npz'), host['ema'], meta)
+        # Each through a temporary name, like the state: a copy taken for a backup
+        # while a save is under way is then the old file or the new one, never half.
+        for name, variables in (('weights.npz', {'params': host['params'], 'batch_stats': host['batch_stats']}),
+                                ('weights_ema.npz', host['ema'])):
+            convert.save_npz(path.join(args.out, name + '.tmp.npz'), variables, meta)
+            os.replace(path.join(args.out, name + '.tmp.npz'), path.join(args.out, name))
         logging.info(f'saved at step {steps:,}')
 
     started = time.perf_counter()
     files = build_file_list(config['dataset'], seed=steps)
     ds = config['dataset']
     # One for every batch the DataLoader keeps in flight, and for the ones on the way
-    # to the devices; with fewer the workers wait for slots, which costs speed only.
-    slots = Slots(ds['num_workers'] * ds.get('prefetch_factor', 2) + 8, batch_size)
+    # to the devices -- `ready` queued, one being queued, one in the feeder's hand;
+    # with fewer the workers wait for slots, which costs speed only.
+    ready = 8
+    slots = Slots(ds['num_workers'] * ds.get('prefetch_factor', 2) + ready + 2, batch_size)
     window, waited, t_log = [], 0., time.perf_counter()
     # The step is dispatched, not waited for, so the device runs while the next batch
     # is fetched; time spent in the fetch itself is the loader not keeping up.
     t_back = time.perf_counter()
-    for arrays in on_devices(loader(config, files, batch_size, steps, slots), split, slots):
+    for arrays in on_devices(loader(config, files, batch_size, steps, slots), split, slots, ready=ready):
         waited += time.perf_counter() - t_back
         state, losses = step(state, arrays)
         steps += 1
