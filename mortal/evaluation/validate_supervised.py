@@ -192,6 +192,8 @@ def main():
             raise SystemExit(f'no {name}-*.parquet in {args.holdout}')
         logging.info(f'{name}: {len(got)} row groups')
 
+    if len({path.realpath(f) for f in args.checkpoints}) < len(args.checkpoints):
+        raise SystemExit('a checkpoint is given twice')
     loaded, versions = {}, set()
     for file in args.checkpoints:
         version, modules = load(file, device)
@@ -204,8 +206,6 @@ def main():
             if name not in loaded:
                 break
             name = path.join(*parts[-depth:])
-        if name in loaded:
-            raise SystemExit(f'{file} is given twice')
         loaded[name] = modules
         versions.add(version)
     if len(versions) > 1:
