@@ -6,6 +6,48 @@ import numpy as np
 from torch.distributions import Normal, Categorical
 from typing import *
 
+class PinnedPool:
+    """Pinned host blocks that engines stack their batches in, lent one batch at a time.
+
+    A block is out only while a batch is stacked into it and copied to the GPU,
+    and the copy blocks, so a few blocks serve any number of arenas and
+    engines. What the pool keeps is capped whatever the number of threads: a
+    batch that finds no free block that fits, and no room under the cap for a
+    new one, is stacked the old way, into an array of its own.
+    """
+    def __init__(self, cap):
+        self.cap = cap
+        self.kept = 0
+        self.free = []
+        self.lock = threading.Lock()
+
+    def take(self, nbytes):
+        with self.lock:
+            fits = [i for i, b in enumerate(self.free) if b.nbytes >= nbytes]
+            if fits:
+                return self.free.pop(min(fits, key=lambda i: self.free[i].nbytes))
+            # The pinned allocator hands out power-of-two blocks, so ask for a
+            # whole one; a block it has cached is never given back to the system.
+            size = max(1 << 24, 1 << (nbytes - 1).bit_length())
+            if self.kept + size > self.cap:
+                return None
+            self.kept += size
+        try:
+            return torch.empty(size // 4, dtype=torch.float32, pin_memory=True)
+        except RuntimeError:
+            # No pinned memory to be had: the batch goes the old way instead.
+            with self.lock:
+                self.kept -= size
+            return None
+
+    def give(self, block):
+        with self.lock:
+            self.free.append(block)
+
+# One pool for the process. An evaluation's batches reach ~100 MB, so this holds
+# two arenas' largest at once and the smaller ones beside them.
+STAGING = PinnedPool(512 << 20)
+
 class MortalEngine:
     def __init__(
         self,
@@ -41,12 +83,11 @@ class MortalEngine:
         self.boltzmann_temp = boltzmann_temp
         self.top_p = top_p
 
-        # Where each thread stacks its batch of observations; see `_stage`.
-        self._staging = threading.local()
+        # Only a batch bound for the GPU is stacked in the pool; see `_stage`.
         self._pin = self.device.type == 'cuda'
 
     def _stage(self, obs):
-        """The batch `obs` as one tensor on the device, stacked in a buffer this thread keeps.
+        """The batch `obs` as one tensor on the device, stacked in a pinned block from STAGING.
 
         A v4 observation is 1012 x 34 floats, 137 KB, and the champion's seats in
         an evaluation act a few hundred at a time: a fresh `np.stack` asked the
@@ -55,22 +96,21 @@ class MortalEngine:
         fragmented for huge pages and nearly every attempt to compact it fails,
         each of those arrays was faulted in 4 KB at a time, and the evaluation's
         arena threads spent 57-85% of their time in the kernel with the GPU idle.
-        The buffer is per thread because the champion's engine is shared by two
-        arenas playing at once, and pinned so the copy reads it directly.
+        On the CPU the stacked array is the model's input itself, one row a move
+        for the bot, and there is nothing to keep.
         """
-        n = len(obs)
-        shape = obs[0].shape
-        buf = getattr(self._staging, 'obs', None)
-        if buf is None or buf.shape[0] < n or buf.shape[1:] != shape:
-            # The pinned allocator hands out power-of-two blocks, so take a whole
-            # one: every row that fits, and no new buffer until a batch outgrows it.
-            block = max(1 << 24, 1 << (n * obs[0].nbytes - 1).bit_length())
-            rows = block // obs[0].nbytes
-            buf = torch.empty((rows, *shape), dtype=torch.float32, pin_memory=self._pin)
-            self._staging.obs = buf
-        view = buf[:n]
-        np.stack(obs, axis=0, out=view.numpy())
-        return view.to(self.device)
+        need = len(obs) * obs[0].size * 4
+        block = STAGING.take(need) if self._pin else None
+        if block is None:
+            return torch.as_tensor(np.stack(obs, axis=0), device=self.device)
+        try:
+            view = block[:need // 4].view(len(obs), *obs[0].shape)
+            np.stack(obs, axis=0, out=view.numpy())
+            # Not non_blocking: the batch is on the device when this returns,
+            # so the block can go straight back for the next one.
+            return view.to(self.device)
+        finally:
+            STAGING.give(block)
 
     def react_batch(self, obs, masks, invisible_obs):
         try:
