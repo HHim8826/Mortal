@@ -142,20 +142,29 @@ def cmd_export(args):
 
 
 def cmd_import(args):
-    """Trained Flax weights into a PyTorch checkpoint the GPU tools can play."""
+    """Trained Flax weights into a PyTorch checkpoint the GPU tools can play.
+
+    The config and everything else come from `base`, except the net's shape, which
+    comes from the .npz: a deepened net has more blocks than the checkpoint it grew
+    from. The weights are loaded strictly into a model of that shape before saving,
+    so a checkpoint that would not load is never written.
+    """
     import torch
+    from model import AuxNet, Brain, DQN
     z = np.load(args.npz)
     state = torch.load(args.base, weights_only=True, map_location='cpu')
+    shape = {'conv_channels': int(z['meta/conv_channels']), 'num_blocks': int(z['meta/num_blocks'])}
     to_t = lambda prefix: {k[len(prefix):]: torch.from_numpy(np.asarray(z[k])) for k in z.files if k.startswith(prefix)}
+    modules = {'mortal': Brain(version=4, **shape), 'current_dqn': DQN(version=4), 'aux_net': AuxNet((4,))}
     for key, prefix in (('mortal', 'mortal/'), ('current_dqn', 'dqn/'), ('aux_net', 'aux/')):
-        missing = set(state[key]) ^ set(to_t(prefix))
-        if missing:
-            raise SystemExit(f'{key}: keys differ from {args.base}: {sorted(missing)[:5]}')
+        modules[key].load_state_dict(to_t(prefix))            # strict: every key, every shape
         state[key] = to_t(prefix)
+    state['config']['resnet'].update(shape)
     state.pop('ema', None)
     state['steps'] = int(z['meta/steps']) if 'meta/steps' in z.files else state.get('steps', 0)
     torch.save(state, args.out)
-    print(f'{args.npz} -> {args.out}, config and optimizer state from {args.base}')
+    print(f'{args.npz} ({shape["conv_channels"]}x{shape["num_blocks"]}) -> {args.out}, '
+          f'config and the rest from {args.base}')
 
 
 def main():
