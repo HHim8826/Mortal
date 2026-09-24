@@ -83,6 +83,8 @@ def main():
     ap.add_argument('--steps', type=int, default=0, help='stop after this many; 0 runs the data out')
     ap.add_argument('--hours', type=float, default=0,
                     help='save and stop after this long; a Kaggle session ends at 9 h, uploads or not')
+    ap.add_argument('--remat', action='store_true',
+                    help='recompute block activations in the backward pass; for a batch that does not fit')
     ap.add_argument('--log-every', type=int, default=100)
     args = ap.parse_args()
 
@@ -119,7 +121,7 @@ def main():
             blocks = args.grow_to
     else:
         variables = Mortal(channels, blocks).init(rng, jnp.zeros((2, 34, 1012)), jnp.ones((2, 46), bool))
-    model = Mortal(channels, blocks)
+    model = Mortal(channels, blocks, dtype=jnp.bfloat16, remat=args.remat)
     tx = make_optimizer(config['optim'])
 
     params, stats = variables['params'], variables['batch_stats']
