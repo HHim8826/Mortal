@@ -42,9 +42,9 @@ python3 - <<EOF
 import os
 from huggingface_hub import hf_hub_download, snapshot_download
 try:
-    from huggingface_hub.errors import EntryNotFoundError
+    from huggingface_hub import errors
 except ImportError:
-    from huggingface_hub.utils import EntryNotFoundError
+    from huggingface_hub import utils as errors
 snapshot_download('hhim8826/tenhou-houou-mjai', repo_type='dataset', local_dir='/root/hf-dataset')
 # The loader's reward net, which is not in git.
 hf_hub_download('${MODEL_REPO}', 'grp/grp.pth', local_dir='/root/grp')
@@ -52,12 +52,16 @@ os.makedirs('/root/Mortal/mortal/grp_v2', exist_ok=True)
 os.replace('/root/grp/grp/grp.pth', '/root/Mortal/mortal/grp_v2/grp.pth')
 if '${INIT}':
     hf_hub_download('${MODEL_REPO}', '${INIT}', local_dir='/root/init')
-# A previous version's state, to resume from. Only a state that is not there starts
-# the run afresh: a download that failed for any other reason stops the script here,
-# or a fresh run would be uploaded over the one it could not fetch.
+# A previous version's state, to resume from. Only a state that the Hub says is not
+# there starts the run afresh: a download that failed for any other reason stops the
+# script here, or a fresh run would be uploaded over the one it could not fetch.
 try:
     hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir='/root/resume')
-except EntryNotFoundError:
+except errors.LocalEntryNotFoundError:
+    # The Hub was never asked: a dropped connection with nothing cached. It is a
+    # subclass of EntryNotFoundError, so it has to go through before that is caught.
+    raise
+except getattr(errors, 'RemoteEntryNotFoundError', errors.EntryNotFoundError):
     print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
 else:
     os.makedirs('${OUT}', exist_ok=True)
