@@ -14,7 +14,8 @@ save_every = 10000
 ema_decay = 0.9998
 
 [dataset]
-parquet_globs = ['/root/hf-dataset/data/*.parquet']
+# In RAM: see ops/kaggle/train_tpu.sh on the host's disk.
+parquet_globs = ['/dev/shm/hf-dataset/data/*.parquet']
 globs = []
 file_batch_size = 20
 prefetch_factor = 4

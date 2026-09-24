@@ -14,8 +14,12 @@
 # TPU_SKIP_MDS_QUERY, ...) is already set; an ssh shell has to source it.
 #
 # INIT is a checkpoint in the private model repo, exported as its EMA weights;
-# GROW_TO deepens it first. Output goes to /kaggle/working/run (20 GB) and is
-# uploaded to RUN_REPO/RUN_PATH after the run, so the next version can resume.
+# GROW_TO deepens it first. Output goes to /dev/shm/run and is uploaded to
+# RUN_REPO/RUN_PATH after the run, so the next version can resume.
+#
+# The corpus and the output live in /dev/shm (164 GB of RAM), not on disk: the
+# host's disk has been throttled to ~1 MB/s for reads the page cache does not
+# hold (measured 2026-09-24), which starves the loader and stalls every save.
 set -euo pipefail
 # mortal.pth at the repo root is the offline run's last save, step 800,400; --ema takes its average.
 INIT=${INIT:-mortal.pth}
@@ -27,7 +31,7 @@ HOURS=${HOURS:-8}
 MODEL_REPO=${MODEL_REPO:-hhim8826/mortal4-0911}
 RUN_REPO=${RUN_REPO:-hhim8826/mortal4-0911}
 RUN_PATH=${RUN_PATH:-tpu-run}
-OUT=/kaggle/working/run
+OUT=/dev/shm/run
 
 cd /root
 echo "== libriichi"
@@ -45,7 +49,7 @@ try:
     from huggingface_hub import errors
 except ImportError:
     from huggingface_hub import utils as errors
-snapshot_download('hhim8826/tenhou-houou-mjai', repo_type='dataset', local_dir='/root/hf-dataset')
+snapshot_download('hhim8826/tenhou-houou-mjai', repo_type='dataset', local_dir='/dev/shm/hf-dataset')
 # The loader's reward net, which is not in git.
 hf_hub_download('${MODEL_REPO}', 'grp/grp.pth', local_dir='/root/grp')
 os.makedirs('/root/Mortal/mortal/grp_v2', exist_ok=True)
