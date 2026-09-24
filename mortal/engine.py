@@ -1,4 +1,5 @@
 import json
+import threading
 import traceback
 import torch
 import numpy as np
@@ -40,6 +41,37 @@ class MortalEngine:
         self.boltzmann_temp = boltzmann_temp
         self.top_p = top_p
 
+        # Where each thread stacks its batch of observations; see `_stage`.
+        self._staging = threading.local()
+        self._pin = self.device.type == 'cuda'
+
+    def _stage(self, obs):
+        """The batch `obs` as one tensor on the device, stacked in a buffer this thread keeps.
+
+        A v4 observation is 1012 x 34 floats, 137 KB, and the champion's seats in
+        an evaluation act a few hundred at a time: a fresh `np.stack` asked the
+        kernel for up to 100 MB every step, about 85 GB per arena for 250 walls,
+        and gave it back on the way out. On the one-card box, where memory is too
+        fragmented for huge pages and nearly every attempt to compact it fails,
+        each of those arrays was faulted in 4 KB at a time, and the evaluation's
+        arena threads spent 57-85% of their time in the kernel with the GPU idle.
+        The buffer is per thread because the champion's engine is shared by two
+        arenas playing at once, and pinned so the copy reads it directly.
+        """
+        n = len(obs)
+        shape = obs[0].shape
+        buf = getattr(self._staging, 'obs', None)
+        if buf is None or buf.shape[0] < n or buf.shape[1:] != shape:
+            # The pinned allocator hands out power-of-two blocks, so take a whole
+            # one: every row that fits, and no new buffer until a batch outgrows it.
+            block = max(1 << 24, 1 << (n * obs[0].nbytes - 1).bit_length())
+            rows = block // obs[0].nbytes
+            buf = torch.empty((rows, *shape), dtype=torch.float32, pin_memory=self._pin)
+            self._staging.obs = buf
+        view = buf[:n]
+        np.stack(obs, axis=0, out=view.numpy())
+        return view.to(self.device)
+
     def react_batch(self, obs, masks, invisible_obs):
         try:
             with (
@@ -51,7 +83,7 @@ class MortalEngine:
             raise Exception(f'{ex}\n{traceback.format_exc()}')
 
     def _react_batch(self, obs, masks, invisible_obs):
-        obs = torch.as_tensor(np.stack(obs, axis=0), device=self.device)
+        obs = self._stage(obs)
         masks = torch.as_tensor(np.stack(masks, axis=0), device=self.device)
         if invisible_obs is not None:
             invisible_obs = torch.as_tensor(np.stack(invisible_obs, axis=0), device=self.device)
