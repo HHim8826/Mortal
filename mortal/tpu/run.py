@@ -31,8 +31,6 @@ from os import path
 
 import numpy as np
 
-from config import config
-
 # prelude's format, without prelude: it pulls in torch's tensorboard, which a TPU host
 # running only this has no use for.
 logging.basicConfig(level=logging.INFO,
@@ -52,7 +50,7 @@ def build_file_list(dataset_cfg, seed):
     return files
 
 
-def loader(files, batch_size, seed):
+def loader(config, files, batch_size, seed):
     import torch
     from torch.utils.data import DataLoader
     from dataloader import FileDatasetsIter, worker_init_fn
@@ -77,28 +75,6 @@ def as_arrays(batch):
             player_ranks.numpy().astype(np.int32))
 
 
-def grow(variables, model_cls, channels, old_blocks, new_blocks, rng):
-    """Deepen by appending identity blocks: fresh weights, second convolution zeroed."""
-    import jax
-    import jax.numpy as jnp
-    fresh = model_cls(channels, new_blocks).init(
-        rng, jnp.zeros((2, 34, 1012)), jnp.ones((2, 46), bool))
-    out = jax.tree_util.tree_map(lambda x: x, fresh)
-    for col in ('params', 'batch_stats'):
-        old, new = variables[col]['brain']['blocks'], out[col]['brain']['blocks']
-        out[col]['brain']['blocks'] = jax.tree_util.tree_map(
-            lambda o, f: jnp.concatenate([o, f[old_blocks:]]), old, new)
-        for k, v in variables[col]['brain'].items():
-            if k != 'blocks':
-                out[col]['brain'][k] = v
-        for k in variables[col]:
-            if k != 'brain':
-                out[col][k] = variables[col][k]
-    kernel = out['params']['brain']['blocks']['conv2']['kernel']
-    out['params']['brain']['blocks']['conv2']['kernel'] = kernel.at[old_blocks:].set(0.)
-    return out
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', required=True)
@@ -112,9 +88,10 @@ def main():
     import jax.numpy as jnp
     import optax
     from flax import serialization
+    from config import config
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from tpu import convert
-    from tpu.model import Mortal
+    from tpu.model import Mortal, deepen
     from tpu.train import loss_fn, make_optimizer
 
     os.makedirs(args.out, exist_ok=True)
@@ -135,7 +112,7 @@ def main():
         channels, blocks = meta['conv_channels'], meta['num_blocks']
         logging.info(f'init: {args.init}, {channels}x{blocks}, step {meta.get("steps", 0):,}')
         if args.grow_to and args.grow_to > blocks:
-            variables = grow(variables, Mortal, channels, blocks, args.grow_to, rng)
+            variables = deepen(variables, channels, blocks, args.grow_to, rng)
             logging.info(f'grown: {blocks} -> {args.grow_to} blocks, the new ones the identity')
             blocks = args.grow_to
     else:
@@ -186,7 +163,7 @@ def main():
     # The step is dispatched, not waited for, so the device runs while the next batch
     # is fetched; time spent in the fetch itself is the loader not keeping up.
     t_back = time.perf_counter()
-    for batch in loader(files, batch_size, seed=steps):
+    for batch in loader(config, files, batch_size, seed=steps):
         waited += time.perf_counter() - t_back
         arrays = jax.device_put(as_arrays(batch), split)
         state, losses = step(state, arrays)

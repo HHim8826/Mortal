@@ -97,3 +97,28 @@ class Mortal(nn.Module):
         q = DQN(name='dqn')(phi, mask)
         next_rank_logits = nn.Dense(4, use_bias=False, name='aux')(phi)
         return q, next_rank_logits
+
+
+def deepen(variables, channels, old_blocks, new_blocks, rng):
+    """`variables` with residual blocks appended up to `new_blocks`, each exactly the identity.
+
+    A pre-activation block adds its residual branch to its input, and the branch ends in
+    the second convolution (then channel attention, which scales it). Zero that one
+    convolution and the branch is zero whatever the rest holds, so the new blocks start
+    as fresh weights around a closed gate: the deeper net plays exactly as the old one,
+    and training opens them.
+    """
+    fresh = Mortal(channels, new_blocks).init(rng, jnp.zeros((2, WIDTH, OBS_CHANNELS)),
+                                              jnp.ones((2, ACTIONS), bool))
+    out = {}
+    for col in ('params', 'batch_stats'):
+        out[col] = dict(variables[col])
+        brain = dict(variables[col]['brain'])
+        brain['blocks'] = jax.tree_util.tree_map(lambda o, f: jnp.concatenate([o, f[old_blocks:]]),
+                                                 variables[col]['brain']['blocks'],
+                                                 fresh[col]['brain']['blocks'])
+        out[col]['brain'] = brain
+    blocks = dict(out['params']['brain']['blocks'])
+    blocks['conv2'] = {'kernel': blocks['conv2']['kernel'].at[old_blocks:].set(0.)}
+    out['params']['brain']['blocks'] = blocks
+    return out
