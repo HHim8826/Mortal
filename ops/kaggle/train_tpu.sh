@@ -41,17 +41,28 @@ echo "== corpus and starting point"
 python3 - <<EOF
 import os
 from huggingface_hub import hf_hub_download, snapshot_download
+try:
+    from huggingface_hub.errors import EntryNotFoundError
+except ImportError:
+    from huggingface_hub.utils import EntryNotFoundError
 snapshot_download('hhim8826/tenhou-houou-mjai', repo_type='dataset', local_dir='/root/hf-dataset')
+# The loader's reward net, which is not in git.
+hf_hub_download('${MODEL_REPO}', 'grp/grp.pth', local_dir='/root/grp')
+os.makedirs('/root/Mortal/mortal/grp_v2', exist_ok=True)
+os.replace('/root/grp/grp/grp.pth', '/root/Mortal/mortal/grp_v2/grp.pth')
 if '${INIT}':
     hf_hub_download('${MODEL_REPO}', '${INIT}', local_dir='/root/init')
-# A previous version's state, to resume from.
+# A previous version's state, to resume from. Only a state that is not there starts
+# the run afresh: a download that failed for any other reason stops the script here,
+# or a fresh run would be uploaded over the one it could not fetch.
 try:
     hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir='/root/resume')
+except EntryNotFoundError:
+    print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
+else:
     os.makedirs('${OUT}', exist_ok=True)
     os.replace('/root/resume/${RUN_PATH}/state.msgpack', '${OUT}/state.msgpack')
     print('resuming from ${RUN_REPO}/${RUN_PATH}/state.msgpack')
-except Exception as exc:
-    print(f'no state to resume ({type(exc).__name__}); starting fresh')
 EOF
 cd /root/Mortal/mortal
 INIT_ARGS=()
@@ -61,9 +72,20 @@ if [ -n "$INIT" ]; then
     [ -n "$GROW_TO" ] && INIT_ARGS+=(--grow-to "$GROW_TO")
 fi
 
+export MORTAL_CFG=config.tpu.toml MORTAL_LOADER_RAYON_THREADS=3
+echo "== one batch through the loader, before the chips are touched"
+python3 - <<EOF
+import copy
+from config import config
+from tpu.run import build_file_list, loader
+cfg = copy.deepcopy(config)
+cfg['dataset']['num_workers'] = 0
+batch = next(iter(loader(cfg, build_file_list(cfg['dataset'], seed=0)[:1], 8, 0)))
+print('loader ok:', [tuple(t.shape) for t in batch])
+EOF
+
 echo "== train"
 mkdir -p "$OUT"
-export MORTAL_CFG=config.tpu.toml MORTAL_LOADER_RAYON_THREADS=3
 python3 -m tpu.run --out "$OUT" "${INIT_ARGS[@]}" --steps "$STEPS" --hours "$HOURS" 2>&1 | tee "$OUT/train.log"
 
 echo "== upload"

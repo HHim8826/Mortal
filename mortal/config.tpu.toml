@@ -54,3 +54,14 @@ peak = 1e-4
 final = 1e-5
 warm_up_steps = 2000
 max_steps = 1000000
+
+# The loader turns each kyoku's result into a reward with the GRP net, and builds
+# it before its first sample, so there is no run without it. The weights are not
+# in git: ops/kaggle/train_tpu.sh fetches them from the private repo's grp/grp.pth
+# (sha256 a09a3735..., the same file every v4 run used).
+[grp]
+state_file = 'grp_v2/grp.pth'
+
+[grp.network]
+hidden_size = 64
+num_layers = 2

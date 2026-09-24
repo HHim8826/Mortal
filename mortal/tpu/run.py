@@ -109,9 +109,27 @@ def main():
     split, whole = NamedSharding(mesh, P('data')), NamedSharding(mesh, P())
     logging.info(f'{len(devices)} x {devices[0].device_kind}, global batch {batch_size:,}')
 
-    channels, blocks = res['conv_channels'], res['num_blocks']
+    tx = make_optimizer(config['optim'])
     rng = jax.random.PRNGKey(ctl.get('seed', 0))
-    if args.init:
+    ckpt = path.join(args.out, 'state.msgpack')
+    resume = None
+    if path.exists(ckpt):
+        # A saved run decides its own shape. It may have been deepened by an earlier
+        # session's --grow-to, which this one need not repeat -- and must not
+        # contradict, which is caught here, before any data is read.
+        with open(ckpt, 'rb') as f:
+            resume = serialization.msgpack_restore(f.read())
+        shape = resume.pop('shape', None) or {
+            'conv_channels': int(resume['params']['brain']['stem']['kernel'].shape[-1]),
+            'num_blocks': int(resume['params']['brain']['blocks']['conv1']['kernel'].shape[0])}
+        channels, blocks = shape['conv_channels'], shape['num_blocks']
+        if args.grow_to and args.grow_to != blocks:
+            raise SystemExit(f'{ckpt} holds {blocks} blocks; --grow-to {args.grow_to} contradicts it. '
+                             'Resume without --grow-to, or train into a new --out')
+        if args.init:
+            logging.info(f'resuming {ckpt} ({channels}x{blocks}); --init is only a starting point, ignored')
+        variables = Mortal(channels, blocks).init(rng, jnp.zeros((2, 34, 1012)), jnp.ones((2, 46), bool))
+    elif args.init:
         variables, meta = convert.load_npz(args.init)
         channels, blocks = meta['conv_channels'], meta['num_blocks']
         logging.info(f'init: {args.init}, {channels}x{blocks}, step {meta.get("steps", 0):,}')
@@ -120,17 +138,15 @@ def main():
             logging.info(f'grown: {blocks} -> {args.grow_to} blocks, the new ones the identity')
             blocks = args.grow_to
     else:
+        channels, blocks = res['conv_channels'], res['num_blocks']
         variables = Mortal(channels, blocks).init(rng, jnp.zeros((2, 34, 1012)), jnp.ones((2, 46), bool))
     model = Mortal(channels, blocks, dtype=jnp.bfloat16, remat=args.remat)
-    tx = make_optimizer(config['optim'])
 
     params, stats = variables['params'], variables['batch_stats']
     state = {'params': params, 'batch_stats': stats, 'opt': tx.init(params),
              'ema': {'params': params, 'batch_stats': stats}, 'steps': 0}
-    ckpt = path.join(args.out, 'state.msgpack')
-    if path.exists(ckpt):
-        with open(ckpt, 'rb') as f:
-            state = serialization.from_bytes(state, f.read())
+    if resume is not None:
+        state = serialization.from_state_dict(state, resume)
         logging.info(f'resumed at step {int(state["steps"]):,}')
     steps = int(state['steps'])
     state = jax.device_put(state, whole)
@@ -154,7 +170,9 @@ def main():
     def save():
         host = jax.device_get(state)
         with open(ckpt + '.tmp', 'wb') as f:
-            f.write(serialization.to_bytes(host))
+            f.write(serialization.msgpack_serialize(
+                {**serialization.to_state_dict(host),
+                 'shape': {'conv_channels': channels, 'num_blocks': blocks}}))
         os.replace(ckpt + '.tmp', ckpt)
         meta = {'conv_channels': channels, 'num_blocks': blocks, 'steps': steps}
         convert.save_npz(path.join(args.out, 'weights.npz'),
@@ -177,8 +195,10 @@ def main():
             sums[k] = sums.get(k, 0.) + v
         n += 1
         if steps % args.log_every == 0:
-            dt = time.perf_counter() - t_log
+            # Reading the losses back waits for the device to finish the window's
+            # steps, so the window ends after it: dispatch alone is not training.
             means = {k: float(v) / n for k, v in sums.items()}
+            dt = time.perf_counter() - t_log
             logging.info(f'step {steps:,}: ' + ', '.join(f'{k} {v:.4f}' for k, v in means.items())
                          + f'; {n * batch_size / dt:,.0f} samples/s, waiting for data {waited / dt:.0%}')
             sums, n, waited, t_log = {}, 0, 0., time.perf_counter()
