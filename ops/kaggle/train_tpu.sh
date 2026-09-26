@@ -105,8 +105,15 @@ from config import config
 from tpu.run import build_file_list, loader
 cfg = copy.deepcopy(config)
 cfg['dataset']['num_workers'] = 0
-batch = next(iter(loader(cfg, build_file_list(cfg['dataset'], seed=0)[:1], 8, 0)))
+data = loader(cfg, build_file_list(cfg['dataset'], seed=0)[:1], 8, 0)
+batch = next(iter(data))
 print('loader ok:', [tuple(t.shape) for t in batch])
+# In this process the dataset's decode thread is already a batch ahead, inside Rust,
+# and it keeps its own generator alive, so nothing would stop it: at exit it comes
+# back for the GIL and aborts the process ("FATAL: exception not rethrown", exit
+# 134), which is how this check once ended a run before it started. Closing the
+# generator runs decoded_ahead's finally, which waits for that decode to finish.
+data.dataset.iterator.close()
 EOF
 
 backup() {
