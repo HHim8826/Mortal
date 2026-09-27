@@ -367,8 +367,11 @@ def write_meta(model_dir, spec, steps, role):
         'labels': sorted(labels),
         'files': sorted(set(meta.get('files', [])) | {path.abspath(spec.file)}),
     })
-    with open(meta_file, 'w', encoding='utf-8') as f:
+    # Through a name of its own, since shards started together write the same file.
+    tmp = f'{meta_file}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(meta, f)
+    os.replace(tmp, meta_file)
 
 
 def play_chunk(engine, champion, wall_set, first, count, model_dir, quiet):
@@ -414,6 +417,17 @@ def cmd_play(args):
     models = [Spec.parse(m) for m in args.model]
     base = set_dir(args.root, wall_set, champion_spec)
     todo = chunks(wall_set, args.chunk_seeds, args.limit_seeds)
+    if args.shard:
+        try:
+            shard, shards = map(int, args.shard.split('/'))
+        except ValueError:
+            raise SystemExit(f'--shard {args.shard}: expected I/N, such as 0/2')
+        if not 0 <= shard < shards:
+            raise SystemExit(f'--shard {args.shard}: I has to be in [0, N)')
+        # By a chunk's place in the whole set, not in what is missing, so a shard
+        # restarted later takes the same chunks again and never one another shard
+        # is playing.
+        todo = todo[shard::shards]
 
     pending = {}
     for spec in models:
@@ -607,6 +621,9 @@ def main(argv=None):
     p.add_argument('--chunk-seeds', type=int, default=250,
                    help='seeds per resumable chunk (4 games each)')
     p.add_argument('--confirm-holdout', default='')
+    p.add_argument('--shard', default=None, metavar='I/N',
+                   help='play only chunks I, I+N, I+2N, ... of the set, so N processes '
+                        '(one per GPU) share it without playing a chunk twice')
     p.add_argument('--quiet', action='store_true')
     p.set_defaults(func=cmd_play)
 
