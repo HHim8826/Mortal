@@ -1,0 +1,95 @@
+# v4 online training on a Kaggle TPU v5e-8 with `python -m tpu.online`: self-play,
+# training and the gate in one process, since a TPU belongs to one process.
+#
+# The algorithm is config.online.toml's, value for value, so a run here can be read
+# beside the vast.ai runs: the loss without CQL, the last 4 blocks trained with
+# BatchNorm frozen, the trainee sampling at epsilon 0.005 and temperature 0.05
+# against a frozen opponent, parameters published every 400 steps, and the gate
+# every 30,000 steps on 8,000 fresh walls, margin 1 se, two misses and it stops.
+# What differs is where things run, in [tpu_online].
+
+[control]
+version = 4
+online = true
+ema_decay = 0.9998
+batch_size = 1024
+save_every = 2000
+test_every = 30000
+submit_every = 400
+
+[train_play]
+boltzmann_epsilon = 0.005
+boltzmann_temp = 0.05
+top_p = 1.0
+# On in every evaluation so far, and in the vast.ai runs' self-play.
+enable_rule_based_agari_guard = true
+
+[test_play]
+# 8,000 walls, each played by the candidate and the champion, four games each.
+games = 32000
+gate_margin = 1.0
+gate_patience = 2
+
+[dataset]
+file_batch_size = 20
+prefetch_factor = 2
+reserve_ratio = 0.2
+num_workers = 8
+num_epochs = 1
+enable_augmentation = false
+augmented_first = false
+
+[env]
+gamma = 1
+pts = [3.0, 1.5, 0.0, -4.5]
+
+[cql]
+min_q_weight = 5
+
+[aux]
+next_rank_weight = 0.2
+
+[freeze]
+trainable_blocks = 4
+
+[freeze_bn]
+mortal = true
+
+[optim]
+eps = 1e-8
+betas = [0.9, 0.999]
+weight_decay = 0.1
+max_grad_norm = 0
+
+[optim.scheduler]
+peak = 1e-5
+final = 1e-5
+warm_up_steps = 200
+max_steps = 1000000
+
+[online]
+history_window = 50
+
+[online.server]
+# Game logs waiting for the trainer before self-play pauses: server.py's capacity.
+capacity = 19200
+
+[tpu_online]
+# Self-play arenas, each in its own thread with its own engines, spread over the chips.
+arenas = 16
+# Walls an arena plays before handing its games to the buffer (4 games a wall).
+walls = 200
+# libriichi's rayon pool in this process, which self-play and the gate share. The
+# loader's workers are other processes: [dataset] num_workers x MORTAL_LOADER_RAYON_THREADS.
+rayon_threads = 64
+# Threads the gate splits each side's walls across.
+gate_arenas = 8
+# The gate's walls: a key of their own, never dealt in self-play (random keys there).
+gate_key = 0x6761746531
+
+[grp]
+state_file = 'grp_v2/grp.pth'
+
+[grp.network]
+hidden_size = 64
+num_layers = 2
