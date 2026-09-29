@@ -9,7 +9,8 @@ What makes it more than a forward pass is the batch. The arena hands over howeve
 many seats are waiting, a different number nearly every call, and XLA compiles a
 new program for every new shape. So a batch is padded up to the next of a few fixed
 sizes and cut back after, and each size compiles once, the first time it is seen.
-The padding rows are all-legal, so their mean advantage stays finite.
+The padding rows are whatever an earlier batch left in the host arrays (see
+`host_arrays`): real observations with legal masks, so their Q stays finite.
 
 Self-play samples as `MortalEngine` does: each move is the argmax with probability
 1 - `boltzmann_epsilon`, and otherwise drawn from softmax(Q / `boltzmann_temp`)
@@ -18,24 +19,50 @@ the host, from Q the device already sent back.
 
     engine = JaxEngine.from_npz('best_ema.npz', name='mortal')
 """
+import threading
 import traceback
 
 import numpy as np
 
 BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 _FORWARD = {}
+_HOST = threading.local()
 
 
 def forward_for(conv_channels, num_blocks, version):
     """One jitted forward per architecture, shared by every engine that plays it: online runs
-    an engine per arena, and each would otherwise compile every batch size again."""
+    an engine per arena, and each would otherwise compile every batch size again.
+
+    It takes observations as libriichi makes them, (channels, 34), and turns them channels
+    last for `tpu.model` on the device, where that is nearly free; on the host it was a
+    strided copy of the whole batch every call (#56)."""
     key = (conv_channels, num_blocks, version)
     if key not in _FORWARD:
         import jax
         from tpu.model import Player
         net = Player(conv_channels, num_blocks, version)
-        _FORWARD[key] = jax.jit(lambda v, obs, mask: net.apply(v, obs, mask))
+        _FORWARD[key] = jax.jit(lambda v, obs, mask: net.apply(v, obs.transpose(0, 2, 1), mask))
     return _FORWARD[key]
+
+
+def host_arrays(size, obs_shape, actions):
+    """This thread's host arrays for a batch padded to `size`: observations and masks.
+
+    Kept from call to call and replaced only by a bigger bucket, as `PinnedPool` does for
+    MortalEngine. A new array a call -- 134 MB for a bucket of 1,024 -- has the kernel fault
+    in every page of it: 8 threads preparing batches of 520 that way took 4.6 times as long
+    as filling kept ones (#56). One set a thread, not an engine, since the gate's threads
+    share an engine; a call is done with them before it returns, as reading Q back waits
+    for the device. Rows an earlier batch left are real observations and legal masks.
+    """
+    key = (obs_shape, actions)
+    kept = getattr(_HOST, 'arrays', None)
+    if kept is None:
+        kept = _HOST.arrays = {}
+    arrays = kept.get(key)
+    if arrays is None or len(arrays[0]) < size:
+        arrays = kept[key] = (np.zeros((size, *obs_shape), np.float32), np.ones((size, actions), bool))
+    return arrays[0][:size], arrays[1][:size]
 
 
 def sample_top_p(logits, p, rng):
@@ -115,10 +142,8 @@ class JaxEngine:
         import jax
         n = len(obs)
         size = next(b for b in BUCKETS if b >= n)
-        # libriichi's observations are (channels, 34); tpu.model takes channels last.
-        x = np.zeros((size, obs[0].shape[1], obs[0].shape[0]), np.float32)
-        x[:n] = np.stack(obs).transpose(0, 2, 1)
-        m = np.ones((size, len(masks[0])), bool)
-        m[:n] = np.stack(masks)
+        x, m = host_arrays(size, obs[0].shape, len(masks[0]))
+        np.stack(obs, out=x[:n])
+        np.stack(masks, out=m[:n])
         q = self._q(self._variables, jax.device_put(x, self.device), jax.device_put(m, self.device))
         return np.asarray(q)[:n]

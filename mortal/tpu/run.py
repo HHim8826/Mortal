@@ -17,9 +17,10 @@ all-reduce left to XLA. What it keeps from train.py's offline run:
 the old ones with their second convolution zeroed, which makes each one exactly
 the identity, so step 0 plays exactly as the checkpoint did.
 
-Every `save_every` steps it writes `state.msgpack` (everything, to resume) and
-`weights.npz` / `weights_ema.npz` (for `python -m tpu.convert import` on a GPU
-box, where the evaluation tools are).
+Every `save_every` steps it writes `state.msgpack` (everything, to resume, with
+where the run is in the data: `Position`) and `weights.npz` / `weights_ema.npz`
+(for `python -m tpu.convert import` on a GPU box, where the evaluation tools are).
+The data is read once; a resumed run reads on, and one that has read it all ends.
 
 With `--test-every`, the EMA also plays the v3 baseline beside training, on the
 chips it trains on (`tpu.testplay`), and each result goes to test_play.jsonl.
@@ -89,6 +90,86 @@ def build_file_list(dataset_cfg, seed):
     return files
 
 
+class Position:
+    """Where a run is in its one pass over the data, kept in its state so a resumed run
+    reads on from there (#55). Before, a resume shuffled the whole corpus again and read
+    all of it, so a run cut at step S trained S + an epoch steps, and one already done
+    trained another epoch.
+
+    For each entry of the run's file list -- a parquet row group, or a gz log -- how much
+    of it the loader has decoded: games of a row group, 1 for a log. The workers write it
+    into memory they share with this process (they are forked, see `loader`), and it is
+    saved with the state. A resumed run builds the list again from the seed it kept,
+    checks it is the same data, and reads only what is left, a row group from the game it
+    stopped at. What was decoded but not yet trained on at the save -- a chunk or two a
+    worker, and the batches in flight -- is skipped, not read twice.
+    """
+
+    def __init__(self, files, seed):
+        import hashlib
+        import pyarrow.parquet as pq
+        import torch
+        self.files, self.seed = files, seed
+        groups = {}
+        for entry in files:
+            if not isinstance(entry, str) and entry[0] not in groups:
+                meta = pq.ParquetFile(entry[0]).metadata
+                groups[entry[0]] = [meta.row_group(i) for i in range(meta.num_row_groups)]
+        self.sizes = np.array([1 if isinstance(e, str) else groups[e[0]][e[1]].num_rows for e in files], np.int64)
+        # The data as named and sized, games and bytes, in the order this seed gives it: the
+        # same digest is the same list, so the counts below still mean the same entries. The
+        # bytes tell a corpus made again under the same names, with as many games a group.
+        names = [(e, os.path.getsize(e)) if isinstance(e, str) else
+                 (path.basename(e[0]), e[1], groups[e[0]][e[1]].total_byte_size) for e in files]
+        self.digest = hashlib.sha256(repr((names, self.sizes.tolist())).encode()).hexdigest()[:16]
+        self._done = torch.zeros(len(files), dtype=torch.int64).share_memory_()
+        self.done = self._done.numpy()
+
+    def restore(self, kept):
+        if kept['digest'] != self.digest:
+            raise SystemExit(f'the data is not what this run was reading (list {kept["digest"]}, now '
+                             f'{self.digest}): its position would name other games. Train into a new --out')
+        self.done[:] = kept['done']
+
+    def saved(self):
+        return {'seed': self.seed, 'digest': self.digest, 'done': self.done.copy()}
+
+    def left(self):
+        """Indices of the entries not read to the end."""
+        return np.flatnonzero(self.done < self.sizes).tolist()
+
+    def fraction(self):
+        return float(np.minimum(self.done, self.sizes).sum() / max(self.sizes.sum(), 1))
+
+
+def read_on(data, position):
+    """`FileDatasetsIter.iter_batches` for a `Position`: `data.file_list` holds indices of its
+    entries (each worker a slice), a row group starts at the game the position has reached,
+    and each chunk is marked read when the decoder asks for the next, which is when it has
+    decoded this one."""
+    import pyarrow.parquet as pq
+    files, done, size = position.files, position.done, data.file_batch_size
+    if not data.parquet:
+        for start in range(0, len(data.file_list), size):
+            chunk = data.file_list[start:start + size]
+            yield [files[i] for i in chunk]
+            done[chunk] = 1
+        return
+    for i in data.file_list:
+        shard, row_group = files[i]
+        reader = data.readers.get(shard)
+        if reader is None:
+            reader = data.readers[shard] = pq.ParquetFile(shard)
+        skip, rows = int(done[i]), 0
+        for batch in reader.iter_batches(batch_size=size, row_groups=[row_group], columns=['events']):
+            rows += batch.num_rows
+            if rows <= skip:
+                continue
+            events = batch.column('events').to_pylist()
+            yield events[max(skip - (rows - len(events)), 0):]
+            done[i] = rows
+
+
 class Slots:
     """Shared memory the loader's workers stack observations into, reused batch after batch.
 
@@ -129,18 +210,22 @@ def init_worker(*args):
     worker_init_fn(*args)
 
 
-def loader(config, files, batch_size, seed, slots=None):
+def loader(config, files, batch_size, seed, slots=None, position=None):
+    """train.py's loader over `files`; with a `Position` over position.files, only what is left."""
     import functools
     import torch
     from torch.utils.data import DataLoader
     from dataloader import FileDatasetsIter
     ds = config['dataset']
     data = FileDatasetsIter(
-        version=4, file_list=files, pts=config['env']['pts'],
+        version=4, file_list=files if position is None else position.left(), pts=config['env']['pts'],
         file_batch_size=ds['file_batch_size'], reserve_ratio=ds['reserve_ratio'],
         parquet=bool(files) and not isinstance(files[0], str), player_names=[],
         num_epochs=ds['num_epochs'], enable_augmentation=ds['enable_augmentation'],
         augmented_first=ds['augmented_first'])
+    if position is not None:
+        # The position reaches the workers by fork too, and they write into it.
+        data.iter_batches = functools.partial(read_on, data, position)
     # The slots reach the workers by fork, which is what the DataLoader uses on Linux.
     kw = {'prefetch_factor': ds.get('prefetch_factor', 2), 'in_order': ds.get('in_order', True),
           'multiprocessing_context': 'fork'} if ds['num_workers'] > 0 else {}
@@ -315,16 +400,21 @@ def main():
     split, whole = NamedSharding(mesh, P('data')), NamedSharding(mesh, P())
     logging.info(f'{len(devices)} x {devices[0].device_kind}, global batch {batch_size:,}')
 
+    ds = config['dataset']
+    if ds['num_epochs'] != 1 or ds['enable_augmentation']:
+        raise SystemExit('tpu.run reads the data once (num_epochs = 1, no augmentation): that is what '
+                         'a resumed run can read on from (Position)')
     tx = make_optimizer(config['optim'])
     rng = jax.random.PRNGKey(ctl.get('seed', 0))
     ckpt = path.join(args.out, 'state.msgpack')
-    resume = None
+    resume = kept = None
     if path.exists(ckpt):
         # A saved run decides its own shape. It may have been deepened by an earlier
         # session's --grow-to, which this one need not repeat -- and must not
         # contradict, which is caught here, before any data is read.
         with open(ckpt, 'rb') as f:
             resume = serialization.msgpack_restore(f.read())
+        kept = resume.pop('data', None)
         shape = resume.pop('shape', None) or {
             'conv_channels': int(resume['params']['brain']['stem']['kernel'].shape[-1]),
             'num_blocks': int(resume['params']['brain']['blocks']['conv1']['kernel'].shape[0])}
@@ -382,7 +472,7 @@ def main():
         with open(ckpt + '.tmp', 'wb') as f:
             f.write(serialization.msgpack_serialize(
                 {**serialization.to_state_dict(host),
-                 'shape': {'conv_channels': channels, 'num_blocks': blocks}}))
+                 'shape': {'conv_channels': channels, 'num_blocks': blocks}, 'data': position.saved()}))
         meta = {'conv_channels': channels, 'num_blocks': blocks, 'steps': steps}
         # Each through a temporary name, like the state: a copy taken for a backup
         # while a save is under way is then the old file or the new one, never half.
@@ -397,8 +487,23 @@ def main():
         logging.info(f'saved at step {steps:,}')
 
     started = time.perf_counter()
-    files = build_file_list(config['dataset'], seed=steps)
-    ds = config['dataset']
+    # One pass over the data in the order of a seed the run keeps, so a resumed run reads on
+    # from where it was instead of reading all of it again (#55).
+    seed = int(kept['seed']) if kept is not None else ctl.get('seed', 0)
+    position = Position(build_file_list(ds, seed=seed), seed)
+    if kept is not None:
+        position.restore(kept)
+        logging.info(f'data: {position.fraction():.2%} of it read by step {steps:,}; reading on')
+    elif steps:
+        if not args.steps:
+            raise SystemExit(f'{ckpt} is at step {steps:,} and has no record of where it was in the data '
+                             '(it was saved before that was kept), so running the data out would read all '
+                             'of it again from the start. To train on anyway, give --steps')
+        logging.warning(f'{ckpt} has no record of where it was in the data; reading it from the start '
+                        f'up to --steps {args.steps:,}')
+    if not position.left():
+        logging.info(f'the data is all read, at step {steps:,}: nothing to do')
+        return
     # One for every batch the DataLoader keeps in flight, and for the ones on the way
     # to the devices -- `ready` queued, one being queued, one in the feeder's hand;
     # with fewer the workers wait for slots, which costs speed only.
@@ -415,7 +520,8 @@ def main():
         from tpu.testplay import TestPlay
         tester = TestPlay(args.test_baseline, args.out, wall_set=args.test_set, walls=args.test_walls,
                           device=devices[0], threads=args.test_threads)
-    for arrays in on_devices(loader(config, files, batch_size, steps, slots), split, slots, ready=ready):
+    for arrays in on_devices(loader(config, position.files, batch_size, steps, slots, position), split, slots,
+                             ready=ready):
         waited += time.perf_counter() - t_back
         if tester is not None and steps >= next_test:
             # Only in here, where the first batch has forked the loader's workers. The
@@ -447,7 +553,7 @@ def main():
             break
         t_back = time.perf_counter()
     save()
-    logging.info(f'done at step {steps:,}')
+    logging.info(f'done at step {steps:,}, {position.fraction():.2%} of the data read')
     if tester is not None:
         tester.finish()
         if tester.last != steps:

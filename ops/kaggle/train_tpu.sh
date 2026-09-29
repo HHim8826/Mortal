@@ -20,17 +20,20 @@
 # TPU_SKIP_MDS_QUERY, ...) is already set; an ssh shell has to source it.
 #
 # INIT is a checkpoint in the private model repo, exported as its EMA weights;
-# GROW_TO deepens it first. Output goes to /dev/shm/run and is uploaded to
+# GROW_TO deepens it first. Output goes to /dev/shm/runs (below) and is uploaded to
 # RUN_REPO/RUN_PATH every BACKUP_MIN minutes while it trains and once more after,
 # so the next version can resume, and a session that dies loses at most that
 # much. (The first run, from an interactive session over ssh, was cut 25 minutes
 # in, before its first backup, and left nothing.)
 #
-# A state already at RUN_REPO/RUN_PATH is resumed, finished or not: a new run
+# A state already at RUN_REPO/RUN_PATH is resumed, and reads on from where it
+# was in the data (#55): one that has read all of it ends at once, so a new run
 # needs a RUN_PATH of its own. `tpu-run` holds the 192x60 run, done at step
-# 1,354,328 on 2026-09-27. Locally each run has its own folder under /dev/shm/runs,
-# named by RUN_REPO/RUN_PATH, so a second run in one session never finds the
-# first's state; a run that ran earlier in the session resumes from its own folder.
+# 1,354,328 on 2026-09-27; it was saved before the position was kept, and
+# tpu.run refuses to run the data out on it again unless STEPS says how far.
+# Locally each run has its own folder under /dev/shm/runs, named by
+# RUN_REPO/RUN_PATH, so a second run in one session never finds the first's
+# state; a run that ran earlier in the session resumes from its own folder.
 #
 # Every TEST_EVERY steps, and at the start and the end, the EMA plays the first
 # TEST_WALLS dev walls against the v3 baseline (baseline/baseline.pth in the model
@@ -175,8 +178,13 @@ BACKUP_PID=$!
 # --remat: faster on the v5e, not only smaller. A run that fails still has its last
 # save uploaded before the script exits with its status.
 status=0
-python3 -m tpu.run --out "$OUT" "${INIT_ARGS[@]}" "${TEST_ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat 2>&1 \
-    | tee -a "$OUT/train.log" || status=$?
+# The trainer is waited for by itself, not as `| tee`: a pipeline ends only once everything
+# holding its write end has, and anything a killed trainer left behind would hold it (#53).
+python3 -m tpu.run --out "$OUT" "${INIT_ARGS[@]}" "${TEST_ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat \
+    > >(tee -a "$OUT/train.log") 2>&1 || status=$?
+TEE_PID=$!
+# The log's last lines, before it is uploaded; not for ever, for the same reason.
+for _ in $(seq 60); do kill -0 $TEE_PID 2>/dev/null || break; sleep 1; done
 pkill -P $BACKUP_PID 2>/dev/null || true      # an upload under way, or the sleep
 kill $BACKUP_PID 2>/dev/null || true
 

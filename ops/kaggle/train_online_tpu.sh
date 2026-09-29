@@ -109,8 +109,12 @@ c['online']['server']['capacity'] = 50
 toml.dump(c, open('/root/cfg_smoke.toml', 'w'))
 EOF
     rm -rf /dev/shm/online-smoke
+    # To a file, not through a pipe: see the training run below.
+    smoke=0
     MORTAL_CFG=/root/cfg_smoke.toml python3 -m tpu.online --out /dev/shm/online-smoke "${ARGS[@]}" \
-        --steps 4 --log-every 1 --remat 2>&1 | tail -20
+        --steps 4 --log-every 1 --remat > /root/online-smoke.log 2>&1 || smoke=$?
+    tail -20 /root/online-smoke.log
+    [ "$smoke" = 0 ] || { echo "smoke run: exit $smoke"; exit 1; }
     grep -q '"steps": 4' /dev/shm/online-smoke/gate.jsonl || { echo "smoke run: no gate at step 4"; exit 1; }
     rm -rf /dev/shm/online-smoke
     # The chips take a while to come free after a process that held them exits.
@@ -130,8 +134,13 @@ mkdir -p "$OUT"
   done ) &
 BACKUP_PID=$!
 status=0
-python3 -m tpu.online --out "$OUT" "${ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat 2>&1 \
-    | tee -a "$OUT/train.log" || status=$?
+# The trainer is waited for by itself, not as `| tee`: a pipeline ends only once everything
+# holding its write end has, and a process a killed trainer left behind held it for good (#53).
+python3 -m tpu.online --out "$OUT" "${ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat \
+    > >(tee -a "$OUT/train.log") 2>&1 || status=$?
+TEE_PID=$!
+# The log's last lines, before it is uploaded; not for ever, for the same reason.
+for _ in $(seq 60); do kill -0 $TEE_PID 2>/dev/null || break; sleep 1; done
 pkill -P $BACKUP_PID 2>/dev/null || true      # an upload under way, or the sleep
 kill $BACKUP_PID 2>/dev/null || true
 

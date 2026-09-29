@@ -248,13 +248,38 @@ class Gate:
             if self.state.get('baseline') != self.baseline_id:
                 logging.info(f'gate: the baseline is now {self.baseline_id}')
                 self.state['baseline'] = self.baseline_id
+            # The step of the last evaluation, so a resumed run can tell one cut short (#54).
+            # Before it was kept, the last line of gate.jsonl says.
+            if 'last' not in self.state:
+                self.state['last'] = (self._last_record() or {}).get('steps', 0)
         else:
             self.state = {'evaluations': 0, 'fails': 0, 'champion': 0, 'key': key, 'next_seed': 0,
-                          'baseline': self.baseline_id}
+                          'baseline': self.baseline_id, 'last': 0}
             self.champion = initial
             with self.manifest.writing(0):
                 self._keep_champion(initial, 0)
                 self._save_state()
+        self.seconds = (self._last_record() or {}).get('seconds')
+
+    def _last_record(self):
+        try:
+            with open(path.join(self.out, 'gate.jsonl'), encoding='utf-8') as f:
+                lines = [line for line in f if line.strip()]
+        except FileNotFoundError:
+            return None
+        return json.loads(lines[-1]) if lines else None
+
+    def owed(self, steps, every):
+        """Whether `steps` is a gate's step that was never played to the end: the run saves
+        before it plays one, so a session that ends during it resumes right there."""
+        return steps > 0 and steps % every == 0 and self.state['last'] < steps
+
+    def expected_seconds(self, games_per_second):
+        """How long an evaluation should take: as long as the last one did, or before there
+        has been one, its games at the pace self-play keeps."""
+        if self.seconds:
+            return self.seconds
+        return 2 * 4 * self.walls / games_per_second if games_per_second > 0 else 0.
 
     def _keep_champion(self, variables, steps):
         from tpu import convert
@@ -359,7 +384,9 @@ class Gate:
         self.state['evaluations'] += 1
         self.state['next_seed'] = first + self.walls
         self.state['fails'] = 0 if replace else self.state['fails'] + 1
-        record.update(replaced=replace, fails=self.state['fails'], seconds=round(time.time() - started, 1))
+        self.state['last'] = steps
+        self.seconds = round(time.time() - started, 1)
+        record.update(replaced=replace, fails=self.state['fails'], seconds=self.seconds)
         with self.manifest.writing(steps):
             if replace:
                 self.champion = ema
@@ -384,9 +411,13 @@ def main():
     ap.add_argument('--remat', action='store_true')
     args = ap.parse_args()
 
-    # First of all, before JAX and before any arena: see the docstring.
+    # First of all, before JAX and before any arena: see the docstring. It dies with this
+    # process, and its workers with it: see tpu.dies_with_parent.
     from multiprocessing import forkserver
+    os.environ['MORTAL_FORKSERVER_PARENT'] = str(os.getpid())
+    forkserver.set_forkserver_preload(['__main__', 'tpu.dies_with_parent'])
     forkserver.ensure_running()
+    os.environ.pop('MORTAL_FORKSERVER_PARENT')
 
     import jax
     import jax.numpy as jnp
@@ -488,13 +519,27 @@ def main():
                 key=tpu_cfg['gate_key'], margin=config['test_play']['gate_margin'],
                 patience=config['test_play']['gate_patience'], arenas=tpu_cfg['gate_arenas'],
                 device=devices[-1], scratch=scratch, manifest=manifest)
+
+    def ended(status):
+        shutil.rmtree(scratch, ignore_errors=True)
+        return status
+
     if gate.stop:
         logging.info(f'the gate stopped this run already ({gate.state["fails"]} misses); the champion is '
                      f'step {gate.state["champion"]:,}, in champion.npz')
-        return 3
+        return ended(3)
+    if gate.owed(steps, test_every):
+        # Played before anything else, or this step's EMA never gets its chance and the next
+        # gate is test_every steps away (#54).
+        logging.info(f'the gate at step {steps:,} was cut short when the run stopped; playing it first')
+        gate.evaluate(steps, jax.device_get(state['ema']))
+        if gate.stop:
+            logging.info(f'gate: {gate.state["fails"]} evaluations without a new champion, '
+                         f'stopping; the champion is step {gate.state["champion"]:,}')
+            return ended(3)
     if args.steps and steps >= args.steps:
         logging.info(f'at step {steps:,} already, --steps {args.steps:,}; nothing to do')
-        return 0
+        return ended(0)
     selfplay = SelfPlay(live(), (channels, blocks), args.opponent, arenas=tpu_cfg['arenas'],
                         walls=tpu_cfg['walls'], play_cfg=config['train_play'],
                         capacity=config['online']['server']['capacity'], root=path.join(scratch, 'selfplay'),
@@ -506,7 +551,8 @@ def main():
     started = time.perf_counter()
     window, waited, t_log, games_log = [], 0., time.perf_counter(), selfplay.games
     stop = None
-    over = lambda: args.hours and time.perf_counter() - started > args.hours * 3600
+    left = lambda: args.hours * 3600 - (time.perf_counter() - started) if args.hours else float('inf')
+    over = lambda: left() < 0
     try:
         while stop is None:
             t = time.perf_counter()
@@ -550,6 +596,15 @@ def main():
                     save()
                 if steps % test_every == 0:
                     save()
+                    # --hours is looked at only between steps, and a gate is tens of thousands
+                    # of games: one begun near the end would run into the session's own limit
+                    # (#54). Saved just now, the gate is owed, and the next session plays it first.
+                    need = gate.expected_seconds(selfplay.games / (time.perf_counter() - started))
+                    if need > left():
+                        logging.info(f'the gate at step {steps:,} should take {need / 60:.0f} min, and '
+                                     f'{args.hours} h are up in {left() / 60:.0f}; stopping before it')
+                        stop = 'hours'
+                        break
                     gate.evaluate(steps, jax.device_get(state['ema']))
                     if gate.stop:
                         logging.info(f'gate: {gate.state["fails"]} evaluations without a new champion, '
@@ -568,10 +623,12 @@ def main():
             # train.py publishes at the end of every round as well.
             selfplay.publish(live())
             discard(files)
+        # Before the arenas are stopped, which waits for each to finish the walls it holds:
+        # the state does not depend on them, and a session that ends meanwhile keeps it (#54).
+        save()
     finally:
         selfplay.stop()
         shutil.rmtree(scratch, ignore_errors=True)
-    save()
     logging.info(f'done at step {steps:,} ({stop})')
     return 3 if stop == 'gate' else 0
 
