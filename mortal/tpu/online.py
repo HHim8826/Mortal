@@ -214,24 +214,47 @@ class Gate:
     """
 
     def __init__(self, baseline, out, shape, initial, *, walls, key, margin, patience, arenas, device,
-                 scratch):
+                 scratch, manifest):
+        from evaluation.evaluate import sha256_of
         from tpu import convert
         from tpu.engine import JaxEngine
+        # Its files change together (champion.npz, gate.json, gate.jsonl), in one generation
+        # of the run's manifest, so a backup never takes a champion with another's record.
+        self.manifest = manifest
         self.out, self.shape = out, shape
         self.walls, self.key, self.margin, self.patience = walls, key, margin, patience
         self.arenas, self.device, self.scratch = arenas, device, scratch
         self.baseline = JaxEngine.from_npz(baseline, device=device, name='baseline')
+        self.baseline_id = sha256_of(baseline)[:16]
         self.state_file = path.join(out, 'gate.json')
         self.champion_file = path.join(out, 'champion.npz')
         if path.exists(self.state_file):
             with open(self.state_file, encoding='utf-8') as f:
                 self.state = json.load(f)
             self.champion = convert.load_npz(self.champion_file)[0]
+            # Where the next walls start is kept, not worked out from the count of
+            # evaluations: a resumed run with another number of walls would otherwise
+            # deal walls it has already played. Another key is another set of deals,
+            # all unplayed, from its seed 0. A gate.json from before either was kept
+            # worked it out from the count, under the same key.
+            if 'next_seed' not in self.state:
+                self.state['next_seed'] = self.state['evaluations'] * walls
+                self.state.setdefault('key', key)
+            if self.state['key'] != key:
+                logging.info(f'gate: walls at key {key:#x} from now on, from seed 0')
+                self.state.update(key=key, next_seed=0)
+            # Each evaluation plays both sides against one baseline, so a new one keeps
+            # every comparison paired; the change is on the record all the same.
+            if self.state.get('baseline') != self.baseline_id:
+                logging.info(f'gate: the baseline is now {self.baseline_id}')
+                self.state['baseline'] = self.baseline_id
         else:
-            self.state = {'evaluations': 0, 'fails': 0, 'champion': 0}
+            self.state = {'evaluations': 0, 'fails': 0, 'champion': 0, 'key': key, 'next_seed': 0,
+                          'baseline': self.baseline_id}
             self.champion = initial
-            self._keep_champion(initial, 0)
-            self._save_state()
+            with self.manifest.writing(0):
+                self._keep_champion(initial, 0)
+                self._save_state()
 
     def _keep_champion(self, variables, steps):
         from tpu import convert
@@ -288,7 +311,7 @@ class Gate:
         """Play the gate for the EMA `ema` (host arrays) at `steps`; True if it took the title."""
         from evaluation.evaluate import paired, summarize, walls_of
         from tpu import convert
-        first = self.state['evaluations'] * self.walls
+        first = self.state['next_seed']
         logging.info(f'gate at step {steps:,}: walls [{first:,}, {first + self.walls:,}) at key {self.key:#x}')
         started = time.time()
         sides = {'candidate': ema, 'champion': self.champion}
@@ -310,7 +333,7 @@ class Gate:
 
         as_games = lambda r: {(int(k.split('_')[0]), k.split('_')[1]): v for k, v in r.items()}
         record = {'steps': steps, 'walls': [first, first + self.walls], 'key': self.key,
-                  'champion_steps': self.state['champion']}
+                  'baseline': self.baseline_id, 'champion_steps': self.state['champion']}
         walls = {}
         for label, (ranks, stat) in results.items():
             walls[label] = walls_of(as_games(ranks))
@@ -334,15 +357,17 @@ class Gate:
                 f'firsts {cand["rank_1"]:.1%} / {champ["rank_1"]:.1%}, fourths {cand["rank_4"]:.1%} / '
                 f'{champ["rank_4"]:.1%}')
         self.state['evaluations'] += 1
+        self.state['next_seed'] = first + self.walls
         self.state['fails'] = 0 if replace else self.state['fails'] + 1
         record.update(replaced=replace, fails=self.state['fails'], seconds=round(time.time() - started, 1))
-        if replace:
-            self.champion = ema
-            self.state['champion'] = steps
-            self._keep_champion(ema, steps)
-        with open(path.join(self.out, 'gate.jsonl'), 'a', encoding='utf-8') as f:
-            f.write(json.dumps(record) + '\n')
-        self._save_state()
+        with self.manifest.writing(steps):
+            if replace:
+                self.champion = ema
+                self.state['champion'] = steps
+                self._keep_champion(ema, steps)
+            with open(path.join(self.out, 'gate.jsonl'), 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record) + '\n')
+            self._save_state()
         logging.info(f'{line} ({time.time() - started:.0f} s)')
         return replace
 
@@ -373,7 +398,7 @@ def main():
     from dataloader import FileDatasetsIter
     from tpu import convert
     from tpu.model import Mortal
-    from tpu.run import as_arrays, collate, init_worker
+    from tpu.run import Manifest, as_arrays, collate, init_worker
     from tpu.train import loss_fn, make_optimizer, trainable
 
     tpu_cfg = config['tpu_online']
@@ -437,6 +462,7 @@ def main():
 
     live = lambda: jax.device_get({'params': state['params'], 'batch_stats': state['batch_stats']})
     saved = [steps]
+    manifest = Manifest(args.out)
 
     def save():
         # Once a step: a step that is a save and a gate, or the last one, would write it twice.
@@ -446,19 +472,22 @@ def main():
         host = jax.device_get(state)
         with open(ckpt + '.tmp', 'wb') as f:
             f.write(serialization.msgpack_serialize(serialization.to_state_dict(host)))
-        os.replace(ckpt + '.tmp', ckpt)
         meta_out = {'conv_channels': channels, 'num_blocks': blocks, 'steps': steps}
         for name, v in (('weights.npz', {'params': host['params'], 'batch_stats': host['batch_stats']}),
                         ('weights_ema.npz', host['ema'])):
             convert.save_npz(path.join(args.out, name + '.tmp.npz'), v, meta_out)
-            os.replace(path.join(args.out, name + '.tmp.npz'), path.join(args.out, name))
+        # Renamed together in one generation of the manifest, for ops/kaggle/backup.py.
+        with manifest.writing(steps):
+            os.replace(ckpt + '.tmp', ckpt)
+            for name in ('weights.npz', 'weights_ema.npz'):
+                os.replace(path.join(args.out, name + '.tmp.npz'), path.join(args.out, name))
         logging.info(f'saved at step {steps:,}')
 
     gate = Gate(args.baseline, args.out, (channels, blocks), variables,
                 walls=config['test_play']['games'] // 4,
                 key=tpu_cfg['gate_key'], margin=config['test_play']['gate_margin'],
                 patience=config['test_play']['gate_patience'], arenas=tpu_cfg['gate_arenas'],
-                device=devices[-1], scratch=scratch)
+                device=devices[-1], scratch=scratch, manifest=manifest)
     if gate.stop:
         logging.info(f'the gate stopped this run already ({gate.state["fails"]} misses); the champion is '
                      f'step {gate.state["champion"]:,}, in champion.npz')
@@ -490,7 +519,9 @@ def main():
                 version=4, file_list=files, pts=config['env']['pts'], file_batch_size=ds['file_batch_size'],
                 reserve_ratio=ds['reserve_ratio'], parquet=False, player_names=['trainee'],
                 num_epochs=1, enable_augmentation=False, augmented_first=False)
-            workers = min(ds['num_workers'], len(files))
+            # At least one worker, never decoding here: in this process the dataset's decode
+            # thread would outlive a round cut short by the gate or --hours (tpu.run.close_dataset).
+            workers = max(1, min(ds['num_workers'], len(files)))
             batches = full_batches(DataLoader(
                 data, batch_size=batch_size, drop_last=False, num_workers=workers, worker_init_fn=init_worker,
                 collate_fn=functools.partial(collate, slots=None), prefetch_factor=ds['prefetch_factor'],

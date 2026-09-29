@@ -57,6 +57,30 @@ def shards(holdout, prefix):
     return out
 
 
+def display_names(files):
+    """{file: name}, each name the shortest end of its real path that no other file shares.
+
+    Every gated run's checkpoint is a best_ema.pth, so the file name alone does not tell
+    them apart, and a name taken twice would let the second model replace the first
+    without a word. Names grow a directory at a time for every file in a clash at once
+    -- the first as well as the later ones -- and from the real path, so a bare file in
+    the current directory has its directory to grow into too. The real paths differ (the
+    caller refuses a file given twice), so the names always come apart.
+    """
+    parts = {f: path.realpath(f).split(path.sep) for f in files}
+    depth = dict.fromkeys(files, 1)
+    while True:
+        names = {f: '/'.join(parts[f][-depth[f]:]).lstrip('/') for f in files}
+        taken = defaultdict(list)
+        for f, name in names.items():
+            taken[name].append(f)
+        clashes = [f for group in taken.values() if len(group) > 1 for f in group]
+        if not clashes:
+            return names
+        for f in clashes:
+            depth[f] = min(depth[f] + 1, len(parts[f]))
+
+
 def load(file, device):
     """A checkpoint as the three modules it was saved as.
 
@@ -194,20 +218,13 @@ def main():
 
     if len({path.realpath(f) for f in args.checkpoints}) < len(args.checkpoints):
         raise SystemExit('a checkpoint is given twice')
+    names = display_names(args.checkpoints)
     loaded, versions = {}, set()
     for file in args.checkpoints:
         version, modules = load(file, device)
-        # Named by the file, and by as much of its path as tells two apart: every
-        # gated run's checkpoint is a best_ema.pth, and the second one of those
-        # would otherwise replace the first here without a word.
-        name = path.basename(file)
-        parts = path.normpath(file).split(path.sep)
-        for depth in range(2, len(parts) + 1):
-            if name not in loaded:
-                break
-            name = path.join(*parts[-depth:])
-        loaded[name] = modules
+        loaded[names[file]] = modules
         versions.add(version)
+    assert len(loaded) == len(args.checkpoints), names
     if len(versions) > 1:
         raise SystemExit(f'checkpoints disagree on the observation version: {versions}. '
                          'They cannot share one pass over the data, and comparing them '

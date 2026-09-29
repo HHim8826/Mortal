@@ -18,10 +18,13 @@
 # and gates once, on a config shrunk to minutes, so a fault in any of those shows here and
 # not at the first real gate an hour or two in.
 #
-# Output goes to /dev/shm/online and is uploaded to RUN_REPO/RUN_PATH every BACKUP_MIN
-# minutes and once more after; a later version with the same RUN_PATH resumes it, gate
-# and all. A state already at RUN_PATH is always resumed, so a new run needs a RUN_PATH of
-# its own. The gate stopping the run (two evaluations without a new champion, exit 3) is
+# Output goes to this run's own folder under /dev/shm/runs (named by RUN_REPO/RUN_PATH, so
+# another run in the same session never finds its state) and is uploaded to
+# RUN_REPO/RUN_PATH every BACKUP_MIN minutes and once more after, from a snapshot of one
+# save (backup.py); a later version with the same RUN_PATH resumes it, gate and all, from
+# its own folder if it ran earlier in the session and from the Hub if not. A state
+# already at RUN_PATH is always resumed, so a new run needs a RUN_PATH of its own. The
+# gate stopping the run (two evaluations without a new champion, exit 3) is
 # how it is meant to end: the script then exits 0 after the upload. The model to use is
 # champion.npz.
 set -euo pipefail
@@ -36,7 +39,8 @@ BACKUP_MIN=${BACKUP_MIN:-30}
 HOURS=${HOURS:-8}
 CONFIG=${CONFIG:-config.online.tpu.toml}
 SMOKE=${SMOKE:-1}
-OUT=/dev/shm/online
+# This run's own folder, named by where it is backed up (#48).
+OUT=/dev/shm/runs/$(printf '%s' "$RUN_REPO/$RUN_PATH" | tr '/' '_')
 
 cd /root
 echo "== libriichi"
@@ -49,6 +53,7 @@ pip install -q toml
 echo "== nets and state"
 python3 - <<EOF
 import os
+import shutil
 from huggingface_hub import hf_hub_download, snapshot_download
 try:
     from huggingface_hub import errors
@@ -62,24 +67,30 @@ for name in {'${INIT}', '${OPPONENT}'}:
     hf_hub_download('${MODEL_REPO}', name, local_dir='/root/nets')
 # What the gate scores against (sha256 475f95ab).
 hf_hub_download('${MODEL_REPO}', 'baseline/baseline.pth', local_dir='/root/nets')
-# A previous version's state, to resume from. Only a state that the Hub says is not there
-# starts afresh: a download that failed for any other reason stops the script here, or a
-# fresh run would be uploaded over the one it could not fetch. Fetched into /dev/shm,
-# beside OUT, so os.replace can move it there.
-resume = '/dev/shm/resume'
-try:
-    hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume)
-except errors.LocalEntryNotFoundError:
-    raise
-except getattr(errors, 'RemoteEntryNotFoundError', errors.EntryNotFoundError):
-    print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
+# Where to resume from. This run's own folder first: it has a state only if this run ran
+# earlier in this session, and then it is at least as new as anything it backed up.
+# Otherwise a previous version's, from the Hub. Only a state that the Hub says is not
+# there starts afresh: a download that failed for any other reason stops the script here,
+# or a fresh run would be uploaded over the one it could not fetch.
+out, resume = '${OUT}', '${OUT}.resume'
+if os.path.exists(f'{out}/state.msgpack'):
+    print(f'resuming from {out}, left by this run earlier in this session')
 else:
-    snapshot_download('${RUN_REPO}', local_dir=resume, allow_patterns=[
-        '${RUN_PATH}/gate.json', '${RUN_PATH}/gate.jsonl', '${RUN_PATH}/champion.npz'])
-    os.makedirs('${OUT}', exist_ok=True)
-    for name in os.listdir(f'{resume}/${RUN_PATH}'):
-        os.replace(f'{resume}/${RUN_PATH}/{name}', f'${OUT}/{name}')
-    print('resuming from ${RUN_REPO}/${RUN_PATH}:', sorted(os.listdir('${OUT}')))
+    try:
+        hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume)
+    except errors.LocalEntryNotFoundError:
+        raise
+    except getattr(errors, 'RemoteEntryNotFoundError', errors.EntryNotFoundError):
+        print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
+    else:
+        snapshot_download('${RUN_REPO}', local_dir=resume, allow_patterns=[
+            '${RUN_PATH}/gate.json', '${RUN_PATH}/gate.jsonl', '${RUN_PATH}/champion.npz'])
+        # Fetched beside OUT, in /dev/shm, so os.replace can move it there.
+        os.makedirs(out, exist_ok=True)
+        for name in os.listdir(f'{resume}/${RUN_PATH}'):
+            os.replace(f'{resume}/${RUN_PATH}/{name}', f'{out}/{name}')
+        print('resuming from ${RUN_REPO}/${RUN_PATH}:', sorted(os.listdir(out)))
+    shutil.rmtree(resume, ignore_errors=True)
 EOF
 cd /root/Mortal/mortal
 python3 -m tpu.convert export /root/nets/baseline/baseline.pth /root/nets/baseline.npz
@@ -106,16 +117,10 @@ EOF
     sleep 30
 fi
 
+# From a snapshot of one save that holds still while it uploads (#49): see backup.py.
 backup() {
-    python3 - <<EOF
-from huggingface_hub import HfApi
-api = HfApi()
-if not api.repo_info('${RUN_REPO}').private:
-    raise SystemExit('${RUN_REPO} is public; refusing to upload checkpoints to it')
-# Every file is written under a temporary name and renamed, so each one read here is whole.
-api.upload_folder(folder_path='${OUT}', repo_id='${RUN_REPO}', path_in_repo='${RUN_PATH}',
-                  ignore_patterns=['*.tmp', '*.tmp.npz'], commit_message='online run: ${1}')
-EOF
+    python3 /root/Mortal/ops/kaggle/backup.py --out "$OUT" --repo "$RUN_REPO" --path "$RUN_PATH" \
+        --message "online run: $1"
 }
 
 echo "== train"

@@ -40,6 +40,42 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)8s %(filename)12s:%(lineno)-4s %(message)s')
 
 
+class Manifest:
+    """manifest.json in a run's output: a generation bumped around each group of writes
+    that belong together -- a save's state.msgpack and both weights files.
+
+    It is written incomplete before the group and complete after, so a backup copying the
+    folder while training runs (ops/kaggle/backup.py) can read it before and after its
+    copy: the same generation, complete both times, means the copy is one save's files.
+    """
+
+    def __init__(self, out):
+        import json
+        self.file = path.join(out, 'manifest.json')
+        self.generation = 0
+        if path.exists(self.file):
+            with open(self.file, encoding='utf-8') as f:
+                self.generation = json.load(f).get('generation', 0)
+
+    def writing(self, steps):
+        import contextlib
+
+        @contextlib.contextmanager
+        def group():
+            self.generation += 1
+            self._write(steps, False)
+            yield
+            self._write(steps, True)
+        return group()
+
+    def _write(self, steps, complete):
+        import json
+        tmp = self.file + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'generation': self.generation, 'steps': int(steps), 'complete': complete}, f)
+        os.replace(tmp, self.file)
+
+
 def build_file_list(dataset_cfg, seed):
     import pyarrow.parquet as pq
     shards = sorted(s for pat in dataset_cfg.get('parquet_globs', []) for s in glob(pat, recursive=True))
@@ -212,6 +248,28 @@ def on_devices(batches, sharding, slots, threads=2, ready=8):
         stop.set()
         feeder.join(timeout=120)
         pool.shutdown(wait=True)
+        close_dataset(batches, feeder)
+
+
+def close_dataset(batches, feeder):
+    """Close a loader's dataset when it decodes in this process, so its decode thread ends.
+
+    Without workers, `FileDatasetsIter.decoded_ahead` decodes in a thread of this
+    process that holds its own generator, so it outlives the feeder that was reading
+    it; left there, it can be inside Rust when the process exits, which aborts it
+    (exit 134, as the loader check once did). Closing the dataset's generator runs
+    decoded_ahead's finally, which stops that thread and waits for it -- only once the
+    feeder has let go, since a generator cannot be closed while another thread runs it.
+    """
+    if getattr(batches, 'num_workers', 1) != 0:
+        return
+    iterator = getattr(getattr(batches, 'dataset', None), 'iterator', None)
+    if iterator is None or not hasattr(iterator, 'close'):
+        return
+    if feeder.is_alive():
+        logging.warning('the loader is still reading; its dataset is left open')
+        return
+    iterator.close()
 
 
 def main():
@@ -317,20 +375,25 @@ def main():
         return {'params': params, 'batch_stats': stats, 'opt': opt, 'ema': ema,
                 'steps': state['steps'] + 1}, losses
 
+    manifest = Manifest(args.out)
+
     def save():
         host = jax.device_get(state)
         with open(ckpt + '.tmp', 'wb') as f:
             f.write(serialization.msgpack_serialize(
                 {**serialization.to_state_dict(host),
                  'shape': {'conv_channels': channels, 'num_blocks': blocks}}))
-        os.replace(ckpt + '.tmp', ckpt)
         meta = {'conv_channels': channels, 'num_blocks': blocks, 'steps': steps}
         # Each through a temporary name, like the state: a copy taken for a backup
         # while a save is under way is then the old file or the new one, never half.
+        # All written first and renamed together, in one generation of the manifest.
         for name, variables in (('weights.npz', {'params': host['params'], 'batch_stats': host['batch_stats']}),
                                 ('weights_ema.npz', host['ema'])):
             convert.save_npz(path.join(args.out, name + '.tmp.npz'), variables, meta)
-            os.replace(path.join(args.out, name + '.tmp.npz'), path.join(args.out, name))
+        with manifest.writing(steps):
+            os.replace(ckpt + '.tmp', ckpt)
+            for name in ('weights.npz', 'weights_ema.npz'):
+                os.replace(path.join(args.out, name + '.tmp.npz'), path.join(args.out, name))
         logging.info(f'saved at step {steps:,}')
 
     started = time.perf_counter()

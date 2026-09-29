@@ -6,9 +6,15 @@ threads and asks a `JaxEngine` on one device for every move. A test plays the fi
 `walls` walls of one of `evaluation.evaluate`'s sets, four games a wall, so its
 numbers sit beside every evaluation made on the same walls with PyTorch, and
 writes one line to test_play.jsonl in the run's output: the average pt, rank and
-fourths with their error over walls, and the difference from the run's first test,
-paired wall by wall. The ranks of every test are kept in test_play/, for pairing
-any two of them later.
+fourths with their error over walls, and the difference from the first test of its
+series, paired wall by wall. The ranks of every test are kept in
+test_play/<series>/, for pairing any two of them later.
+
+A series is one wall set, its key and one baseline (by content): a wall is a seed
+under a key, so seed 0 of dev and seed 0 of holdout are different deals, and a
+different baseline is a different opponent. Tests pair only within their series; a
+run resumed with other settings starts a new one rather than set unlike games side
+by side as if they were one measurement.
 
 Nothing is chosen by it. A best-so-far picked from these numbers would be the
 largest of several noisy ones -- 4,000 games carry 1.3 pt of error -- so a run's
@@ -27,7 +33,7 @@ from os import path
 
 class TestPlay:
     def __init__(self, baseline, out, *, wall_set='dev', walls=500, device=None, threads=8):
-        from evaluation.evaluate import WALL_SETS
+        from evaluation.evaluate import WALL_SETS, sha256_of
         from tpu.engine import JaxEngine
         # The arena runs on libriichi's rayon pool in this process, which is sized the
         # first time it is used; the loader's workers are other processes with their own.
@@ -40,7 +46,9 @@ class TestPlay:
         self.thread = None
         self.last = None
         self.log_file = path.join(out, 'test_play.jsonl')
-        self.ranks_dir = path.join(out, 'test_play')
+        # What makes two tests comparable: the same deals against the same opponent.
+        self.series = f'{self.wall_set.name}-{self.wall_set.key:x}-{sha256_of(baseline)[:16]}'
+        self.ranks_dir = path.join(out, 'test_play', self.series)
         os.makedirs(self.ranks_dir, exist_ok=True)
         # The game logs are only read back for the ranks: RAM, where there is some,
         # since the Kaggle host's disk can be throttled to 1 MB/s.
@@ -92,8 +100,8 @@ class TestPlay:
         finally:
             shutil.rmtree(logs, ignore_errors=True)
 
-        # The first test of the run is what the others are paired against; a run that
-        # resumes finds it among the kept ranks.
+        # The first test of this series is what the others are paired against; a run that
+        # resumes finds it among the kept ranks. Another series' tests are never looked at.
         kept = sorted(glob.glob(path.join(self.ranks_dir, '*.json')))
         first = None
         if kept:
@@ -107,8 +115,8 @@ class TestPlay:
         as_games = lambda r: {(int(k.split('_')[0]), k.split('_')[1]): v for k, v in r.items()}
         walls = walls_of(as_games(ranks))
         seeds = sorted(walls)
-        record = {'steps': steps, 'set': self.wall_set.name, 'walls': len(seeds), 'games': 4 * len(seeds),
-                  'seconds': round(time.time() - started, 1)}
+        record = {'steps': steps, 'series': self.series, 'set': self.wall_set.name, 'key': self.wall_set.key,
+                  'walls': len(seeds), 'games': 4 * len(seeds), 'seconds': round(time.time() - started, 1)}
         for name in ('pt', 'rank', 'fourth'):
             record[name] = summarize(walls, seeds, name)
         line = (f'test play at step {steps:,}: {record["pt"]["mean"]:+.2f} ± {record["pt"]["se"]:.2f} pt, '

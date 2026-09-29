@@ -28,7 +28,9 @@
 #
 # A state already at RUN_REPO/RUN_PATH is resumed, finished or not: a new run
 # needs a RUN_PATH of its own. `tpu-run` holds the 192x60 run, done at step
-# 1,354,328 on 2026-09-27.
+# 1,354,328 on 2026-09-27. Locally each run has its own folder under /dev/shm/runs,
+# named by RUN_REPO/RUN_PATH, so a second run in one session never finds the
+# first's state; a run that ran earlier in the session resumes from its own folder.
 #
 # Every TEST_EVERY steps, and at the start and the end, the EMA plays the first
 # TEST_WALLS dev walls against the v3 baseline (baseline/baseline.pth in the model
@@ -57,7 +59,9 @@ TEST_EVERY=${TEST_EVERY:-100000}
 TEST_WALLS=${TEST_WALLS:-500}
 # The run's config; another only to try the script on a smaller box.
 CONFIG=${CONFIG:-config.tpu.toml}
-OUT=/dev/shm/run
+# This run's own folder, named by where it is backed up: another run later in the same
+# session, under another RUN_PATH, must not find this one's state and resume it (#48).
+OUT=/dev/shm/runs/$(printf '%s' "$RUN_REPO/$RUN_PATH" | tr '/' '_')
 
 cd /root
 echo "== libriichi"
@@ -70,6 +74,7 @@ pip install -q toml
 echo "== corpus and starting point"
 python3 - <<EOF
 import os
+import shutil
 from huggingface_hub import hf_hub_download, snapshot_download
 try:
     from huggingface_hub import errors
@@ -85,35 +90,38 @@ if '${INIT}':
 if int('${TEST_EVERY}'):
     # What test play scores against (sha256 475f95ab), the champion of every evaluation.
     hf_hub_download('${MODEL_REPO}', 'baseline/baseline.pth', local_dir='/root/baseline')
-# A previous version's state, to resume from. Only a state that the Hub says is not
-# there starts the run afresh: a download that failed for any other reason stops the
-# script here, or a fresh run would be uploaded over the one it could not fetch.
-# Fetched into /dev/shm, beside OUT: os.replace cannot move a file from the disk
-# into RAM, and from /root every resume stopped here ("Invalid cross-device link").
-resume = '/dev/shm/resume'
-try:
-    hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume)
-except errors.LocalEntryNotFoundError:
-    # The Hub was never asked: a dropped connection with nothing cached. It is a
-    # subclass of EntryNotFoundError, so it has to go through before that is caught.
-    raise
-except getattr(errors, 'RemoteEntryNotFoundError', errors.EntryNotFoundError):
-    print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
+# Where to resume from. This run's own folder first: it has a state only if this run
+# ran earlier in this session, and then that state is at least as new as anything it
+# backed up. Otherwise a previous version's, from the Hub; only a state that the Hub
+# says is not there starts the run afresh: a download that failed for any other reason
+# stops the script here, or a fresh run would be uploaded over the one it could not fetch.
+out, resume = '${OUT}', '${OUT}.resume'
+if os.path.exists(f'{out}/state.msgpack'):
+    print(f'resuming from {out}, left by this run earlier in this session')
 else:
-    os.makedirs('${OUT}', exist_ok=True)
-    os.replace(f'{resume}/${RUN_PATH}/state.msgpack', '${OUT}/state.msgpack')
-    print('resuming from ${RUN_REPO}/${RUN_PATH}/state.msgpack')
-    # Its test play so far, so the tests to come are paired against its first.
-    snapshot_download('${RUN_REPO}', local_dir=resume,
-                      allow_patterns=['${RUN_PATH}/test_play.jsonl', '${RUN_PATH}/test_play/*.json'])
-    kept = f'{resume}/${RUN_PATH}'
-    if os.path.exists(f'{kept}/test_play.jsonl'):
-        os.replace(f'{kept}/test_play.jsonl', '${OUT}/test_play.jsonl')
-    if os.path.isdir(f'{kept}/test_play'):
-        os.makedirs('${OUT}/test_play', exist_ok=True)
-        for name in os.listdir(f'{kept}/test_play'):
-            os.replace(f'{kept}/test_play/{name}', f'${OUT}/test_play/{name}')
-    print('test play kept:', len(os.listdir('${OUT}/test_play')) if os.path.isdir('${OUT}/test_play') else 0)
+    try:
+        hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume)
+    except errors.LocalEntryNotFoundError:
+        # The Hub was never asked: a dropped connection with nothing cached. It is a
+        # subclass of EntryNotFoundError, so it has to go through before that is caught.
+        raise
+    except getattr(errors, 'RemoteEntryNotFoundError', errors.EntryNotFoundError):
+        print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
+    else:
+        # Its test play so far, so the tests to come are paired against their series' first.
+        snapshot_download('${RUN_REPO}', local_dir=resume,
+                          allow_patterns=['${RUN_PATH}/test_play.jsonl', '${RUN_PATH}/test_play/*'])
+        # Fetched beside OUT, in /dev/shm: os.replace cannot move a file from the disk
+        # into RAM, and from /root every resume stopped here ("Invalid cross-device link").
+        os.makedirs(out, exist_ok=True)
+        kept = f'{resume}/${RUN_PATH}'
+        for name in ('state.msgpack', 'test_play.jsonl', 'test_play'):
+            if os.path.exists(f'{kept}/{name}'):
+                if os.path.isdir(f'{out}/{name}'):
+                    shutil.rmtree(f'{out}/{name}')      # what the Hub holds is this run's record
+                os.replace(f'{kept}/{name}', f'{out}/{name}')
+        print('resuming from ${RUN_REPO}/${RUN_PATH}:', sorted(os.listdir(out)))
+    shutil.rmtree(resume, ignore_errors=True)
 EOF
 cd /root/Mortal/mortal
 INIT_ARGS=()
@@ -151,17 +159,11 @@ print('loader ok:', [tuple(t.shape) for t in batch])
 data.dataset.iterator.close()
 EOF
 
+# From a snapshot of one save that holds still while it uploads, not from the folder the
+# trainer keeps renaming files into: see backup.py (#49).
 backup() {
-    python3 - <<EOF
-from huggingface_hub import HfApi
-api = HfApi()
-if not api.repo_info('${RUN_REPO}').private:
-    raise SystemExit('${RUN_REPO} is public; refusing to upload checkpoints to it')
-# run.py writes every file under a temporary name and renames it, so each file
-# read here is a whole save; the temporaries themselves are left out.
-api.upload_folder(folder_path='${OUT}', repo_id='${RUN_REPO}', path_in_repo='${RUN_PATH}',
-                  ignore_patterns=['*.tmp', '*.tmp.npz'], commit_message='tpu run: ${1}')
-EOF
+    python3 /root/Mortal/ops/kaggle/backup.py --out "$OUT" --repo "$RUN_REPO" --path "$RUN_PATH" \
+        --message "tpu run: $1"
 }
 
 echo "== train"
@@ -174,7 +176,7 @@ BACKUP_PID=$!
 # save uploaded before the script exits with its status.
 status=0
 python3 -m tpu.run --out "$OUT" "${INIT_ARGS[@]}" "${TEST_ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat 2>&1 \
-    | tee "$OUT/train.log" || status=$?
+    | tee -a "$OUT/train.log" || status=$?
 pkill -P $BACKUP_PID 2>/dev/null || true      # an upload under way, or the sleep
 kill $BACKUP_PID 2>/dev/null || true
 
