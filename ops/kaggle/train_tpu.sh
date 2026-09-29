@@ -26,6 +26,15 @@
 # much. (The first run, from an interactive session over ssh, was cut 25 minutes
 # in, before its first backup, and left nothing.)
 #
+# A state already at RUN_REPO/RUN_PATH is resumed, finished or not: a new run
+# needs a RUN_PATH of its own. `tpu-run` holds the 192x60 run, done at step
+# 1,354,328 on 2026-09-27.
+#
+# Every TEST_EVERY steps, and at the start and the end, the EMA plays the first
+# TEST_WALLS dev walls against the v3 baseline (baseline/baseline.pth in the model
+# repo) beside training; the results go to test_play.jsonl and are backed up with
+# the rest, and a resumed run keeps pairing its tests against its first. 0 plays none.
+#
 # The corpus and the output live in /dev/shm (164 GB of RAM), not on disk: the
 # host's disk has been throttled to ~1 MB/s for reads the page cache does not
 # hold (measured 2026-09-24), which starves the loader and stalls every save.
@@ -44,6 +53,10 @@ HOURS=${HOURS:-8}
 MODEL_REPO=${MODEL_REPO:-hhim8826/mortal4-0911}
 RUN_REPO=${RUN_REPO:-hhim8826/mortal4-0911}
 RUN_PATH=${RUN_PATH:-tpu-run}
+TEST_EVERY=${TEST_EVERY:-100000}
+TEST_WALLS=${TEST_WALLS:-500}
+# The run's config; another only to try the script on a smaller box.
+CONFIG=${CONFIG:-config.tpu.toml}
 OUT=/dev/shm/run
 
 cd /root
@@ -69,11 +82,17 @@ os.makedirs('/root/Mortal/mortal/grp_v2', exist_ok=True)
 os.replace('/root/grp/grp/grp.pth', '/root/Mortal/mortal/grp_v2/grp.pth')
 if '${INIT}':
     hf_hub_download('${MODEL_REPO}', '${INIT}', local_dir='/root/init')
+if int('${TEST_EVERY}'):
+    # What test play scores against (sha256 475f95ab), the champion of every evaluation.
+    hf_hub_download('${MODEL_REPO}', 'baseline/baseline.pth', local_dir='/root/baseline')
 # A previous version's state, to resume from. Only a state that the Hub says is not
 # there starts the run afresh: a download that failed for any other reason stops the
 # script here, or a fresh run would be uploaded over the one it could not fetch.
+# Fetched into /dev/shm, beside OUT: os.replace cannot move a file from the disk
+# into RAM, and from /root every resume stopped here ("Invalid cross-device link").
+resume = '/dev/shm/resume'
 try:
-    hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir='/root/resume')
+    hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume)
 except errors.LocalEntryNotFoundError:
     # The Hub was never asked: a dropped connection with nothing cached. It is a
     # subclass of EntryNotFoundError, so it has to go through before that is caught.
@@ -82,8 +101,19 @@ except getattr(errors, 'RemoteEntryNotFoundError', errors.EntryNotFoundError):
     print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
 else:
     os.makedirs('${OUT}', exist_ok=True)
-    os.replace('/root/resume/${RUN_PATH}/state.msgpack', '${OUT}/state.msgpack')
+    os.replace(f'{resume}/${RUN_PATH}/state.msgpack', '${OUT}/state.msgpack')
     print('resuming from ${RUN_REPO}/${RUN_PATH}/state.msgpack')
+    # Its test play so far, so the tests to come are paired against its first.
+    snapshot_download('${RUN_REPO}', local_dir=resume,
+                      allow_patterns=['${RUN_PATH}/test_play.jsonl', '${RUN_PATH}/test_play/*.json'])
+    kept = f'{resume}/${RUN_PATH}'
+    if os.path.exists(f'{kept}/test_play.jsonl'):
+        os.replace(f'{kept}/test_play.jsonl', '${OUT}/test_play.jsonl')
+    if os.path.isdir(f'{kept}/test_play'):
+        os.makedirs('${OUT}/test_play', exist_ok=True)
+        for name in os.listdir(f'{kept}/test_play'):
+            os.replace(f'{kept}/test_play/{name}', f'${OUT}/test_play/{name}')
+    print('test play kept:', len(os.listdir('${OUT}/test_play')) if os.path.isdir('${OUT}/test_play') else 0)
 EOF
 cd /root/Mortal/mortal
 INIT_ARGS=()
@@ -92,10 +122,15 @@ if [ -n "$INIT" ]; then
     INIT_ARGS=(--init /root/init.npz)
     [ -n "$GROW_TO" ] && INIT_ARGS+=(--grow-to "$GROW_TO")
 fi
+TEST_ARGS=()
+if [ "$TEST_EVERY" -gt 0 ]; then
+    python3 -m tpu.convert export /root/baseline/baseline/baseline.pth /root/baseline.npz
+    TEST_ARGS=(--test-every "$TEST_EVERY" --test-baseline /root/baseline.npz --test-walls "$TEST_WALLS")
+fi
 
-export MORTAL_CFG=config.tpu.toml MORTAL_LOADER_RAYON_THREADS=3
+export MORTAL_CFG=$CONFIG MORTAL_LOADER_RAYON_THREADS=3
 if [ -n "$MAX_STEPS" ]; then
-    python3 -c "import toml; c = toml.load('config.tpu.toml'); c['optim']['scheduler']['max_steps'] = $MAX_STEPS; toml.dump(c, open('/root/cfg_run.toml', 'w'))"
+    python3 -c "import toml; c = toml.load('$CONFIG'); c['optim']['scheduler']['max_steps'] = $MAX_STEPS; toml.dump(c, open('/root/cfg_run.toml', 'w'))"
     export MORTAL_CFG=/root/cfg_run.toml
 fi
 echo "== one batch through the loader, before the chips are touched"
@@ -138,7 +173,8 @@ BACKUP_PID=$!
 # --remat: faster on the v5e, not only smaller. A run that fails still has its last
 # save uploaded before the script exits with its status.
 status=0
-python3 -m tpu.run --out "$OUT" "${INIT_ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat 2>&1     | tee "$OUT/train.log" || status=$?
+python3 -m tpu.run --out "$OUT" "${INIT_ARGS[@]}" "${TEST_ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat 2>&1 \
+    | tee "$OUT/train.log" || status=$?
 pkill -P $BACKUP_PID 2>/dev/null || true      # an upload under way, or the sleep
 kill $BACKUP_PID 2>/dev/null || true
 
