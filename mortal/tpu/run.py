@@ -20,6 +20,9 @@ the identity, so step 0 plays exactly as the checkpoint did.
 Every `save_every` steps it writes `state.msgpack` (everything, to resume) and
 `weights.npz` / `weights_ema.npz` (for `python -m tpu.convert import` on a GPU
 box, where the evaluation tools are).
+
+With `--test-every`, the EMA also plays the v3 baseline beside training, on the
+chips it trains on (`tpu.testplay`), and each result goes to test_play.jsonl.
 """
 import argparse
 import logging
@@ -223,6 +226,14 @@ def main():
                     help='recompute block activations in the backward pass: less memory, and on a '
                          'v5e-8 faster as well (7.1 ms a step at batch 1,024 against 9.0)')
     ap.add_argument('--log-every', type=int, default=100)
+    ap.add_argument('--test-every', type=int, default=0,
+                    help='play the EMA against --test-baseline every this many steps, beside training; '
+                         'also once at the start and once at the end. 0 plays none')
+    ap.add_argument('--test-baseline', default='',
+                    help='the v3 baseline as an .npz: python -m tpu.convert export logs/baseline.pth base.npz')
+    ap.add_argument('--test-set', default='dev', help="evaluation.evaluate's wall set to play")
+    ap.add_argument('--test-walls', type=int, default=500, help='its first this many walls, four games each')
+    ap.add_argument('--test-threads', type=int, default=8, help='CPU threads the games take from the loader')
     args = ap.parse_args()
 
     import jax
@@ -268,6 +279,8 @@ def main():
         variables = Mortal(channels, blocks).init(rng, jnp.zeros((2, 34, 1012)), jnp.ones((2, 46), bool))
     elif args.init:
         variables, meta = convert.load_npz(args.init)
+        if meta['version'] != 4:
+            raise SystemExit(f'{args.init} is version {meta["version"]}; only v4 trains here')
         channels, blocks = meta['conv_channels'], meta['num_blocks']
         logging.info(f'init: {args.init}, {channels}x{blocks}, step {meta.get("steps", 0):,}')
         if args.grow_to and args.grow_to > blocks:
@@ -332,8 +345,21 @@ def main():
     # The step is dispatched, not waited for, so the device runs while the next batch
     # is fetched; time spent in the fetch itself is the loader not keeping up.
     t_back = time.perf_counter()
+    tester, next_test = None, steps
+    if args.test_every:
+        if not args.test_baseline:
+            raise SystemExit('--test-every needs --test-baseline: python -m tpu.convert export logs/baseline.pth')
+        from tpu.testplay import TestPlay
+        tester = TestPlay(args.test_baseline, args.out, wall_set=args.test_set, walls=args.test_walls,
+                          device=devices[0], threads=args.test_threads)
     for arrays in on_devices(loader(config, files, batch_size, steps, slots), split, slots, ready=ready):
         waited += time.perf_counter() - t_back
+        if tester is not None and steps >= next_test:
+            # Only in here, where the first batch has forked the loader's workers. The
+            # games start libriichi's rayon pool in this process; a worker forked after
+            # that inherits the pool without its threads and hangs on its first decode.
+            tester.start(steps, jax.device_get(state['ema']), channels, blocks)
+            next_test = steps - steps % args.test_every + args.test_every
         state, losses = step(state, arrays)
         steps += 1
         # Kept on the device until the log: adding them up as they come is three more
@@ -359,6 +385,11 @@ def main():
         t_back = time.perf_counter()
     save()
     logging.info(f'done at step {steps:,}')
+    if tester is not None:
+        tester.finish()
+        if tester.last != steps:
+            tester.start(steps, jax.device_get(state['ema']), channels, blocks)
+            tester.finish()
 
 
 if __name__ == '__main__':

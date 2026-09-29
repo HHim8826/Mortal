@@ -62,10 +62,15 @@ def from_torch(mortal, dqn, aux, num_blocks):
     }
     stats['blocks'] = {'bn1': {f: stack(('bn1', t)) for t, f in BN_STATS},
                        'bn2': {f: stack(('bn2', t)) for t, f in BN_STATS}}
-    return {'params': {'brain': params,
-                       'dqn': {'net': {'kernel': dense_in(dqn['net.weight']), 'bias': dqn['net.bias']}},
-                       'aux': {'kernel': dense_in(aux['net.weight'])}},
-            'batch_stats': {'brain': stats}}
+    dense = lambda prefix: {'kernel': dense_in(dqn[prefix + 'weight']), 'bias': dqn[prefix + 'bias']}
+    if 'net.weight' in dqn:                                   # v4: one linear
+        head = {'net': dense('net.')}
+    else:                                                     # v3: an MLP each for V and A
+        head = {f'{h}_{part}': dense(f'{h}_head.{i}.') for h in 'va' for i, part in ((0, 'hidden'), (2, 'out'))}
+    out = {'params': {'brain': params, 'dqn': head}, 'batch_stats': {'brain': stats}}
+    if aux:                                                   # the v3 baseline has none to play
+        out['params']['aux'] = {'kernel': dense_in(aux['net.weight'])}
+    return out
 
 
 def to_torch(variables, num_blocks):
@@ -110,6 +115,7 @@ def load_npz(path):
     z = np.load(path)
     part = lambda prefix: {k[len(prefix):]: z[k] for k in z.files if k.startswith(prefix)}
     meta = {k: int(v) for k, v in part('meta/').items()}
+    meta.setdefault('version', 4)                             # exported before v3 could be
     return from_torch(part('mortal/'), part('dqn/'), part('aux/'), meta['num_blocks']), meta
 
 
@@ -126,15 +132,17 @@ def cmd_export(args):
     state = torch.load(args.checkpoint, weights_only=True, map_location='cpu')
     cfg = state['config']
     version = cfg['control'].get('version', 1)
-    if version != 4:
-        raise SystemExit(f'{args.checkpoint} is version {version}; only v4 is ported')
+    if version not in (3, 4):
+        raise SystemExit(f'{args.checkpoint} is version {version}; v4 is ported, and v3 for playing')
     weights = state['ema'] if args.ema else state
     out = {'meta/conv_channels': np.array(cfg['resnet']['conv_channels']),
            'meta/num_blocks': np.array(cfg['resnet']['num_blocks']),
-           'meta/steps': np.array(state.get('steps', 0))}
-    for prefix, key, sd in (('mortal/', 'mortal', weights['mortal']),
-                            ('dqn/', 'current_dqn', weights['current_dqn']),
-                            ('aux/', 'aux_net', state['aux_net'])):
+           'meta/steps': np.array(state.get('steps', 0)),
+           'meta/version': np.array(version)}
+    parts = [('mortal/', weights['mortal']), ('dqn/', weights['current_dqn'])]
+    if 'aux_net' in state:                                    # v4; the v3 baseline plays without it
+        parts.append(('aux/', state['aux_net']))
+    for prefix, sd in parts:
         out.update({prefix + k: v.float().numpy() if v.is_floating_point() else v.numpy()
                     for k, v in sd.items()})
     np.savez(args.out, **out)

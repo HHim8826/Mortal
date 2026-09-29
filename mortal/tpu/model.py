@@ -11,8 +11,10 @@ Layer for layer the same network, so a checkpoint moves between the two with
   modules. Unrolled, the forty-block graph took over 60 GB of host memory to
   compile and had not finished after fifteen minutes on the Kaggle TPU host.
 
-Only version 4 is ported: its BatchNorm eps is 1e-3 and momentum 0.01 in
-PyTorch's convention, 0.99 in Flax's.
+Version 4 is ported for training: its BatchNorm eps is 1e-3 and momentum 0.01 in
+PyTorch's convention, 0.99 in Flax's. Version 3, the baseline test play is scored
+against, is ported for playing only (`Player`): its Brain is the same network on
+a different observation, and only its DQN head differs.
 """
 from typing import Any
 
@@ -92,6 +94,12 @@ class Brain(nn.Module):
         return mish(nn.Dense(1024, dtype=d, name='fc')(x))
 
 
+def dueling(v, a, mask):
+    """Q from V and the advantages, centred on the legal actions' mean; -inf where illegal."""
+    a_mean = jnp.where(mask, a, 0.).sum(-1, keepdims=True) / mask.sum(-1, keepdims=True)
+    return jnp.where(mask, v + a - a_mean, -jnp.inf)
+
+
 class DQN(nn.Module):
     """The v4 dueling head: one linear to V and the 46 advantages."""
     dtype: Any = jnp.float32
@@ -99,9 +107,36 @@ class DQN(nn.Module):
     @nn.compact
     def __call__(self, phi, mask):
         va = nn.Dense(1 + ACTIONS, dtype=self.dtype, name='net')(phi)
-        v, a = va[:, :1], va[:, 1:]
-        a_mean = jnp.where(mask, a, 0.).sum(-1, keepdims=True) / mask.sum(-1, keepdims=True)
-        return jnp.where(mask, v + a - a_mean, -jnp.inf)
+        return dueling(va[:, :1], va[:, 1:], mask)
+
+
+class DQNv3(nn.Module):
+    """The v3 dueling head: V and the advantages each from their own 256-wide MLP."""
+    dtype: Any = jnp.float32
+
+    @nn.compact
+    def __call__(self, phi, mask):
+        mlp = lambda out, name: (lambda x: nn.Dense(out, dtype=self.dtype, name=f'{name}_out')(
+            mish(nn.Dense(256, dtype=self.dtype, name=f'{name}_hidden')(x))))
+        return dueling(mlp(1, 'v')(phi), mlp(ACTIONS, 'a')(phi), mask)
+
+
+class Player(nn.Module):
+    """Brain and its version's DQN head, as `MortalEngine` plays them: obs and masks to Q.
+
+    The Brain takes its input width from the observation, so the same module plays
+    v4 and the v3 baseline; the variables are the training ones without `aux`.
+    """
+    conv_channels: int = 192
+    num_blocks: int = 40
+    version: int = 4
+    dtype: Any = jnp.float32
+
+    @nn.compact
+    def __call__(self, obs, mask):
+        phi = Brain(self.conv_channels, self.num_blocks, self.dtype, name='brain')(obs)
+        head = {4: DQN, 3: DQNv3}[self.version]
+        return head(self.dtype, name='dqn')(phi, mask)
 
 
 class Mortal(nn.Module):
