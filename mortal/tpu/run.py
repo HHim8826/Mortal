@@ -447,6 +447,11 @@ def main():
         state = serialization.from_state_dict(state, resume)
         logging.info(f'resumed at step {int(state["steps"]):,}')
     steps = int(state['steps'])
+    if args.steps and steps >= args.steps:
+        # Before the loader starts: the loop steps before it looks at --steps, and its
+        # workers' first chunks would count as read (#60).
+        logging.info(f'at step {steps:,} already, --steps {args.steps:,}; nothing to do')
+        return
     state = jax.device_put(state, whole)
     logging.info(f'parameters: {sum(x.size for x in jax.tree_util.tree_leaves(state["params"])):,}')
 

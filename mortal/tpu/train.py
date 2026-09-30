@@ -16,8 +16,8 @@ makes unnecessary.
 Online (`online = true`) it is train.py's online branch: no CQL term; with
 `freeze_bn`, BatchNorm normalises by its running statistics and never updates
 them, as a BatchNorm held in eval does, while its scale and bias still train; and
-with `trainable_blocks`, `trainable` and `hold` keep the stem and every block but
-the last few exactly where they are, as `Brain.freeze_trunk` does.
+with `trainable_blocks`, `split` keeps the stem and every block but the last few
+out of the gradient and the optimizer, as `Brain.freeze_trunk` does.
 """
 import math
 
@@ -45,62 +45,74 @@ def decay_mask(params):
     return jax.tree_util.tree_map_with_path(lambda path, _: path[-1].key == 'kernel', params)
 
 
-def trainable(params, trainable_blocks):
-    """1 where a parameter trains, 0 where `Brain.freeze_trunk(trainable_blocks)` holds it.
+def split(tree, frozen_blocks):
+    """(trained, frozen): a params or batch_stats tree cut where `Brain.freeze_trunk` cuts.
 
-    That is the stem and every residual block but the last `trainable_blocks`; the tail
-    of the Brain, the heads and the aux net always train, and 0 -- or at least as many
-    as there are blocks -- trains everything. The blocks are one stacked array here, so
-    their mask runs along its first axis, one entry a block.
-
-    Only with `freeze_bn`: the frozen blocks' BatchNorm is then in eval as train.py's
-    is. Without it, their running statistics would still move here and not there.
+    The frozen part is the stem and the first `frozen_blocks` residual blocks; the rest of
+    the Brain, the heads and the aux net are the trained part. The blocks are one stacked
+    array, cut along its first axis. `join` puts them back together.
     """
-    blocks = jax.tree_util.tree_leaves(params['brain']['blocks'])[0].shape[0]
-    everything = not trainable_blocks or trainable_blocks >= blocks
-
-    def mask(path, leaf):
-        keys = [p.key for p in path]
-        if everything or keys[0] != 'brain' or keys[1] not in ('stem', 'blocks'):
-            return jnp.ones((), leaf.dtype)
-        if keys[1] == 'stem':
-            return jnp.zeros((), leaf.dtype)
-        held = (jnp.arange(blocks) >= blocks - trainable_blocks).astype(leaf.dtype)
-        return held.reshape((blocks,) + (1,) * (leaf.ndim - 1))
-    return jax.tree_util.tree_map_with_path(mask, params)
+    brain = tree['brain']
+    cut = lambda sub, s: jax.tree_util.tree_map(lambda a: a[s], sub)
+    frozen = {'blocks': cut(brain['blocks'], slice(None, frozen_blocks))}
+    if 'stem' in brain:
+        frozen['stem'] = brain['stem']
+    trained = {k: v for k, v in brain.items() if k not in ('stem', 'blocks')}
+    trained['blocks'] = cut(brain['blocks'], slice(frozen_blocks, None))
+    return {**{k: v for k, v in tree.items() if k != 'brain'}, 'brain': trained}, {'brain': frozen}
 
 
-def hold(mask):
-    """Multiplies what passes through by `mask`: 0 is no gradient in, and no step out."""
-    def update(updates, state, params=None):
-        return jax.tree_util.tree_map(lambda u, m: u * m, updates, mask), state
-    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+def join(trained, frozen):
+    """The tree `split` cut into `trained` and `frozen`."""
+    brain = {**trained['brain'], **{k: v for k, v in frozen['brain'].items() if k != 'blocks'}}
+    brain['blocks'] = jax.tree_util.tree_map(lambda f, t: jnp.concatenate([f, t]),
+                                             frozen['brain']['blocks'], trained['brain']['blocks'])
+    return {**trained, 'brain': brain}
 
 
-def make_optimizer(optim_cfg, mask=None):
-    """AdamW as train.py builds it; with `mask` (`trainable`), frozen parameters never move.
+def before_split(opt):
+    """Whether `opt`, an online state's optimizer state as msgpack_restore gives it, is from
+    before `split` (#59): the whole net's AdamW between two masks, chain(hold, AdamW, hold),
+    whose EmptyStates restore as empty dicts."""
+    return isinstance(opt, dict) and set(opt) == {'0', '1', '2'} and opt['0'] == {} and opt['2'] == {}
 
-    train.py leaves a frozen parameter out of the optimizer. Here it stays in, and is
-    held twice: its gradient is zeroed going in, so AdamW's moments for it stay zero,
-    and its update is zeroed coming out, so the decoupled weight decay cannot shrink it.
-    """
+
+def from_before_split(opt, frozen_blocks):
+    """Such a state as the trained part's AdamW state now: the moments, zero where the net
+    was held, cut to the trained part; the step counts as they were."""
+    if not frozen_blocks:
+        return opt['1']
+
+    def walk(d):
+        if isinstance(d, dict) and isinstance(d.get('brain'), dict) and 'stem' in d['brain']:
+            return split(d, frozen_blocks)[0]
+        return {k: walk(v) for k, v in d.items()} if isinstance(d, dict) else d
+    return walk(opt['1'])
+
+
+def make_optimizer(optim_cfg):
+    """AdamW as train.py builds it. A frozen parameter stays out of it, as in train.py:
+    online, it is given `split`'s trained part only."""
     tx = optax.adamw(lr_schedule(**optim_cfg['scheduler']), b1=optim_cfg['betas'][0],
                      b2=optim_cfg['betas'][1], eps=optim_cfg['eps'],
                      weight_decay=optim_cfg['weight_decay'], mask=decay_mask)
     if optim_cfg.get('max_grad_norm', 0) > 0:
         tx = optax.chain(optax.clip_by_global_norm(optim_cfg['max_grad_norm']), tx)
-    if mask is not None:
-        tx = optax.chain(hold(mask), tx, hold(mask))
     return tx
 
 
 def loss_fn(params, batch_stats, batch, *, model, gamma, min_q_weight, next_rank_weight,
-            dtype=jnp.bfloat16, online=False, freeze_bn=False):
+            dtype=jnp.bfloat16, online=False, freeze_bn=False, frozen=None):
     """train.py's loss on one batch.
 
     Offline, BatchNorm normalises by the batch's own statistics and updates its running
     ones. `online` drops the CQL term; `freeze_bn` normalises by the running statistics
     and leaves them as they are.
+
+    With `frozen`, the (params, batch_stats) of `split`'s frozen part, `params` and
+    `batch_stats` are the trained part: the frozen blocks run forward only, into the
+    trained ones, so the gradient -- `params`' alone -- goes back through those and no
+    further (#59). It needs `freeze_bn`, which holds the frozen blocks' BatchNorm in eval.
 
     `batch` is train.py's tuple as arrays: obs (n, 1012, 34), actions, masks, steps_to_done,
     kyoku_rewards, player_ranks.
@@ -108,7 +120,15 @@ def loss_fn(params, batch_stats, batch, *, model, gamma, min_q_weight, next_rank
     obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks = batch
     x = obs.transpose(0, 2, 1).astype(dtype)                  # channels last
     variables = {'params': params, 'batch_stats': batch_stats}
-    if freeze_bn:
+    if frozen is not None:
+        if not freeze_bn:
+            raise ValueError('a frozen trunk needs freeze_bn')
+        cut = jax.tree_util.tree_leaves(frozen[0]['brain']['blocks'])[0].shape[0]
+        trunk = model.clone(part='trunk', num_blocks=cut, remat=False)
+        x = jax.lax.stop_gradient(trunk.apply({'params': frozen[0], 'batch_stats': frozen[1]}, x))
+        q_out, logits = model.clone(part='tail', num_blocks=model.num_blocks - cut).apply(
+            variables, x, masks, train=False)
+    elif freeze_bn:
         q_out, logits = model.apply(variables, x, masks, train=False)
     else:
         (q_out, logits), updates = model.apply(variables, x, masks, train=True, mutable=['batch_stats'])

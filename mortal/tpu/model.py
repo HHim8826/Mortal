@@ -77,17 +77,25 @@ class Brain(nn.Module):
     Left at float32 a layer computes in float32 whatever its input is, because
     Flax promotes a bfloat16 input against float32 weights: training has to ask
     for bfloat16, and conversion and the equivalence checks keep float32.
+
+    `part` runs a piece of it, on the same names as the whole: 'trunk' is the stem and
+    `num_blocks` blocks, to their output; 'tail' takes that and runs `num_blocks` more
+    and the rest. A trunk of the first blocks and a tail of the others are the Brain.
     """
     conv_channels: int = 192
     num_blocks: int = 40
     dtype: Any = jnp.float32
     remat: bool = False
+    part: str = 'all'
 
     @nn.compact
-    def __call__(self, obs, train=False):
+    def __call__(self, x, train=False):
         d = self.dtype
-        x = nn.Conv(self.conv_channels, (3,), padding='SAME', use_bias=False, dtype=d, name='stem')(obs)
+        if self.part != 'tail':
+            x = nn.Conv(self.conv_channels, (3,), padding='SAME', use_bias=False, dtype=d, name='stem')(x)
         x, _ = blocks(self.num_blocks, self.remat)(self.conv_channels, train, d, name='blocks')(x, None)
+        if self.part == 'trunk':
+            return x
         x = mish(batch_norm(train, 'bn_final', d)(x))
         x = mish(nn.Conv(32, (3,), padding='SAME', dtype=d, name='conv_out')(x))
         x = x.transpose(0, 2, 1).reshape(x.shape[0], -1)       # PyTorch's (32, 34) order
@@ -140,15 +148,22 @@ class Player(nn.Module):
 
 
 class Mortal(nn.Module):
-    """Brain, DQN and the next-rank AuxNet together, as `train.py` runs them."""
+    """Brain, DQN and the next-rank AuxNet together, as `train.py` runs them.
+
+    `part`, as the Brain's: a 'trunk' returns the Brain's trunk's output, and a 'tail'
+    takes that for `obs` and returns what the whole does (`tpu.train.split`)."""
     conv_channels: int = 192
     num_blocks: int = 40
     dtype: Any = jnp.float32
     remat: bool = False
+    part: str = 'all'
 
     @nn.compact
-    def __call__(self, obs, mask, train=False):
-        phi = Brain(self.conv_channels, self.num_blocks, self.dtype, self.remat, name='brain')(obs, train)
+    def __call__(self, obs, mask=None, train=False):
+        phi = Brain(self.conv_channels, self.num_blocks, self.dtype, self.remat, self.part,
+                    name='brain')(obs, train)
+        if self.part == 'trunk':
+            return phi
         q = DQN(self.dtype, name='dqn')(phi, mask)
         next_rank_logits = nn.Dense(4, use_bias=False, dtype=self.dtype, name='aux')(phi)
         return q, next_rank_logits

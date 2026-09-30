@@ -64,7 +64,12 @@ TEST_WALLS=${TEST_WALLS:-500}
 CONFIG=${CONFIG:-config.tpu.toml}
 # This run's own folder, named by where it is backed up: another run later in the same
 # session, under another RUN_PATH, must not find this one's state and resume it (#48).
-OUT=/dev/shm/runs/$(printf '%s' "$RUN_REPO/$RUN_PATH" | tr '/' '_')
+# The name is RUN_REPO/RUN_PATH percent-encoded, which decodes back to it: `/` -> `_` gave
+# online/tpu60 and online_tpu60 one folder. A stray / would give one Hub folder two local
+# ones, so it is refused.
+case "$RUN_PATH" in ''|/*|*/|*//*) echo "RUN_PATH '$RUN_PATH': no leading, trailing or double /"; exit 1;; esac
+OUT=/dev/shm/runs/$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+                    "$RUN_REPO/$RUN_PATH")
 
 cd /root
 echo "== libriichi"
@@ -78,7 +83,7 @@ echo "== corpus and starting point"
 python3 - <<EOF
 import os
 import shutil
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 try:
     from huggingface_hub import errors
 except ImportError:
@@ -102,8 +107,11 @@ out, resume = '${OUT}', '${OUT}.resume'
 if os.path.exists(f'{out}/state.msgpack'):
     print(f'resuming from {out}, left by this run earlier in this session')
 else:
+    # Every file from one commit: two downloads of the head could each find another backup's,
+    # a state with a later record of test play (#58).
+    revision = HfApi().model_info('${RUN_REPO}').sha
     try:
-        hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume)
+        hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume, revision=revision)
     except errors.LocalEntryNotFoundError:
         # The Hub was never asked: a dropped connection with nothing cached. It is a
         # subclass of EntryNotFoundError, so it has to go through before that is caught.
@@ -112,7 +120,7 @@ else:
         print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
     else:
         # Its test play so far, so the tests to come are paired against their series' first.
-        snapshot_download('${RUN_REPO}', local_dir=resume,
+        snapshot_download('${RUN_REPO}', local_dir=resume, revision=revision,
                           allow_patterns=['${RUN_PATH}/test_play.jsonl', '${RUN_PATH}/test_play/*'])
         # Fetched beside OUT, in /dev/shm: os.replace cannot move a file from the disk
         # into RAM, and from /root every resume stopped here ("Invalid cross-device link").
@@ -123,7 +131,7 @@ else:
                 if os.path.isdir(f'{out}/{name}'):
                     shutil.rmtree(f'{out}/{name}')      # what the Hub holds is this run's record
                 os.replace(f'{kept}/{name}', f'{out}/{name}')
-        print('resuming from ${RUN_REPO}/${RUN_PATH}:', sorted(os.listdir(out)))
+        print(f'resuming from ${RUN_REPO}/${RUN_PATH} at commit {revision[:8]}:', sorted(os.listdir(out)))
     shutil.rmtree(resume, ignore_errors=True)
 EOF
 cd /root/Mortal/mortal

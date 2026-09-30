@@ -228,10 +228,11 @@ class Gate:
         self.baseline_id = sha256_of(baseline)[:16]
         self.state_file = path.join(out, 'gate.json')
         self.champion_file = path.join(out, 'champion.npz')
+        # A new champion waits here until gate.json names it: see evaluate.
+        self.pending_file = path.join(out, 'champion.new.npz')
         if path.exists(self.state_file):
             with open(self.state_file, encoding='utf-8') as f:
                 self.state = json.load(f)
-            self.champion = convert.load_npz(self.champion_file)[0]
             # Where the next walls start is kept, not worked out from the count of
             # evaluations: a resumed run with another number of walls would otherwise
             # deal walls it has already played. Another key is another set of deals,
@@ -252,14 +253,48 @@ class Gate:
             # Before it was kept, the last line of gate.jsonl says.
             if 'last' not in self.state:
                 self.state['last'] = (self._last_record() or {}).get('steps', 0)
+            self.champion = self._recover()
         else:
             self.state = {'evaluations': 0, 'fails': 0, 'champion': 0, 'key': key, 'next_seed': 0,
                           'baseline': self.baseline_id, 'last': 0}
             self.champion = initial
             with self.manifest.writing(0):
-                self._keep_champion(initial, 0)
+                self._keep_champion(initial, 0, self.champion_file)
                 self._save_state()
         self.seconds = (self._last_record() or {}).get('seconds')
+
+    def _recover(self):
+        """The champion gate.json names, with an evaluation cut short between its writes
+        finished or undone (#57); raises if champion.npz is another step's.
+
+        gate.json is where an evaluation takes effect: a champion.new.npz of its champion's
+        step was written before it and is moved into place, one of any other step was not
+        yet named and is dropped, and its record goes to gate.jsonl if that has not got it.
+        """
+        from tpu import convert
+        pending = path.exists(self.pending_file)
+        record = self.state.get('record')
+        lost = record is not None and self._last_record() != record
+        if pending or lost:
+            with self.manifest.writing(self.state['last']):
+                if pending and convert.load_npz(self.pending_file)[1].get('steps') == self.state['champion']:
+                    logging.info(f'gate: step {self.state["champion"]:,} took the title before the run '
+                                 'was cut; champion.npz is now it')
+                    os.replace(self.pending_file, self.champion_file)
+                elif pending:
+                    logging.info('gate: an evaluation was cut before it took effect; its champion dropped')
+                    os.remove(self.pending_file)
+                if lost:
+                    self._append(record)
+        variables, meta = convert.load_npz(self.champion_file)
+        if meta.get('steps') != self.state['champion']:
+            raise SystemExit(f'{self.champion_file} is step {meta.get("steps")}, and gate.json says the '
+                             f'champion is step {self.state["champion"]:,}: one of them is not this run\'s')
+        return variables
+
+    def _append(self, record):
+        with open(path.join(self.out, 'gate.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record) + '\n')
 
     def _last_record(self):
         try:
@@ -281,12 +316,12 @@ class Gate:
             return self.seconds
         return 2 * 4 * self.walls / games_per_second if games_per_second > 0 else 0.
 
-    def _keep_champion(self, variables, steps):
+    def _keep_champion(self, variables, steps, dest):
         from tpu import convert
-        tmp = self.champion_file + '.tmp.npz'
+        tmp = dest + '.tmp.npz'
         convert.save_npz(tmp, variables, {'conv_channels': self.shape[0], 'num_blocks': self.shape[1],
                                           'steps': steps})
-        os.replace(tmp, self.champion_file)
+        os.replace(tmp, dest)
 
     def _save_state(self):
         tmp = self.state_file + '.tmp'
@@ -381,20 +416,27 @@ class Gate:
                 f'{champ["riichi"]:.1%}, deal-in {cand["houjuu"]:.1%} / {champ["houjuu"]:.1%}, '
                 f'firsts {cand["rank_1"]:.1%} / {champ["rank_1"]:.1%}, fourths {cand["rank_4"]:.1%} / '
                 f'{champ["rank_4"]:.1%}')
-        self.state['evaluations'] += 1
-        self.state['next_seed'] = first + self.walls
-        self.state['fails'] = 0 if replace else self.state['fails'] + 1
-        self.state['last'] = steps
         self.seconds = round(time.time() - started, 1)
-        record.update(replaced=replace, fails=self.state['fails'], seconds=self.seconds)
+        record.update(replaced=replace, fails=0 if replace else self.state['fails'] + 1, seconds=self.seconds)
+        # As JSON has it, which is how _recover compares it with gate.jsonl's last line.
+        record = json.loads(json.dumps(record))
+        # gate.json is where the evaluation takes effect, in one rename: the new champion is
+        # written beside the old one before it and moved into place after, and gate.json
+        # keeps the record until gate.jsonl has it. A run cut anywhere in between resumes
+        # to the gate as it was or as it is now, never to a champion with the other's
+        # counts (#57): see _recover.
         with self.manifest.writing(steps):
             if replace:
-                self.champion = ema
+                self._keep_champion(ema, steps, self.pending_file)
+            self.state.update(evaluations=self.state['evaluations'] + 1, next_seed=first + self.walls,
+                              fails=record['fails'], last=steps, record=record)
+            if replace:
                 self.state['champion'] = steps
-                self._keep_champion(ema, steps)
-            with open(path.join(self.out, 'gate.jsonl'), 'a', encoding='utf-8') as f:
-                f.write(json.dumps(record) + '\n')
             self._save_state()
+            if replace:
+                os.replace(self.pending_file, self.champion_file)
+                self.champion = ema
+            self._append(record)
         logging.info(f'{line} ({time.time() - started:.0f} s)')
         return replace
 
@@ -430,7 +472,7 @@ def main():
     from tpu import convert
     from tpu.model import Mortal
     from tpu.run import Manifest, as_arrays, collate, init_worker
-    from tpu.train import loss_fn, make_optimizer, trainable
+    from tpu.train import before_split, from_before_split, join, loss_fn, make_optimizer, split as cut
 
     tpu_cfg = config['tpu_online']
     # What self-play and the gate's nets compute in: see tpu.engine.
@@ -459,24 +501,34 @@ def main():
         raise SystemExit(f'{args.init} is version {meta["version"]}; only v4 trains here')
     channels, blocks = meta['conv_channels'], meta['num_blocks']
     model = Mortal(channels, blocks, dtype=jnp.bfloat16, remat=args.remat)
-    mask = trainable(variables['params'], trainable_blocks)
-    tx = make_optimizer(config['optim'], mask)
+    # The stem and every block but the last trainable_blocks: they run forward only, and the
+    # optimizer never sees them (#59), as train.py's freeze_trunk leaves them out of its.
+    frozen_blocks = blocks - trainable_blocks if 0 < trainable_blocks < blocks else 0
+    trained = lambda tree: cut(tree, frozen_blocks)[0] if frozen_blocks else tree
+    tx = make_optimizer(config['optim'])
     params, stats = variables['params'], variables['batch_stats']
-    state = {'params': params, 'batch_stats': stats, 'opt': tx.init(params),
+    opt = tx.init(trained(params))
+    state = {'params': params, 'batch_stats': stats, 'opt': opt,
              'ema': {'params': params, 'batch_stats': stats}, 'steps': 0}
     ckpt = path.join(args.out, 'state.msgpack')
     if path.exists(ckpt):
         with open(ckpt, 'rb') as f:
-            state = serialization.from_state_dict(state, serialization.msgpack_restore(f.read()))
+            restored = serialization.msgpack_restore(f.read())
+        if before_split(restored['opt']):
+            restored['opt'] = from_before_split(restored['opt'], frozen_blocks)
+            logging.info(f'{ckpt} is from before the optimizer held only the trained blocks; cut to them')
+        state = serialization.from_state_dict(state, restored)
+        if [np.shape(x) for x in jax.tree_util.tree_leaves(state['opt'])] != \
+                [np.shape(x) for x in jax.tree_util.tree_leaves(opt)]:
+            raise SystemExit(f'{ckpt} was trained with another trainable_blocks than {trainable_blocks}: '
+                             'its optimizer state is for other blocks')
         logging.info(f'resumed {ckpt} at step {int(state["steps"]):,}; --init is only a starting point, ignored')
     else:
         logging.info(f'init: {args.init}, {channels}x{blocks}, step {meta.get("steps", 0):,}')
     steps = int(state['steps'])
     state = jax.device_put(state, whole)
-    held = sum(int((np.asarray(m) == 0).sum() * p.size // max(np.asarray(m).size, 1))
-               for m, p in zip(jax.tree_util.tree_leaves(mask), jax.tree_util.tree_leaves(params)))
-    frozen = max(blocks - trainable_blocks, 0) if trainable_blocks else 0
-    logging.info(f'{len(devices)} x {devices[0].device_kind}, batch {batch_size:,}; {frozen} of {blocks} '
+    held = sum(x.size for x in jax.tree_util.tree_leaves(cut(params, frozen_blocks)[1])) if frozen_blocks else 0
+    logging.info(f'{len(devices)} x {devices[0].device_kind}, batch {batch_size:,}; {frozen_blocks} of {blocks} '
                  f'blocks frozen ({held:,} parameters), BatchNorm {"frozen" if freeze_bn else "training"}')
 
     loss_kw = dict(model=model, gamma=config['env']['gamma'], min_q_weight=config['cql']['min_q_weight'],
@@ -485,9 +537,15 @@ def main():
 
     @jax.jit
     def step(state, batch):
-        (_, (stats, losses)), grads = grad_fn(state['params'], state['batch_stats'], batch, **loss_kw)
-        updates, opt = tx.update(grads, state['opt'], state['params'])
-        params = optax.apply_updates(state['params'], updates)
+        params, stats, frozen = state['params'], state['batch_stats'], None
+        if frozen_blocks:
+            (params, fixed), (stats, fixed_stats) = cut(params, frozen_blocks), cut(stats, frozen_blocks)
+            frozen = (fixed, fixed_stats)
+        (_, (stats, losses)), grads = grad_fn(params, stats, batch, frozen=frozen, **loss_kw)
+        updates, opt = tx.update(grads, state['opt'], params)
+        params = optax.apply_updates(params, updates)
+        if frozen_blocks:
+            params, stats = join(params, fixed), join(stats, fixed_stats)
         live = {'params': params, 'batch_stats': stats}
         ema = jax.tree_util.tree_map(lambda e, x: ema_decay * e + (1 - ema_decay) * x, state['ema'], live)
         return {'params': params, 'batch_stats': stats, 'opt': opt, 'ema': ema,

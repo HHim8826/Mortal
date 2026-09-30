@@ -42,8 +42,12 @@ BACKUP_MIN=${BACKUP_MIN:-30}
 HOURS=${HOURS:-8}
 CONFIG=${CONFIG:-config.online.tpu.toml}
 SMOKE=${SMOKE:-1}
-# This run's own folder, named by where it is backed up (#48).
-OUT=/dev/shm/runs/$(printf '%s' "$RUN_REPO/$RUN_PATH" | tr '/' '_')
+# This run's own folder, named by where it is backed up (#48): RUN_REPO/RUN_PATH
+# percent-encoded, which decodes back to it (`/` -> `_` gave online/tpu60 and online_tpu60
+# one folder). A stray / would give one Hub folder two local ones, so it is refused.
+case "$RUN_PATH" in ''|/*|*/|*//*) echo "RUN_PATH '$RUN_PATH': no leading, trailing or double /"; exit 1;; esac
+OUT=/dev/shm/runs/$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+                    "$RUN_REPO/$RUN_PATH")
 
 cd /root
 echo "== libriichi"
@@ -57,7 +61,7 @@ echo "== nets and state"
 python3 - <<EOF
 import os
 import shutil
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 try:
     from huggingface_hub import errors
 except ImportError:
@@ -79,20 +83,23 @@ out, resume = '${OUT}', '${OUT}.resume'
 if os.path.exists(f'{out}/state.msgpack'):
     print(f'resuming from {out}, left by this run earlier in this session')
 else:
+    # Every file from one commit: two downloads of the head could each find another backup's,
+    # a state with a later gate (#58). A backup is one save's files in one commit (#49).
+    revision = HfApi().model_info('${RUN_REPO}').sha
     try:
-        hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume)
+        hf_hub_download('${RUN_REPO}', '${RUN_PATH}/state.msgpack', local_dir=resume, revision=revision)
     except errors.LocalEntryNotFoundError:
         raise
     except getattr(errors, 'RemoteEntryNotFoundError', errors.EntryNotFoundError):
         print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
     else:
-        snapshot_download('${RUN_REPO}', local_dir=resume, allow_patterns=[
+        snapshot_download('${RUN_REPO}', local_dir=resume, revision=revision, allow_patterns=[
             '${RUN_PATH}/gate.json', '${RUN_PATH}/gate.jsonl', '${RUN_PATH}/champion.npz'])
         # Fetched beside OUT, in /dev/shm, so os.replace can move it there.
         os.makedirs(out, exist_ok=True)
         for name in os.listdir(f'{resume}/${RUN_PATH}'):
             os.replace(f'{resume}/${RUN_PATH}/{name}', f'{out}/{name}')
-        print('resuming from ${RUN_REPO}/${RUN_PATH}:', sorted(os.listdir(out)))
+        print(f'resuming from ${RUN_REPO}/${RUN_PATH} at commit {revision[:8]}:', sorted(os.listdir(out)))
     shutil.rmtree(resume, ignore_errors=True)
 EOF
 cd /root/Mortal/mortal
