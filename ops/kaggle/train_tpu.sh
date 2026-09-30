@@ -7,7 +7,7 @@
 #   from kaggle_secrets import UserSecretsClient
 #   import os, subprocess
 #   os.environ['HF_TOKEN'] = UserSecretsClient().get_secret('HF_TOKEN')
-#   subprocess.run('git clone -q --depth 1 -b train-parquet https://github.com/HHim8826/Mortal.git /root/Mortal'
+#   subprocess.run('rm -rf /root/Mortal && git clone -q --depth 1 -b train-parquet https://github.com/HHim8826/Mortal.git /root/Mortal'
 #                  ' && bash /root/Mortal/ops/kaggle/train_tpu.sh', shell=True, check=True,
 #                  env=dict(os.environ, GROW_TO='60', MAX_STEPS='1390000'))
 #

@@ -5,9 +5,12 @@
 #   from kaggle_secrets import UserSecretsClient
 #   import os, subprocess
 #   os.environ['HF_TOKEN'] = UserSecretsClient().get_secret('HF_TOKEN')
-#   subprocess.run('git clone -q --depth 1 -b train-parquet https://github.com/HHim8826/Mortal.git /root/Mortal'
+#   subprocess.run('rm -rf /root/Mortal && git clone -q --depth 1 -b train-parquet https://github.com/HHim8826/Mortal.git /root/Mortal'
 #                  ' && bash /root/Mortal/ops/kaggle/train_online_tpu.sh', shell=True, check=True,
 #                  env=dict(os.environ, RUN_PATH='online-tpu60'))
+#
+# rm -rf first so the cell can run again in the same session; an interactive session
+# that has run for a while needs HOURS below the 9 h it has left (it is 8 by default).
 #
 # The algorithm is config.online.toml's (see config.online.tpu.toml); it starts from INIT
 # and plays against OPPONENT, both .npz in the model repo -- by default the 192x60 offline
