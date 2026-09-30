@@ -102,7 +102,7 @@ class SelfPlay:
     """
 
     def __init__(self, variables, shape, opponent, *, arenas, walls, play_cfg, capacity, root,
-                 devices, history):
+                 devices, history, dtype='float32'):
         from tpu import convert
         from tpu.engine import JaxEngine
         channels, blocks = shape
@@ -125,11 +125,11 @@ class SelfPlay:
                 variables, version=4, conv_channels=channels, num_blocks=blocks, device=device,
                 name='trainee', enable_rule_based_agari_guard=guard,
                 boltzmann_epsilon=play_cfg['boltzmann_epsilon'], boltzmann_temp=play_cfg['boltzmann_temp'],
-                top_p=play_cfg['top_p']))
+                top_p=play_cfg['top_p'], dtype=dtype))
             self.opponents.append(JaxEngine(
                 opp, version=opp_meta['version'], conv_channels=opp_meta['conv_channels'],
                 num_blocks=opp_meta['num_blocks'], device=device, name='baseline',
-                enable_rule_based_agari_guard=guard))
+                enable_rule_based_agari_guard=guard, dtype=dtype))
         self.threads = [threading.Thread(target=self._arena, args=(i,), name=f'selfplay{i}')
                         for i in range(arenas)]
 
@@ -214,7 +214,7 @@ class Gate:
     """
 
     def __init__(self, baseline, out, shape, initial, *, walls, key, margin, patience, arenas, device,
-                 scratch, manifest):
+                 scratch, manifest, dtype='float32'):
         from evaluation.evaluate import sha256_of
         from tpu import convert
         from tpu.engine import JaxEngine
@@ -223,8 +223,8 @@ class Gate:
         self.manifest = manifest
         self.out, self.shape = out, shape
         self.walls, self.key, self.margin, self.patience = walls, key, margin, patience
-        self.arenas, self.device, self.scratch = arenas, device, scratch
-        self.baseline = JaxEngine.from_npz(baseline, device=device, name='baseline')
+        self.arenas, self.device, self.scratch, self.dtype = arenas, device, scratch, dtype
+        self.baseline = JaxEngine.from_npz(baseline, device=device, name='baseline', dtype=dtype)
         self.baseline_id = sha256_of(baseline)[:16]
         self.state_file = path.join(out, 'gate.json')
         self.champion_file = path.join(out, 'champion.npz')
@@ -305,7 +305,7 @@ class Gate:
         from libriichi.stat import Stat
         from tpu.engine import JaxEngine
         engine = JaxEngine(variables, version=4, conv_channels=self.shape[0], num_blocks=self.shape[1],
-                           device=self.device, name='mortal')
+                           device=self.device, name='mortal', dtype=self.dtype)
         logs = tempfile.mkdtemp(prefix=f'gate_{label}_', dir=self.scratch)
         try:
             # Contiguous slices in threads: one arena leaves most of the CPUs idle. Games are
@@ -433,6 +433,8 @@ def main():
     from tpu.train import loss_fn, make_optimizer, trainable
 
     tpu_cfg = config['tpu_online']
+    # What self-play and the gate's nets compute in: see tpu.engine.
+    inference = tpu_cfg.get('inference_dtype', 'float32')
     # This process's rayon pool, which self-play and the gate share; set after the forkserver
     # started, so the loader's workers keep MORTAL_LOADER_RAYON_THREADS instead.
     os.environ.setdefault('RAYON_NUM_THREADS', str(tpu_cfg['rayon_threads']))
@@ -518,7 +520,7 @@ def main():
                 walls=config['test_play']['games'] // 4,
                 key=tpu_cfg['gate_key'], margin=config['test_play']['gate_margin'],
                 patience=config['test_play']['gate_patience'], arenas=tpu_cfg['gate_arenas'],
-                device=devices[-1], scratch=scratch, manifest=manifest)
+                device=devices[-1], scratch=scratch, manifest=manifest, dtype=inference)
 
     def ended(status):
         shutil.rmtree(scratch, ignore_errors=True)
@@ -543,7 +545,7 @@ def main():
     selfplay = SelfPlay(live(), (channels, blocks), args.opponent, arenas=tpu_cfg['arenas'],
                         walls=tpu_cfg['walls'], play_cfg=config['train_play'],
                         capacity=config['online']['server']['capacity'], root=path.join(scratch, 'selfplay'),
-                        devices=devices, history=config['online']['history_window'])
+                        devices=devices, history=config['online']['history_window'], dtype=inference)
     selfplay.start()
     logging.info(f'self-play: {tpu_cfg["arenas"]} arenas of {tpu_cfg["walls"]} walls; '
                  f'gate every {test_every:,} steps on {config["test_play"]["games"] // 4:,} walls')

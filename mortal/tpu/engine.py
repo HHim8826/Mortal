@@ -17,6 +17,12 @@ Self-play samples as `MortalEngine` does: each move is the argmax with probabili
 over the legal actions, cut to the top `top_p` of the mass. The draw is numpy on
 the host, from Q the device already sent back.
 
+`dtype` is what the net computes in. On a TPU v5e float32 costs 5.4 times what
+bfloat16 does (52.9 against 9.7 ms for 1,024 rows of the 192x60), and it is not
+float32 there either: against the CPU's float32, over 1,024 real observations, its
+Q was off by up to 0.09 with 2 argmaxes flipped, bfloat16's by 0.14 with 3.
+Training computes in bfloat16 as well.
+
     engine = JaxEngine.from_npz('best_ema.npz', name='mortal')
 """
 import threading
@@ -29,19 +35,22 @@ _FORWARD = {}
 _HOST = threading.local()
 
 
-def forward_for(conv_channels, num_blocks, version):
-    """One jitted forward per architecture, shared by every engine that plays it: online runs
-    an engine per arena, and each would otherwise compile every batch size again.
+def forward_for(conv_channels, num_blocks, version, dtype='float32'):
+    """One jitted forward per architecture and dtype, shared by every engine that plays it:
+    online runs an engine per arena, and each would otherwise compile every batch size again.
 
     It takes observations as libriichi makes them, (channels, 34), and turns them channels
     last for `tpu.model` on the device, where that is nearly free; on the host it was a
-    strided copy of the whole batch every call (#56)."""
-    key = (conv_channels, num_blocks, version)
+    strided copy of the whole batch every call (#56). Q comes back in float32 whatever the
+    net computes in."""
+    key = (conv_channels, num_blocks, version, dtype)
     if key not in _FORWARD:
         import jax
+        import jax.numpy as jnp
         from tpu.model import Player
-        net = Player(conv_channels, num_blocks, version)
-        _FORWARD[key] = jax.jit(lambda v, obs, mask: net.apply(v, obs.transpose(0, 2, 1), mask))
+        net = Player(conv_channels, num_blocks, version, dtype=jnp.dtype(dtype))
+        _FORWARD[key] = jax.jit(
+            lambda v, obs, mask: net.apply(v, obs.transpose(0, 2, 1), mask).astype(jnp.float32))
     return _FORWARD[key]
 
 
@@ -89,10 +98,14 @@ def sample_top_p(logits, p, rng):
 class JaxEngine:
     engine_type = 'mortal'
     is_oracle = False
+    # Asks libriichi for each batch as one array (N, C, 34) and the masks as (N, 46), stacked
+    # in Rust without the GIL. A build from before that option hands over lists, as it does
+    # to every engine that does not ask; both are taken.
+    stacked_obs = True
 
     def __init__(self, variables, *, version, conv_channels, num_blocks, device=None, name='NoName',
                  enable_quick_eval=True, enable_rule_based_agari_guard=True,
-                 boltzmann_epsilon=0., boltzmann_temp=1., top_p=1., seed=None):
+                 boltzmann_epsilon=0., boltzmann_temp=1., top_p=1., seed=None, dtype='float32'):
         import jax
         self.name = name
         self.version = version
@@ -105,7 +118,7 @@ class JaxEngine:
         # Generator draws take its lock, so arenas in threads can share one engine.
         self.rng = np.random.default_rng(seed)
         self.device = device or jax.devices()[0]
-        self._q = forward_for(conv_channels, num_blocks, version)
+        self._q = forward_for(conv_channels, num_blocks, version, dtype)
         self.set_variables(variables)
 
     @classmethod
@@ -127,7 +140,7 @@ class JaxEngine:
             step = BUCKETS[-1]
             q = np.concatenate([self._forward(obs[i:i + step], masks[i:i + step])
                                 for i in range(0, len(obs), step)])
-            legal = np.stack(masks)
+            legal = np.asarray(masks) if isinstance(masks, np.ndarray) else np.stack(masks)
             actions = q.argmax(-1)
             greedy = np.ones(len(q), bool)
             if self.boltzmann_epsilon > 0:
@@ -143,7 +156,14 @@ class JaxEngine:
         n = len(obs)
         size = next(b for b in BUCKETS if b >= n)
         x, m = host_arrays(size, obs[0].shape, len(masks[0]))
-        np.stack(obs, out=x[:n])
-        np.stack(masks, out=m[:n])
+        if isinstance(obs, np.ndarray):
+            # One copy, which numpy makes without the GIL. Stacking N arrays takes it N times:
+            # on a TPU v5e host 32 threads stacked no faster than one (~135k rows/s), where
+            # the same bytes in one block copied at ~590k.
+            x[:n] = obs
+            m[:n] = masks
+        else:
+            np.stack(obs, out=x[:n])
+            np.stack(masks, out=m[:n])
         q = self._q(self._variables, jax.device_put(x, self.device), jax.device_put(m, self.device))
         return np.asarray(q)[:n]

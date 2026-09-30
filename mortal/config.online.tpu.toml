@@ -34,7 +34,10 @@ gate_patience = 2
 file_batch_size = 20
 prefetch_factor = 2
 reserve_ratio = 0.2
-num_workers = 8
+# The trainee's logs are decoded again here, 3 threads a worker. With 8 the trainer waited
+# on them with thousands of logs waiting (~9,500 samples/s); with 12, ~13-15k while there
+# are logs, and self-play is what it waits for. Measured on the v5e-8, 2026-09-30.
+num_workers = 12
 num_epochs = 1
 enable_augmentation = false
 augmented_first = false
@@ -75,6 +78,10 @@ history_window = 50
 capacity = 19200
 
 [tpu_online]
+# Measured on the v5e-8 (2026-09-30): self-play is bound by the host's CPUs, not the chips.
+# 16 arenas x 200 walls with 64 threads play ~61-64 games/s with ~56 of the 96 CPUs busy,
+# and the loader's workers take most of the rest; in 12 minutes the whole loop trained
+# 5,434 steps. Starting the arenas' blocks staggered changed nothing (5,354).
 # Self-play arenas, each in its own thread with its own engines, spread over the chips.
 arenas = 16
 # Walls an arena plays before handing its games to the buffer (4 games a wall).
@@ -82,8 +89,14 @@ walls = 200
 # libriichi's rayon pool in this process, which self-play and the gate share. The
 # loader's workers are other processes: [dataset] num_workers x MORTAL_LOADER_RAYON_THREADS.
 rayon_threads = 64
-# Threads the gate splits each side's walls across.
+# Threads the gate splits each side's walls across: 8,000 walls take ~19 min with 8, and
+# 16 were slower (48.6 against 56.2 games/s on 800 walls).
 gate_arenas = 8
+# What self-play and the gate's nets compute in. On the v5e float32 takes 5.4 times the
+# chips' time of bfloat16 and is not float32 there either (tpu.engine); self-play is no
+# faster in bfloat16, being CPU-bound, but the chips are left to training. The candidate,
+# the champion and the v3 baseline all play in it, so the gate stays a like-for-like test.
+inference_dtype = 'bfloat16'
 # The gate's walls: a key of their own, never dealt in self-play (random keys there).
 gate_key = 0x6761746531
 

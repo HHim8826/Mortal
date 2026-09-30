@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use crossbeam::sync::WaitGroup;
 use ndarray::prelude::*;
-use numpy::{PyArray1, PyArray2};
+use numpy::{PyArray1, PyArray2, PyArray3};
 use parking_lot::Mutex;
 use pyo3::intern;
 use pyo3::prelude::*;
+use rayon::prelude::*;
 
 pub struct MortalBatchAgent {
     engine: PyObject,
@@ -21,6 +22,7 @@ pub struct MortalBatchAgent {
     version: u32,
     enable_quick_eval: bool,
     enable_rule_based_agari_guard: bool,
+    stacked_obs: bool,
     name: String,
     player_ids: Vec<u8>,
 
@@ -50,28 +52,41 @@ impl MortalBatchAgent {
     pub fn new(engine: PyObject, player_ids: &[u8]) -> Result<Self> {
         ensure!(player_ids.iter().all(|&id| matches!(id, 0..=3)));
 
-        let (name, is_oracle, version, enable_quick_eval, enable_rule_based_agari_guard) =
-            Python::with_gil(|py| {
-                let obj = engine.bind_borrowed(py);
-                ensure!(
-                    obj.getattr("react_batch")?.is_callable(),
-                    "missing method react_batch",
-                );
+        let (
+            name,
+            is_oracle,
+            version,
+            enable_quick_eval,
+            enable_rule_based_agari_guard,
+            stacked_obs,
+        ) = Python::with_gil(|py| {
+            let obj = engine.bind_borrowed(py);
+            ensure!(
+                obj.getattr("react_batch")?.is_callable(),
+                "missing method react_batch",
+            );
 
-                let name = obj.getattr("name")?.extract()?;
-                let is_oracle = obj.getattr("is_oracle")?.extract()?;
-                let version = obj.getattr("version")?.extract()?;
-                let enable_quick_eval = obj.getattr("enable_quick_eval")?.extract()?;
-                let enable_rule_based_agari_guard =
-                    obj.getattr("enable_rule_based_agari_guard")?.extract()?;
-                Ok((
-                    name,
-                    is_oracle,
-                    version,
-                    enable_quick_eval,
-                    enable_rule_based_agari_guard,
-                ))
-            })?;
+            let name = obj.getattr("name")?.extract()?;
+            let is_oracle = obj.getattr("is_oracle")?.extract()?;
+            let version = obj.getattr("version")?.extract()?;
+            let enable_quick_eval = obj.getattr("enable_quick_eval")?.extract()?;
+            let enable_rule_based_agari_guard =
+                obj.getattr("enable_rule_based_agari_guard")?.extract()?;
+            // Optional: engines that do not ask get lists, as they always have.
+            let stacked_obs = if obj.hasattr("stacked_obs")? {
+                obj.getattr("stacked_obs")?.extract()?
+            } else {
+                false
+            };
+            Ok((
+                name,
+                is_oracle,
+                version,
+                enable_quick_eval,
+                enable_rule_based_agari_guard,
+                stacked_obs,
+            ))
+        })?;
 
         let size = player_ids.len();
         let quick_eval_reactions = if enable_quick_eval {
@@ -93,6 +108,7 @@ impl MortalBatchAgent {
             version,
             enable_quick_eval,
             enable_rule_based_agari_guard,
+            stacked_obs,
             name,
             player_ids: player_ids.to_vec(),
 
@@ -122,6 +138,41 @@ impl MortalBatchAgent {
 
         let start = Instant::now();
         self.last_batch_size = sync_fields.states.len();
+
+        if self.stacked_obs {
+            // The batch as one array (N, C, 34), and the masks as (N, 46), copied here by
+            // rayon without the GIL. Handed over as N arrays, stacking them in Python held
+            // the GIL for every one: 32 threads stacked no faster than one, ~135k rows/s,
+            // where one block copies at ~590k (tpu.engine on a TPU v5e host, 2026-09-30).
+            let states = mem::take(&mut sync_fields.states);
+            let masks = mem::take(&mut sync_fields.masks);
+            let invisible_states = mem::take(&mut sync_fields.invisible_states);
+            let states = stack_rows(&states)?;
+            let masks = stack_masks(&masks)?;
+            let invisible_states = self
+                .is_oracle
+                .then(|| stack_rows(&invisible_states))
+                .transpose()?;
+
+            (self.actions, self.q_values, self.masks_recv, self.is_greedy) =
+                Python::with_gil(|py| {
+                    let args = (
+                        PyArray3::from_owned_array(py, states),
+                        PyArray2::from_owned_array(py, masks),
+                        invisible_states.map(|v| PyArray3::from_owned_array(py, v)),
+                    );
+                    self.engine
+                        .bind_borrowed(py)
+                        .call_method1(intern!(py, "react_batch"), args)
+                        .context("failed to execute `react_batch` on Python engine")?
+                        .extract()
+                        .context("failed to extract to Rust type")
+                })?;
+            self.last_eval_elapsed = Instant::now()
+                .checked_duration_since(start)
+                .unwrap_or(Duration::ZERO);
+            return Ok(());
+        }
 
         (self.actions, self.q_values, self.masks_recv, self.is_greedy) = Python::with_gil(|py| {
             let states: Vec<_> = sync_fields
@@ -184,6 +235,34 @@ impl MortalBatchAgent {
             ..Default::default()
         }
     }
+}
+
+/// `rows`, each (C, W) and in standard layout, as one (N, C, W) array, copied in parallel.
+fn stack_rows(rows: &[Array2<f32>]) -> Result<Array3<f32>> {
+    let (c, w) = rows.first().map_or((0, 0), |r| r.dim());
+    let size = c * w;
+    let mut flat = vec![0_f32; rows.len() * size];
+    if size > 0 {
+        flat.par_chunks_mut(size)
+            .zip(rows.par_iter())
+            .try_for_each(|(dst, src)| -> Result<()> {
+                ensure!(src.dim() == (c, w), "observations of different shapes in one batch");
+                let src = src.as_slice().context("an observation not in standard layout")?;
+                dst.copy_from_slice(src);
+                Ok(())
+            })?;
+    }
+    Ok(Array3::from_shape_vec((rows.len(), c, w), flat)?)
+}
+
+/// The masks as one (N, ACTION_SPACE) array.
+fn stack_masks(masks: &[Array1<bool>]) -> Result<Array2<bool>> {
+    let mut out = Array2::from_elem((masks.len(), ACTION_SPACE), false);
+    for (mut row, mask) in out.outer_iter_mut().zip(masks) {
+        ensure!(mask.len() == ACTION_SPACE, "a mask of {} actions", mask.len());
+        row.assign(mask);
+    }
+    Ok(out)
 }
 
 impl BatchAgent for MortalBatchAgent {
