@@ -28,8 +28,8 @@ files either. For the same reason this module must stay safe to import: the
 forkserver's children import it again.
 
 In --out: state.msgpack (to resume), weights.npz and weights_ema.npz, champion.npz (the
-gate's champion, the model to use), gate.json (the gate's own state) and gate.jsonl (one
-line an evaluation).
+gate's champion, the model to use), gate.json (the gate's own state), gate.jsonl (one
+line an evaluation) and run.json (the run's settings and opponent: `tpu.runid`).
 """
 import argparse
 import functools
@@ -461,6 +461,9 @@ def main():
     ap.add_argument('--hours', type=float, default=0, help='save and stop after this long')
     ap.add_argument('--log-every', type=int, default=500)
     ap.add_argument('--remat', action='store_true')
+    ap.add_argument('--accept-changes', action='store_true',
+                    help='resume with this session\'s settings and opponent where they are not the run\'s '
+                         '(tpu.runid); without it such a session stops')
     args = ap.parse_args()
 
     # First of all, before JAX and before any arena: see the docstring. It dies with this
@@ -479,7 +482,7 @@ def main():
     from torch.utils.data import DataLoader
     from config import config
     from dataloader import FileDatasetsIter
-    from tpu import convert
+    from tpu import convert, runid
     from tpu.model import Mortal
     from tpu.run import Manifest, as_arrays, collate, init_worker
     from tpu.train import before_split, from_before_split, join, loss_fn, make_optimizer, split as cut
@@ -536,6 +539,9 @@ def main():
     else:
         logging.info(f'init: {args.init}, {channels}x{blocks}, step {meta.get("steps", 0):,}')
     steps = int(state['steps'])
+    # The run's own settings and opponent, or a session that would make it another run (#61).
+    runid.settle(args.out, config, steps=steps, init=args.init, opponent=args.opponent, baseline=args.baseline,
+                 accept=args.accept_changes, log=logging.info)
     state = jax.device_put(state, whole)
     held = sum(x.size for x in jax.tree_util.tree_leaves(cut(params, frozen_blocks)[1])) if frozen_blocks else 0
     logging.info(f'{len(devices)} x {devices[0].device_kind}, batch {batch_size:,}; {frozen_blocks} of {blocks} '

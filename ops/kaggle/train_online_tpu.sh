@@ -17,8 +17,14 @@
 # by the gate at 60,000 steps with nothing gained: the whole net trains, as in the one online
 # phase that measured a gain (520k -> 560k, +2.40 pt on dev, every block training), with the
 # gate every 20,000 steps and deciding on pt. CONFIG_SET is "section.key=value ..." over
-# CONFIG, each a key it already has and a value of the same type; the config the run used is
-# kept beside its output as config.toml.
+# CONFIG, each a key it already has and a value of the same type.
+#
+# A run keeps its settings: its first session writes them into run.json, with the init,
+# opponent and baseline it had, and a session resuming it trains with those whatever its
+# cell says -- only how the work is spread may differ (tpu.runid.PLACEMENT) -- and prints
+# each of its own settings that it does not use (#61). A run that changed algorithm or
+# ruler half way would be two runs under one name. To change one anyway, from here on,
+# ACCEPT_CHANGES=1; run.json records it.
 #
 # The algorithm is config.online.toml's (see config.online.tpu.toml); it starts from INIT
 # and plays against OPPONENT, both .npz in the model repo -- by default the 192x60 offline
@@ -50,6 +56,7 @@ BACKUP_MIN=${BACKUP_MIN:-30}
 HOURS=${HOURS:-8}
 CONFIG=${CONFIG:-config.online.tpu.toml}
 CONFIG_SET=${CONFIG_SET:-}
+ACCEPT_CHANGES=${ACCEPT_CHANGES:-0}
 SMOKE=${SMOKE:-1}
 # This run's own folder, named by where it is backed up (#48): RUN_REPO/RUN_PATH
 # percent-encoded, which decodes back to it (`/` -> `_` gave online/tpu60 and online_tpu60
@@ -136,7 +143,7 @@ else:
         print('no state at ${RUN_REPO}/${RUN_PATH}; starting fresh')
     else:
         snapshot_download('${RUN_REPO}', local_dir=resume, revision=revision, allow_patterns=[
-            '${RUN_PATH}/gate.json', '${RUN_PATH}/gate.jsonl', '${RUN_PATH}/champion.npz'])
+            '${RUN_PATH}/gate.json', '${RUN_PATH}/gate.jsonl', '${RUN_PATH}/champion.npz', '${RUN_PATH}/run.json'])
         # Fetched beside OUT, in /dev/shm, so os.replace can move it there.
         os.makedirs(out, exist_ok=True)
         for name in os.listdir(f'{resume}/${RUN_PATH}'):
@@ -147,6 +154,14 @@ EOF
 cd /root/Mortal/mortal
 python3 -m tpu.convert export /root/nets/baseline/baseline.pth /root/nets/baseline.npz
 ARGS=(--init "/root/nets/$INIT" --opponent "/root/nets/$OPPONENT" --baseline /root/nets/baseline.npz)
+ACCEPT=()
+[ "$ACCEPT_CHANGES" = 1 ] && ACCEPT=(--accept-changes)
+
+echo "== settings"
+# A resumed run's own, from its run.json, but for how the work is spread; a new run's are
+# this session's (#61). The trainer checks them again, and the opponent, before it starts.
+python3 -m tpu.runid --out "$OUT" --config "$CONFIG" --write /root/cfg_resolved.toml "${ACCEPT[@]}"
+CONFIG=/root/cfg_resolved.toml
 export MORTAL_CFG=$CONFIG MORTAL_LOADER_RAYON_THREADS=3
 
 if [ "$SMOKE" = 1 ]; then
@@ -181,9 +196,8 @@ backup() {
 
 echo "== train"
 mkdir -p "$OUT"
-# The config this session ran, uploaded with the rest.
-cp "$CONFIG" "$OUT/config.toml"
-echo "config: $CONFIG${CONFIG_SET:+ with $CONFIG_SET}" >> "$OUT/train.log"
+echo "session: CONFIG_SET='$CONFIG_SET' ACCEPT_CHANGES=$ACCEPT_CHANGES; the run's settings are in run.json" \
+    >> "$OUT/train.log"
 ( while sleep $((BACKUP_MIN * 60)); do
       [ -f "$OUT/state.msgpack" ] && { backup "backup during training" || echo "backup failed; will retry"; }
   done ) &
@@ -191,7 +205,7 @@ BACKUP_PID=$!
 status=0
 # The trainer is waited for by itself, not as `| tee`: a pipeline ends only once everything
 # holding its write end has, and a process a killed trainer left behind held it for good (#53).
-python3 -m tpu.online --out "$OUT" "${ARGS[@]}" --steps "$STEPS" --hours "$HOURS" --remat \
+python3 -m tpu.online --out "$OUT" "${ARGS[@]}" "${ACCEPT[@]}" --steps "$STEPS" --hours "$HOURS" --remat \
     > >(tee -a "$OUT/train.log") 2>&1 || status=$?
 TEE_PID=$!
 # The log's last lines, before it is uploaded; not for ever, for the same reason.
