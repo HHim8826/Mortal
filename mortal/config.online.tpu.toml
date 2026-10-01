@@ -6,7 +6,8 @@
 # BatchNorm frozen, the trainee sampling at epsilon 0.005 and temperature 0.05
 # against a frozen opponent, parameters published every 400 steps, and the gate
 # every 30,000 steps on 8,000 fresh walls, margin 1 se, two misses and it stops.
-# What differs is where things run, in [tpu_online].
+# What differs is where things run, in [tpu_online]. For one run, CONFIG_SET in
+# ops/kaggle/train_online_tpu.sh sets any value here without a file of its own.
 
 [control]
 version = 4
@@ -29,6 +30,9 @@ enable_rule_based_agari_guard = true
 games = 32000
 gate_margin = 1.0
 gate_patience = 2
+# What the margin is counted in: 'rank', as train.py, or 'pt'. Online's one measured gain
+# showed more in pt and fourths than in rank (520k -> 560k: pt 2.7-3.6 se, rank 1.8-2.7 se).
+gate_metric = 'rank'
 
 [dataset]
 file_batch_size = 20

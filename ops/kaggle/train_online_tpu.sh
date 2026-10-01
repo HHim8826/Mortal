@@ -7,10 +7,18 @@
 #   os.environ['HF_TOKEN'] = UserSecretsClient().get_secret('HF_TOKEN')
 #   subprocess.run('rm -rf /root/Mortal && git clone -q --depth 1 -b train-parquet https://github.com/HHim8826/Mortal.git /root/Mortal'
 #                  ' && bash /root/Mortal/ops/kaggle/train_online_tpu.sh', shell=True, check=True,
-#                  env=dict(os.environ, RUN_PATH='online-tpu60'))
+#                  env=dict(os.environ, RUN_PATH='online-tpu60-full',
+#                           CONFIG_SET='freeze.trainable_blocks=0 control.test_every=20000 test_play.gate_metric=pt'))
 #
 # rm -rf first so the cell can run again in the same session; an interactive session
 # that has run for a while needs HOURS below the 9 h it has left (it is 8 by default).
+#
+# That is the run after online-tpu60, which trained the last 4 of 60 blocks and was stopped
+# by the gate at 60,000 steps with nothing gained: the whole net trains, as in the one online
+# phase that measured a gain (520k -> 560k, +2.40 pt on dev, every block training), with the
+# gate every 20,000 steps and deciding on pt. CONFIG_SET is "section.key=value ..." over
+# CONFIG, each a key it already has and a value of the same type; the config the run used is
+# kept beside its output as config.toml.
 #
 # The algorithm is config.online.toml's (see config.online.tpu.toml); it starts from INIT
 # and plays against OPPONENT, both .npz in the model repo -- by default the 192x60 offline
@@ -41,6 +49,7 @@ BACKUP_MIN=${BACKUP_MIN:-30}
 # Under the 9 h a session gets, with room for the smoke run and the upload after.
 HOURS=${HOURS:-8}
 CONFIG=${CONFIG:-config.online.tpu.toml}
+CONFIG_SET=${CONFIG_SET:-}
 SMOKE=${SMOKE:-1}
 # This run's own folder, named by where it is backed up (#48): RUN_REPO/RUN_PATH
 # percent-encoded, which decodes back to it (`/` -> `_` gave online/tpu60 and online_tpu60
@@ -56,6 +65,39 @@ echo "== libriichi"
  PYO3_PYTHON=$(command -v python3) ~/.cargo/bin/cargo build -q -p libriichi --release --lib &&
  cp target/release/libriichi.so mortal/libriichi.so)
 pip install -q toml
+
+if [ -n "$CONFIG_SET" ]; then
+    echo "== config: $CONFIG with $CONFIG_SET"
+    # Here, before anything is fetched: a key that is not in the config stops the script.
+    (cd /root/Mortal/mortal && python3 - "$CONFIG" "$CONFIG_SET" /root/cfg_run.toml <<'EOF'
+import ast
+import sys
+import toml
+src, sets, dst = sys.argv[1:]
+c = toml.load(src)
+for item in sets.split():
+    key, eq, text = item.partition('=')
+    *sections, name = key.split('.')
+    d = c
+    for section in sections:
+        d = d.get(section) if isinstance(d, dict) else None
+    if not eq or not sections or not isinstance(d, dict) or name not in d:
+        raise SystemExit(f'CONFIG_SET: {item!r} is not section.key=value for a key in {src}')
+    try:
+        value = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        value = {'true': True, 'false': False}.get(text, text)     # TOML's booleans, or a bare word
+    old = d[name]
+    if type(value) is not type(old) and not (type(old) is float and type(value) is int):
+        raise SystemExit(f'CONFIG_SET: {key} is {type(old).__name__} ({old!r}), not {value!r}')
+    d[name] = value
+    print(f'  {key}: {old!r} -> {value!r}')
+with open(dst, 'w') as f:
+    toml.dump(c, f)
+EOF
+    )
+    CONFIG=/root/cfg_run.toml
+fi
 
 echo "== nets and state"
 python3 - <<EOF
@@ -139,6 +181,9 @@ backup() {
 
 echo "== train"
 mkdir -p "$OUT"
+# The config this session ran, uploaded with the rest.
+cp "$CONFIG" "$OUT/config.toml"
+echo "config: $CONFIG${CONFIG_SET:+ with $CONFIG_SET}" >> "$OUT/train.log"
 ( while sleep $((BACKUP_MIN * 60)); do
       [ -f "$OUT/state.msgpack" ] && { backup "backup during training" || echo "backup failed; will retry"; }
   done ) &

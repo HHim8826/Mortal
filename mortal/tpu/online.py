@@ -12,8 +12,9 @@ for a TPU, which belongs to one process:
   `trainable_blocks` blocks), then publishes the weights again.
 - the gate, every `test_every` steps: the EMA and the champion play the next block of
   walls never played before, against the v3 baseline, and are paired by wall. The EMA
-  takes the title if its rank is ahead by `gate_margin` se; `gate_patience` evaluations
-  in a row without a new champion stop the run with exit status 3. train.py's gate.
+  takes the title if it is ahead by `gate_margin` se in `gate_metric` -- rank, as in
+  train.py, or pt; `gate_patience` evaluations in a row without a new champion stop the
+  run with exit status 3. train.py's gate.
 
     MORTAL_CFG=config.online.tpu.toml python -m tpu.online --out /dev/shm/online \\
         --init tpu60.npz --opponent tpu60.npz --baseline baseline.npz --hours 8
@@ -53,13 +54,17 @@ logging.basicConfig(level=logging.INFO,
 PTS = np.array([90, 45, 0, -135])
 
 
-def gate_says_replace(diff, se, margin):
-    """train.py's rule: the candidate's rank minus the champion's, over the same walls, below
-    -`margin` se. A measurement that did not happen keeps the champion."""
+GATE_METRICS = {'rank': -1, 'pt': 1}       # which way is ahead
+
+
+def gate_says_replace(diff, se, margin, metric='rank'):
+    """train.py's rule: the candidate minus the champion in `metric`, over the same walls,
+    ahead by more than `margin` se -- a lower rank, or more pt. A measurement that did not
+    happen keeps the champion."""
     if se is None or not se > 0:
         return False
     # A Python bool: numpy's cannot be written to gate.jsonl.
-    return bool(diff < -margin * se)
+    return bool(GATE_METRICS[metric] * diff > margin * se)
 
 
 def full_batches(batches, batch_size):
@@ -206,15 +211,16 @@ class Gate:
 
     Each evaluation plays the candidate and the champion on the next `walls` walls at `key`
     -- walls neither has played -- against the v3 baseline, four games a wall, and pairs
-    them by wall. The candidate takes the title only if its rank is ahead by `margin` se,
-    and `patience` evaluations in a row without a new champion stop the run. The first
+    them by wall. The candidate takes the title only if it is ahead by `margin` se in
+    `metric` (rank or pt), and `patience` evaluations in a row without a new champion stop
+    the run. The first
     champion is the net the run starts from (`initial`, step 0), as the vast.ai freeze4
     run's was the 560k it was seeded from: the first gate asks whether online has beaten
     its own starting point.
     """
 
     def __init__(self, baseline, out, shape, initial, *, walls, key, margin, patience, arenas, device,
-                 scratch, manifest, dtype='float32'):
+                 scratch, manifest, dtype='float32', metric='rank'):
         from evaluation.evaluate import sha256_of
         from tpu import convert
         from tpu.engine import JaxEngine
@@ -223,6 +229,9 @@ class Gate:
         self.manifest = manifest
         self.out, self.shape = out, shape
         self.walls, self.key, self.margin, self.patience = walls, key, margin, patience
+        if metric not in GATE_METRICS:
+            raise SystemExit(f'gate_metric {metric!r}: one of {", ".join(GATE_METRICS)}')
+        self.metric = metric
         self.arenas, self.device, self.scratch, self.dtype = arenas, device, scratch, dtype
         self.baseline = JaxEngine.from_npz(baseline, device=device, name='baseline', dtype=dtype)
         self.baseline_id = sha256_of(baseline)[:16]
@@ -393,7 +402,7 @@ class Gate:
 
         as_games = lambda r: {(int(k.split('_')[0]), k.split('_')[1]): v for k, v in r.items()}
         record = {'steps': steps, 'walls': [first, first + self.walls], 'key': self.key,
-                  'baseline': self.baseline_id, 'champion_steps': self.state['champion']}
+                  'baseline': self.baseline_id, 'champion_steps': self.state['champion'], 'metric': self.metric}
         walls = {}
         for label, (ranks, stat) in results.items():
             walls[label] = walls_of(as_games(ranks))
@@ -403,15 +412,16 @@ class Gate:
                              'houjuu': stat.houjuu_rate, 'rank_1': stat.rank_1_rate, 'rank_4': stat.rank_4_rate}
         cand, champ = record['candidate'], record['champion']
         common = sorted(set(walls['candidate']) & set(walls['champion']))
-        gain = paired(walls['candidate'], walls['champion'], common, 'rank', reps=0)
-        record['paired'] = {'walls': len(common), 'rank': gain,
-                            'pt': paired(walls['candidate'], walls['champion'], common, 'pt', reps=0)}
-        replace = gate_says_replace(gain['diff'], gain['se'], self.margin)
-        pt = record['paired']['pt']
+        record['paired'] = {'walls': len(common), **{m: paired(walls['candidate'], walls['champion'], common,
+                                                               m, reps=0) for m in GATE_METRICS}}
+        gain, pt = record['paired']['rank'], record['paired']['pt']
+        decides = record['paired'][self.metric]
+        replace = gate_says_replace(decides['diff'], decides['se'], self.margin, self.metric)
         line = (f'gate at step {steps:,}: candidate {cand["pt"]["mean"]:+.2f} ± {cand["pt"]["se"]:.2f} pt, '
                 f'champion (step {self.state["champion"]:,}) {champ["pt"]["mean"]:+.2f} pt; paired over '
                 f'{len(common):,} walls: rank {gain["diff"]:+.4f} ± {gain["se"]:.4f}, pt {pt["diff"]:+.2f} ± '
-                f'{pt["se"]:.2f}; {"replacing" if replace else "keeping"} the champion (margin {self.margin} se); '
+                f'{pt["se"]:.2f}; {"replacing" if replace else "keeping"} the champion '
+                f'({self.metric}, margin {self.margin} se); '
                 f'calls {cand["fuuro"]:.1%} / {champ["fuuro"]:.1%}, riichi {cand["riichi"]:.1%} / '
                 f'{champ["riichi"]:.1%}, deal-in {cand["houjuu"]:.1%} / {champ["houjuu"]:.1%}, '
                 f'firsts {cand["rank_1"]:.1%} / {champ["rank_1"]:.1%}, fourths {cand["rank_4"]:.1%} / '
@@ -577,6 +587,7 @@ def main():
     gate = Gate(args.baseline, args.out, (channels, blocks), variables,
                 walls=config['test_play']['games'] // 4,
                 key=tpu_cfg['gate_key'], margin=config['test_play']['gate_margin'],
+                metric=config['test_play'].get('gate_metric', 'rank'),
                 patience=config['test_play']['gate_patience'], arenas=tpu_cfg['gate_arenas'],
                 device=devices[-1], scratch=scratch, manifest=manifest, dtype=inference)
 
